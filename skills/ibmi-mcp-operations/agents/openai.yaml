@@ -1,0 +1,4 @@
+interface:
+  display_name: "IBM i MCP Operations"
+  short_description: "Help with IBM i MCP compile and procedure-call workflows"
+  default_prompt: "Use this skill to perform IBM i MCP setup, source discovery, compile strategy, and procedure invocation with minimal retries."

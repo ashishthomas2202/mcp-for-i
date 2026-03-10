@@ -2,6 +2,8 @@ import { LocalLanguageActions } from "../ibmi/LocalLanguageActions.js";
 import { CompileTools } from "../ibmi/CompileTools.js";
 import { Search } from "../ibmi/Search.js";
 import { setPassword, deletePassword } from "../security/credentialStore.js";
+import fs from "fs/promises";
+import path from "path";
 export function getTools() {
     return [
         {
@@ -261,6 +263,179 @@ export function getTools() {
             name: "ibmi.actions.delete",
             description: "Delete a custom action by name.",
             inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] }
+        },
+        {
+            name: "ibmi.libl.get",
+            description: "Get current library list settings.",
+            inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
+        },
+        {
+            name: "ibmi.libl.set",
+            description: "Set library list and/or current library.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    connectionName: { type: "string" },
+                    libraryList: { type: "array", items: { type: "string" } },
+                    currentLibrary: { type: "string" },
+                    applyToJob: { type: "boolean", default: false }
+                }
+            }
+        },
+        {
+            name: "ibmi.libl.add",
+            description: "Add a library to the library list.",
+            inputSchema: {
+                type: "object",
+                properties: { connectionName: { type: "string" }, library: { type: "string" }, applyToJob: { type: "boolean", default: false } },
+                required: ["library"]
+            }
+        },
+        {
+            name: "ibmi.libl.remove",
+            description: "Remove a library from the library list.",
+            inputSchema: {
+                type: "object",
+                properties: { connectionName: { type: "string" }, library: { type: "string" }, applyToJob: { type: "boolean", default: false } },
+                required: ["library"]
+            }
+        },
+        {
+            name: "ibmi.libl.setCurrent",
+            description: "Set current library.",
+            inputSchema: {
+                type: "object",
+                properties: { connectionName: { type: "string" }, library: { type: "string" }, applyToJob: { type: "boolean", default: false } },
+                required: ["library"]
+            }
+        },
+        {
+            name: "ibmi.libl.validate",
+            description: "Validate a library list.",
+            inputSchema: {
+                type: "object",
+                properties: { libraryList: { type: "array", items: { type: "string" } } },
+                required: ["libraryList"]
+            }
+        },
+        {
+            name: "ibmi.profiles.list",
+            description: "List connection profiles.",
+            inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
+        },
+        {
+            name: "ibmi.profiles.save",
+            description: "Create or update a connection profile.",
+            inputSchema: {
+                type: "object",
+                properties: { connectionName: { type: "string" }, profile: { type: "object" } },
+                required: ["profile"]
+            }
+        },
+        {
+            name: "ibmi.profiles.delete",
+            description: "Delete a connection profile.",
+            inputSchema: {
+                type: "object",
+                properties: { connectionName: { type: "string" }, name: { type: "string" } },
+                required: ["name"]
+            }
+        },
+        {
+            name: "ibmi.profiles.activate",
+            description: "Activate a profile for a connection.",
+            inputSchema: {
+                type: "object",
+                properties: { connectionName: { type: "string" }, name: { type: "string" }, applyToJob: { type: "boolean", default: false } },
+                required: ["name"]
+            }
+        },
+        {
+            name: "ibmi.resolve.path",
+            description: "Resolve a member or IFS path and return details if it exists.",
+            inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+        },
+        {
+            name: "ibmi.deploy.uploadDirectory",
+            description: "Upload a local directory to IFS.",
+            inputSchema: {
+                type: "object",
+                properties: { localPath: { type: "string" }, remotePath: { type: "string" } },
+                required: ["localPath", "remotePath"]
+            }
+        },
+        {
+            name: "ibmi.deploy.uploadFiles",
+            description: "Upload local files to a remote directory.",
+            inputSchema: {
+                type: "object",
+                properties: { localFiles: { type: "array", items: { type: "string" } }, remoteDirectory: { type: "string" } },
+                required: ["localFiles", "remoteDirectory"]
+            }
+        },
+        {
+            name: "ibmi.deploy.setCcsid",
+            description: "Set CCSID for a remote path (recursive).",
+            inputSchema: {
+                type: "object",
+                properties: { remotePath: { type: "string" }, ccsid: { type: "string", default: "1208" } },
+                required: ["remotePath"]
+            }
+        },
+        {
+            name: "ibmi.filters.list",
+            description: "List object filters.",
+            inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
+        },
+        {
+            name: "ibmi.filters.save",
+            description: "Create or update an object filter.",
+            inputSchema: { type: "object", properties: { connectionName: { type: "string" }, filter: { type: "object" } }, required: ["filter"] }
+        },
+        {
+            name: "ibmi.filters.delete",
+            description: "Delete an object filter by name.",
+            inputSchema: { type: "object", properties: { connectionName: { type: "string" }, name: { type: "string" } }, required: ["name"] }
+        },
+        {
+            name: "ibmi.ifs.shortcuts.list",
+            description: "List IFS shortcuts.",
+            inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
+        },
+        {
+            name: "ibmi.ifs.shortcuts.add",
+            description: "Add an IFS shortcut.",
+            inputSchema: { type: "object", properties: { connectionName: { type: "string" }, path: { type: "string" } }, required: ["path"] }
+        },
+        {
+            name: "ibmi.ifs.shortcuts.delete",
+            description: "Delete an IFS shortcut.",
+            inputSchema: { type: "object", properties: { connectionName: { type: "string" }, path: { type: "string" } }, required: ["path"] }
+        },
+        {
+            name: "ibmi.debug.status",
+            description: "Check IBM i debug service status.",
+            inputSchema: { type: "object", properties: {} }
+        },
+        {
+            name: "ibmi.debug.startService",
+            description: "Start IBM i debug service (best-effort).",
+            inputSchema: { type: "object", properties: { submitOptions: { type: "string" }, javaHome: { type: "string" } } }
+        },
+        {
+            name: "ibmi.debug.stopService",
+            description: "Stop IBM i debug service (best-effort).",
+            inputSchema: { type: "object", properties: {} }
+        },
+        {
+            name: "ibmi.deploy.compare",
+            description: "Compare local and remote directories (by relative paths).",
+            inputSchema: { type: "object", properties: { localPath: { type: "string" }, remotePath: { type: "string" } }, required: ["localPath", "remotePath"] }
+        },
+        {
+            name: "ibmi.deploy.sync",
+            description: "Sync local directory to remote (upload missing or overwrite).",
+            inputSchema: { type: "object", properties: { localPath: { type: "string" }, remotePath: { type: "string" }, overwrite: { type: "boolean", default: false } }, required: ["localPath", "remotePath"] }
         }
     ];
 }
@@ -356,31 +531,43 @@ export async function handleTool(ctx, name, args) {
         }
         case "ibmi.qsys.members.write": {
             const conn = ctx.ensureActive();
+            if (conn.getConfig().readOnlyMode)
+                throw new Error("Connection is in read-only mode");
             await conn.content.uploadMemberContent(args.library, args.sourceFile, args.member, args.content);
             return result("OK");
         }
         case "ibmi.qsys.members.create": {
             const conn = ctx.ensureActive();
+            if (conn.getConfig().readOnlyMode)
+                throw new Error("Connection is in read-only mode");
             await conn.content.createMember(args.library, args.sourceFile, args.member, args.srctype);
             return result("OK");
         }
         case "ibmi.qsys.members.rename": {
             const conn = ctx.ensureActive();
+            if (conn.getConfig().readOnlyMode)
+                throw new Error("Connection is in read-only mode");
             await conn.content.renameMember(args.library, args.sourceFile, args.member, args.newMember);
             return result("OK");
         }
         case "ibmi.qsys.members.delete": {
             const conn = ctx.ensureActive();
+            if (conn.getConfig().readOnlyMode)
+                throw new Error("Connection is in read-only mode");
             await conn.content.deleteMember(args.library, args.sourceFile, args.member);
             return result("OK");
         }
         case "ibmi.qsys.sourcefiles.create": {
             const conn = ctx.ensureActive();
+            if (conn.getConfig().readOnlyMode)
+                throw new Error("Connection is in read-only mode");
             await conn.content.createSourceFile(args.library, args.sourceFile, args.rcdlen || 112);
             return result("OK");
         }
         case "ibmi.qsys.libraries.create": {
             const conn = ctx.ensureActive();
+            if (conn.getConfig().readOnlyMode)
+                throw new Error("Connection is in read-only mode");
             await conn.content.createLibrary(args.library);
             return result("OK");
         }
@@ -396,6 +583,8 @@ export async function handleTool(ctx, name, args) {
         }
         case "ibmi.ifs.write": {
             const conn = ctx.ensureActive();
+            if (conn.getConfig().readOnlyMode)
+                throw new Error("Connection is in read-only mode");
             await conn.content.writeStreamfileRaw(args.path, args.content);
             return result("OK");
         }
@@ -435,12 +624,12 @@ export async function handleTool(ctx, name, args) {
         case "ibmi.search.ifs": {
             const conn = ctx.ensureActive();
             const data = await Search.searchIFS(conn, args.path, args.term);
-            return json(data);
+            return json(data ?? { term: args.term, hits: [] });
         }
         case "ibmi.find.ifs": {
             const conn = ctx.ensureActive();
             const data = await Search.findIFS(conn, args.path, args.term);
-            return json(data);
+            return json(data ?? { term: args.term, hits: [] });
         }
         case "ibmi.actions.list": {
             let actions = await listActions(ctx);
@@ -455,6 +644,8 @@ export async function handleTool(ctx, name, args) {
         }
         case "ibmi.actions.run": {
             const conn = ctx.ensureActive();
+            if (conn.getConfig().readOnlyMode)
+                throw new Error("Connection is in read-only mode");
             const action = await resolveAction(ctx, args);
             if (!action)
                 throw new Error("Action not found");
@@ -473,14 +664,22 @@ export async function handleTool(ctx, name, args) {
                 envVars["&RELATIVEPATH"] = targetPath;
             }
             if (targetType === "member") {
-                const lib = args.library;
-                const src = args.sourceFile;
-                const mbr = args.member || targetPath.split("/").pop();
+                const lib = String(args.library || "").toUpperCase();
+                const src = String(args.sourceFile || "").toUpperCase();
+                const mbr = String(args.member || targetPath.split("/").pop() || "").toUpperCase();
+                const ext = String(args.extension || "");
                 envVars["&LIBRARY"] = lib;
                 envVars["&SRCFILE"] = src;
                 envVars["&NAME"] = mbr;
-                envVars["&EXT"] = args.extension || "";
+                envVars["&EXT"] = ext;
+                envVars["&EXTL"] = ext.toLowerCase();
                 envVars["&FULLPATH"] = `${lib}/${src}/${mbr}`;
+                envVars["&OPENLIB"] = lib;
+                envVars["&OPENLIBL"] = lib.toLowerCase();
+                envVars["&OPENSPF"] = src;
+                envVars["&OPENSPFL"] = src.toLowerCase();
+                envVars["&OPENMBR"] = mbr;
+                envVars["&OPENMBRL"] = mbr.toLowerCase();
             }
             const resultCmd = await CompileTools.runCommand(conn, {
                 command: action.command,
@@ -499,6 +698,276 @@ export async function handleTool(ctx, name, args) {
         case "ibmi.actions.delete": {
             await ctx.store.deleteAction(args.name);
             return result(`Action ${args.name} deleted`);
+        }
+        case "ibmi.libl.get": {
+            const name = getConnectionName(ctx, args);
+            const conn = await ctx.store.getConnection(name);
+            if (!conn)
+                throw new Error(`Connection ${name} not found`);
+            const settings = conn.settings || {};
+            return json({
+                currentLibrary: settings.currentLibrary ?? ctx.active?.getConfig().currentLibrary,
+                libraryList: settings.libraryList ?? ctx.active?.getConfig().libraryList ?? []
+            });
+        }
+        case "ibmi.libl.set": {
+            const name = getConnectionName(ctx, args);
+            await updateConnectionSettings(ctx, name, {
+                currentLibrary: args.currentLibrary,
+                libraryList: args.libraryList
+            });
+            if (args.applyToJob) {
+                const conn = ctx.ensureActive();
+                await applyLibraryList(conn, args.libraryList, args.currentLibrary);
+            }
+            return result("OK");
+        }
+        case "ibmi.libl.add": {
+            const name = getConnectionName(ctx, args);
+            const conn = await ctx.store.getConnection(name);
+            if (!conn)
+                throw new Error(`Connection ${name} not found`);
+            const list = conn.settings?.libraryList || [];
+            const lib = String(args.library).toUpperCase();
+            if (!list.includes(lib))
+                list.push(lib);
+            await updateConnectionSettings(ctx, name, { libraryList: list });
+            if (args.applyToJob) {
+                const active = ctx.ensureActive();
+                await applyLibraryList(active, list, conn.settings?.currentLibrary);
+            }
+            return result("OK");
+        }
+        case "ibmi.libl.remove": {
+            const name = getConnectionName(ctx, args);
+            const conn = await ctx.store.getConnection(name);
+            if (!conn)
+                throw new Error(`Connection ${name} not found`);
+            const list = (conn.settings?.libraryList || []).filter(l => l !== String(args.library).toUpperCase());
+            await updateConnectionSettings(ctx, name, { libraryList: list });
+            if (args.applyToJob) {
+                const active = ctx.ensureActive();
+                await applyLibraryList(active, list, conn.settings?.currentLibrary);
+            }
+            return result("OK");
+        }
+        case "ibmi.libl.setCurrent": {
+            const name = getConnectionName(ctx, args);
+            const lib = String(args.library).toUpperCase();
+            await updateConnectionSettings(ctx, name, { currentLibrary: lib });
+            if (args.applyToJob) {
+                const active = ctx.ensureActive();
+                await applyLibraryList(active, undefined, lib);
+            }
+            return result("OK");
+        }
+        case "ibmi.libl.validate": {
+            const conn = ctx.ensureActive();
+            const bad = await conn.content.validateLibraryList(args.libraryList);
+            return json({ badLibraries: bad });
+        }
+        case "ibmi.profiles.list": {
+            const name = getConnectionName(ctx, args);
+            const profiles = await ctx.store.listProfiles(name);
+            return json(profiles);
+        }
+        case "ibmi.profiles.save": {
+            const name = getConnectionName(ctx, args);
+            const profile = args.profile;
+            if (!profile?.name)
+                throw new Error("Profile must include a name");
+            await ctx.store.saveProfile(name, profile);
+            return result(`Profile ${profile.name} saved`);
+        }
+        case "ibmi.profiles.delete": {
+            const name = getConnectionName(ctx, args);
+            await ctx.store.deleteProfile(name, args.name);
+            return result(`Profile ${args.name} deleted`);
+        }
+        case "ibmi.profiles.activate": {
+            const name = getConnectionName(ctx, args);
+            const connInfo = await ctx.store.getConnection(name);
+            if (!connInfo)
+                throw new Error(`Connection ${name} not found`);
+            const profile = (connInfo.profiles || []).find(p => p.name === args.name);
+            if (!profile)
+                throw new Error(`Profile ${args.name} not found`);
+            await ctx.store.setCurrentProfile(name, args.name);
+            await updateConnectionSettings(ctx, name, {
+                currentLibrary: profile.currentLibrary,
+                libraryList: profile.libraryList,
+                customVariables: profile.customVariables
+            });
+            if (args.applyToJob) {
+                const active = ctx.ensureActive();
+                await applyLibraryList(active, profile.libraryList, profile.currentLibrary);
+            }
+            return result(`Profile ${args.name} activated`);
+        }
+        case "ibmi.resolve.path": {
+            const conn = ctx.ensureActive();
+            const pathStr = String(args.path);
+            if (pathStr.startsWith("/")) {
+                const isDir = await conn.content.testStreamFile(pathStr, "d");
+                const isFile = await conn.content.testStreamFile(pathStr, "e");
+                return json({ type: "ifs", exists: isDir || isFile, kind: isDir ? "directory" : isFile ? "streamfile" : "unknown", path: pathStr });
+            }
+            const parts = pathStr.split("/").filter(Boolean);
+            if (parts.length < 3)
+                throw new Error("Member path should be LIB/FILE/MEMBER(.ext)");
+            const lib = parts.length === 4 ? parts[1] : parts[0];
+            const file = parts.length === 4 ? parts[2] : parts[1];
+            const memberPart = parts.length === 4 ? parts[3] : parts[2];
+            const member = memberPart.includes(".") ? memberPart.substring(0, memberPart.indexOf(".")) : memberPart;
+            const info = await conn.content.getMemberInfo(lib, file, member);
+            return json({ type: "member", exists: Boolean(info), details: info || { library: lib, file, name: member } });
+        }
+        case "ibmi.deploy.uploadDirectory": {
+            const conn = ctx.ensureActive();
+            if (conn.getConfig().readOnlyMode)
+                throw new Error("Connection is in read-only mode");
+            await conn.client.putDirectory(args.localPath, args.remotePath, { recursive: true, concurrency: 5 });
+            return result("OK");
+        }
+        case "ibmi.deploy.uploadFiles": {
+            const conn = ctx.ensureActive();
+            if (conn.getConfig().readOnlyMode)
+                throw new Error("Connection is in read-only mode");
+            const remoteDir = String(args.remoteDirectory);
+            for (const file of args.localFiles || []) {
+                const base = String(file).split(/[\\/]/).pop();
+                const remotePath = `${remoteDir}/${base}`;
+                await conn.client.putFile(String(file), remotePath);
+            }
+            return result("OK");
+        }
+        case "ibmi.deploy.setCcsid": {
+            const conn = ctx.ensureActive();
+            if (conn.getConfig().readOnlyMode)
+                throw new Error("Connection is in read-only mode");
+            const setccsid = conn.remoteFeatures.setccsid;
+            if (!setccsid)
+                throw new Error("setccsid not available on remote system");
+            const ccsid = args.ccsid || "1208";
+            await conn.sendCommand({ command: `${setccsid} -R ${ccsid} ${args.remotePath}` });
+            return result("OK");
+        }
+        case "ibmi.filters.list": {
+            const name = getConnectionName(ctx, args);
+            const connInfo = await ctx.store.getConnection(name);
+            if (!connInfo)
+                throw new Error(`Connection ${name} not found`);
+            return json(connInfo.settings?.objectFilters || []);
+        }
+        case "ibmi.filters.save": {
+            const name = getConnectionName(ctx, args);
+            const connInfo = await ctx.store.getConnection(name);
+            if (!connInfo)
+                throw new Error(`Connection ${name} not found`);
+            const filter = args.filter;
+            if (!filter?.name)
+                throw new Error("Filter must include a name");
+            const list = connInfo.settings?.objectFilters || [];
+            const idx = list.findIndex((f) => f.name === filter.name);
+            if (idx >= 0)
+                list[idx] = filter;
+            else
+                list.push(filter);
+            await updateConnectionSettings(ctx, name, { objectFilters: list });
+            return result(`Filter ${filter.name} saved`);
+        }
+        case "ibmi.filters.delete": {
+            const name = getConnectionName(ctx, args);
+            const connInfo = await ctx.store.getConnection(name);
+            if (!connInfo)
+                throw new Error(`Connection ${name} not found`);
+            const list = (connInfo.settings?.objectFilters || []).filter((f) => f.name !== args.name);
+            await updateConnectionSettings(ctx, name, { objectFilters: list });
+            return result(`Filter ${args.name} deleted`);
+        }
+        case "ibmi.ifs.shortcuts.list": {
+            const name = getConnectionName(ctx, args);
+            const connInfo = await ctx.store.getConnection(name);
+            if (!connInfo)
+                throw new Error(`Connection ${name} not found`);
+            return json(connInfo.settings?.ifsShortcuts || []);
+        }
+        case "ibmi.ifs.shortcuts.add": {
+            const name = getConnectionName(ctx, args);
+            const connInfo = await ctx.store.getConnection(name);
+            if (!connInfo)
+                throw new Error(`Connection ${name} not found`);
+            const list = connInfo.settings?.ifsShortcuts || [];
+            if (!list.includes(args.path))
+                list.push(args.path);
+            await updateConnectionSettings(ctx, name, { ifsShortcuts: list });
+            return result("OK");
+        }
+        case "ibmi.ifs.shortcuts.delete": {
+            const name = getConnectionName(ctx, args);
+            const connInfo = await ctx.store.getConnection(name);
+            if (!connInfo)
+                throw new Error(`Connection ${name} not found`);
+            const list = (connInfo.settings?.ifsShortcuts || []).filter((p) => p !== args.path);
+            await updateConnectionSettings(ctx, name, { ifsShortcuts: list });
+            return result("OK");
+        }
+        case "ibmi.debug.status": {
+            const conn = ctx.ensureActive();
+            const port = conn.getConfig().debugPort || 8005;
+            const rows = await conn.runSQL(`select job_name, local_port from qsys2.netstat_job_info where local_port = ${port} and remote_address = '0.0.0.0' fetch first 1 row only`);
+            if (rows.length === 0)
+                return json({ running: false, port });
+            return json({ running: true, port, job: rows[0].JOB_NAME });
+        }
+        case "ibmi.debug.startService": {
+            const conn = ctx.ensureActive();
+            if (conn.getConfig().readOnlyMode)
+                throw new Error("Connection is in read-only mode");
+            const javaHome = args.javaHome ? `export JAVA_HOME=${args.javaHome};` : ``;
+            const submitOptions = args.submitOptions || `JOBQ(QSYS/QUSRNOMAX) JOBD(QSYS/QSYSJOBD) OUTQ(QUSRSYS/QDBGSRV) USER(QDBGSRV)`;
+            const cmd = `QSYS/SBMJOB JOB(QDBGSRV) SYSLIBL(*SYSVAL) CURLIB(*USRPRF) INLLIBL(*JOBD) ${submitOptions} CMD(QSH CMD('${javaHome}/QIBM/ProdData/IBMiDebugService/bin/startDebugService.sh'))`;
+            const res = await conn.sendQsh({ command: `system \"${cmd}\"` });
+            return json(res);
+        }
+        case "ibmi.debug.stopService": {
+            const conn = ctx.ensureActive();
+            if (conn.getConfig().readOnlyMode)
+                throw new Error("Connection is in read-only mode");
+            const res = await conn.sendCommand({ command: `/QIBM/ProdData/IBMiDebugService/bin/stopDebugService.sh` });
+            return json(res);
+        }
+        case "ibmi.deploy.compare": {
+            const conn = ctx.ensureActive();
+            const localPath = String(args.localPath);
+            const remotePath = String(args.remotePath);
+            const localFiles = await listLocalFiles(localPath);
+            const remoteFiles = await listRemoteFiles(conn, remotePath);
+            const localSet = new Set(localFiles);
+            const remoteSet = new Set(remoteFiles);
+            const onlyLocal = localFiles.filter(f => !remoteSet.has(f));
+            const onlyRemote = remoteFiles.filter(f => !localSet.has(f));
+            const common = localFiles.filter(f => remoteSet.has(f));
+            return json({ onlyLocal, onlyRemote, common });
+        }
+        case "ibmi.deploy.sync": {
+            const conn = ctx.ensureActive();
+            if (conn.getConfig().readOnlyMode)
+                throw new Error("Connection is in read-only mode");
+            const localPath = String(args.localPath);
+            const remotePath = String(args.remotePath);
+            const overwrite = Boolean(args.overwrite);
+            const localFiles = await listLocalFiles(localPath);
+            const remoteFiles = await listRemoteFiles(conn, remotePath);
+            const remoteSet = new Set(remoteFiles);
+            for (const rel of localFiles) {
+                if (!overwrite && remoteSet.has(rel))
+                    continue;
+                const localFile = require("path").join(localPath, rel);
+                const remoteFile = `${remotePath}/${rel}`.replace(/\\/g, "/");
+                await conn.client.putFile(localFile, remoteFile);
+            }
+            return result("OK");
         }
     }
     throw new Error(`Unknown tool: ${name}`);
@@ -521,4 +990,62 @@ function result(text) {
 }
 function json(obj) {
     return { content: [{ type: "text", text: JSON.stringify(obj, null, 2) }] };
+}
+function getConnectionName(ctx, args) {
+    const name = args?.connectionName || ctx.activeName;
+    if (!name)
+        throw new Error("connectionName is required (no active connection)");
+    return name;
+}
+async function updateConnectionSettings(ctx, name, update) {
+    const conn = await ctx.store.getConnection(name);
+    if (!conn)
+        throw new Error(`Connection ${name} not found`);
+    conn.settings = { ...(conn.settings || {}), ...stripUndefined(update) };
+    await ctx.store.upsertConnection(conn);
+    if (ctx.active && ctx.activeName === name) {
+        ctx.active.setConfig({ ...ctx.active.getConfig(), ...conn.settings });
+    }
+}
+async function applyLibraryList(conn, libraryList, currentLibrary) {
+    if (libraryList && libraryList.length > 0) {
+        const libs = libraryList.map((l) => l.toUpperCase()).join(" ");
+        await conn.sendQsh({ command: `system \"CHGLIBL LIBL(${libs})\"` });
+    }
+    if (currentLibrary) {
+        const lib = String(currentLibrary).toUpperCase();
+        await conn.sendQsh({ command: `system \"CHGCURLIB ${lib}\"` });
+    }
+}
+function stripUndefined(obj) {
+    const out = {};
+    for (const [k, v] of Object.entries(obj)) {
+        if (v !== undefined)
+            out[k] = v;
+    }
+    return out;
+}
+async function listLocalFiles(root) {
+    const results = [];
+    async function walk(dir) {
+        const entries = await fs.readdir(dir, { withFileTypes: true });
+        for (const entry of entries) {
+            const full = path.join(dir, entry.name);
+            const rel = path.relative(root, full).replace(/\\/g, "/");
+            if (entry.isDirectory()) {
+                await walk(full);
+            }
+            else {
+                results.push(rel);
+            }
+        }
+    }
+    await walk(root);
+    return results;
+}
+async function listRemoteFiles(conn, remoteRoot) {
+    const find = conn.remoteFeatures.find || "/QOpenSys/pkgs/bin/find";
+    const res = await conn.sendCommand({ command: `${find} ${remoteRoot} -type f -print` });
+    const lines = res.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+    return lines.map((line) => line.replace(remoteRoot.replace(/\/$/, ""), "").replace(/^[\\/]/, ""));
 }

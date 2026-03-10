@@ -69,6 +69,10 @@ export namespace Search {
     if (grepRes.code === 0) {
       return { term: searchTerm, hits: parseGrepOutput(grepRes.stdout) };
     }
+    // grep returns exit code 1 when no matches are found
+    if (grepRes.code === 1 && !grepRes.stderr) {
+      return { term: searchTerm, hits: [] };
+    }
   }
 
   export async function findIFS(connection: IBMiClient, path: string, findTerm: string): Promise<SearchResults | undefined> {
@@ -79,8 +83,11 @@ export namespace Search {
       command: `${find} ${Tools.escapePath(path)} -type f -iname '*${findTerm}*' -print`
     });
 
-    if (findRes.code === 0 && findRes.stdout) {
-      return { term: findTerm, hits: parseFindOutput(findRes.stdout) };
+    if (findRes.code === 0) {
+      if (findRes.stdout) {
+        return { term: findTerm, hits: parseFindOutput(findRes.stdout) };
+      }
+      return { term: findTerm, hits: [] };
     }
   }
 

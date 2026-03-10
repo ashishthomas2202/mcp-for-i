@@ -101,11 +101,13 @@ export namespace CompileTools {
   }
 
   function buildLiblistCommands(connection: IBMiClient, config: ILELibrarySettings): string[] {
-    const defaultLibs = config.libraryList.length ? config.libraryList : [];
+    const defaultLibs = Tools.sanitizeObjNamesForPase((connection.defaultUserLibraries || []).filter(l => l && l !== "QSYS"));
+    const currentLib = Tools.sanitizeObjNamesForPase([config.currentLibrary || "QGPL"])[0];
+    const userLibs = Tools.sanitizeObjNamesForPase(buildLibraryList(config));
     return [
       `liblist -d ${IBMiClient.escapeForShell(defaultLibs.join(` `))}`,
-      `liblist -c ${IBMiClient.escapeForShell(config.currentLibrary)}`,
-      `liblist -a ${IBMiClient.escapeForShell(buildLibraryList(config).join(` `))}`
+      `liblist -c ${IBMiClient.escapeForShell(currentLib)}`,
+      `liblist -a ${IBMiClient.escapeForShell(userLibs.join(` `))}`
     ];
   }
 }

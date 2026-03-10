@@ -4,12 +4,37 @@ import os from "os";
 import { Tools } from "./Tools.js";
 import { IBMiClient } from "./client.js";
 import { IBMiMember, IBMiObject, IFSFile } from "./types.js";
+import { SourceDateStore, makeAliasName } from "./sourceDates.js";
 
 export class IBMiContent {
+  private readonly sourceDates = new SourceDateStore();
+
   constructor(private readonly ibmi: IBMiClient) {}
 
   private get config() {
     return this.ibmi.getConfig();
+  }
+
+  private async getTempLibrary(): Promise<string | undefined> {
+    const desired = this.ibmi.upperCaseName(this.config.tempLibrary || "ILEDITOR");
+    if (desired === "QTEMP") return "QTEMP";
+    try {
+      const rows = await this.ibmi.runSQL(
+        `select SYSTEM_SCHEMA_NAME from QSYS2.SYSSCHEMAS where SYSTEM_SCHEMA_NAME='${desired}'`
+      );
+      if (rows.length > 0) return desired;
+    } catch {
+      // ignore and fall back to QTEMP
+    }
+    if (!this.config.readOnlyMode) {
+      try {
+        await this.createLibrary(desired);
+        return desired;
+      } catch {
+        // ignore
+      }
+    }
+    return undefined;
   }
 
   async downloadStreamfileRaw(remotePath: string): Promise<Uint8Array> {
@@ -59,6 +84,10 @@ export class IBMiContent {
   }
 
   async downloadMemberContent(library: string, sourceFile: string, member: string): Promise<string> {
+    if (this.config.enableSourceDates) {
+      const withDates = await this.downloadMemberContentWithDates(library, sourceFile, member);
+      if (withDates !== undefined) return withDates;
+    }
     const lib = this.ibmi.upperCaseName(library);
     const file = this.ibmi.upperCaseName(sourceFile);
     const mbr = this.ibmi.upperCaseName(member);
@@ -77,6 +106,18 @@ export class IBMiContent {
   }
 
   async uploadMemberContent(library: string, sourceFile: string, member: string, content: Uint8Array | string) {
+    if (this.config.enableSourceDates) {
+      try {
+        await this.uploadMemberContentWithDates(library, sourceFile, member, content.toString());
+        return;
+      } catch {
+        // Fall back to normal upload without source dates
+      }
+    }
+    await this.uploadMemberContentRaw(library, sourceFile, member, content);
+  }
+
+  private async uploadMemberContentRaw(library: string, sourceFile: string, member: string, content: Uint8Array | string) {
     this.assertWritable();
     const lib = this.ibmi.upperCaseName(library);
     const file = this.ibmi.upperCaseName(sourceFile);
@@ -109,6 +150,57 @@ export class IBMiContent {
     }));
   }
 
+  async getLibraryList(libraries: string[]): Promise<IBMiObject[]> {
+    const libs = libraries.map(l => this.ibmi.upperCaseName(l));
+    if (libs.length === 0) return [];
+
+    const inClause = libs.map(l => `'${l}'`).join(", ");
+    const rows = await this.ibmi.runSQL(
+      `select SYSTEM_SCHEMA_NAME, SCHEMA_TEXT from QSYS2.SYSSCHEMAS where SYSTEM_SCHEMA_NAME in (${inClause})`
+    );
+
+    const found = rows.map(r => ({
+      library: "QSYS",
+      name: String(r.SYSTEM_SCHEMA_NAME),
+      type: "*LIB",
+      text: String(r.SCHEMA_TEXT || "")
+    } as IBMiObject));
+
+    return libs.map(library => {
+      return found.find(f => f.name === library) || {
+        library: "QSYS",
+        name: library,
+        type: "*LIB",
+        text: "*** NOT FOUND ***"
+      };
+    });
+  }
+
+  async validateLibraryList(newLibl: string[]): Promise<string[]> {
+    let badLibs: string[] = [];
+    const libs = newLibl
+      .map(l => this.ibmi.upperCaseName(l))
+      .filter(l => {
+        const ok = this.ibmi.validQsysName(l);
+        if (!ok) badLibs.push(l);
+        return ok;
+      });
+
+    if (libs.length === 0) return badLibs;
+
+    const inClause = libs.map(l => `'${l}'`).join(", ");
+    const rows = await this.ibmi.runSQL(
+      `select SYSTEM_SCHEMA_NAME from QSYS2.SYSSCHEMAS where SYSTEM_SCHEMA_NAME in (${inClause})`
+    );
+    const existing = rows.map(r => String(r.SYSTEM_SCHEMA_NAME));
+
+    libs.forEach(l => {
+      if (!existing.includes(l)) badLibs.push(l);
+    });
+
+    return badLibs;
+  }
+
   async getObjectList(library: string, types: string[] = ["*ALL"]): Promise<IBMiObject[]> {
     const lib = this.ibmi.upperCaseName(library);
     const typesList = types.join(" ");
@@ -137,6 +229,144 @@ export class IBMiContent {
       extension: String(r.SOURCE_TYPE || ""),
       text: String(r.PARTITION_TEXT || "")
     }));
+  }
+
+  async getMemberInfo(library: string, sourceFile: string, member: string): Promise<IBMiMember | undefined> {
+    const lib = this.ibmi.upperCaseName(library);
+    const file = this.ibmi.upperCaseName(sourceFile);
+    const mbr = this.ibmi.upperCaseName(member);
+    const rows = await this.ibmi.runSQL(
+      `select SYSTEM_TABLE_MEMBER, SOURCE_TYPE, PARTITION_TEXT from QSYS2.SYSPARTITIONSTAT where SYSTEM_TABLE_SCHEMA='${lib}' and SYSTEM_TABLE_NAME='${file}' and SYSTEM_TABLE_MEMBER='${mbr}'`
+    );
+    const row = rows[0];
+    if (!row) return undefined;
+    return {
+      library: lib,
+      file,
+      name: String(row.SYSTEM_TABLE_MEMBER),
+      extension: String(row.SOURCE_TYPE || ""),
+      text: String(row.PARTITION_TEXT || "")
+    };
+  }
+
+  async downloadMemberContentWithDates(library: string, sourceFile: string, member: string): Promise<string | undefined> {
+    const lib = this.ibmi.upperCaseName(library);
+    const file = this.ibmi.upperCaseName(sourceFile);
+    const mbr = this.ibmi.upperCaseName(member);
+
+    const tempLib = await this.getTempLibrary();
+    if (!tempLib) return undefined;
+    const alias = makeAliasName(`${lib}/${file}/${mbr}`);
+    const aliasPath = `${tempLib}.${alias}`;
+
+    try {
+      await this.ibmi.runSQL(`CREATE OR REPLACE ALIAS ${aliasPath} for \"${lib}\".\"${file}\"(\"${mbr}\")`);
+    } catch {
+      // ignore, alias might already exist
+    }
+
+    const recordLength = await this.getRecordLength(aliasPath, lib, file);
+
+    const rows = await this.ibmi.runSQL(
+      `select case when locate('40',hex(srcdat)) > 0 then 0 else srcdat end as SRCDAT, srcseq, srcdta from ${aliasPath}`
+    );
+
+    if (!rows || rows.length === 0) {
+      return "";
+    }
+
+    const sourceDates = rows.map(row => String(row.SRCDAT).padStart(6, `0`));
+    const body = rows.map(row => String(row.SRCDTA ?? "")).join(`\n`);
+
+    this.sourceDates.setBase(`${lib}/${file}/${mbr}`, body, sourceDates, recordLength);
+    return body;
+  }
+
+  async uploadMemberContentWithDates(library: string, sourceFile: string, member: string, body: string) {
+    this.assertWritable();
+    const lib = this.ibmi.upperCaseName(library);
+    const file = this.ibmi.upperCaseName(sourceFile);
+    const mbr = this.ibmi.upperCaseName(member);
+
+    const tempLib = await this.getTempLibrary();
+    if (!tempLib) {
+      throw new Error(`Temp library is not available for source-date updates.`);
+    }
+    const alias = makeAliasName(`${lib}/${file}/${mbr}`);
+    const aliasPath = `${tempLib}.${alias}`;
+
+    const baseKey = `${lib}/${file}/${mbr}`;
+    if (!this.sourceDates.getBaseSource(baseKey)) {
+      await this.downloadMemberContentWithDates(lib, file, mbr);
+    }
+
+    const sourceDates = this.sourceDates.calcNewSourceDates(baseKey, body);
+    const recordLength = this.sourceDates.getRecordLength(baseKey) || await this.getRecordLength(aliasPath, lib, file);
+
+    const sourceData = body.split(`\n`);
+    const decimalSequence = sourceData.length >= 10000;
+
+    const rows: string[] = [];
+    for (let i = 0; i < sourceData.length; i++) {
+      const seq = decimalSequence ? ((i + 1) / 100) : (i + 1);
+      let line = sourceData[i].trimEnd();
+      if (line.length > recordLength) {
+        line = line.substring(0, recordLength);
+      }
+      const date = sourceDates[i] ? sourceDates[i].padEnd(6, `0`) : `0`;
+      rows.push(`(${seq}, ${date}, '${escapeString(line)}')`);
+    }
+
+    const tempTable = `QTEMP.NEWMEMBER`;
+    const statements: string[] = [
+      `CREATE TABLE ${tempTable} LIKE \"${lib}\".\"${file}\";`
+    ];
+
+    const rowLength = recordLength + 55;
+    const perInsert = Math.max(1, Math.floor(400000 / rowLength));
+    for (let i = 0; i < rows.length; i += perInsert) {
+      statements.push(`insert into ${tempTable} values ${rows.slice(i, i + perInsert).join(`,`)};`);
+    }
+
+    statements.push(
+      `CALL QSYS2.QCMDEXC('CLRPFM FILE(${lib}/${file}) MBR(${mbr})');`,
+      `insert into ${aliasPath} (select * from ${tempTable});`
+    );
+
+    const tempRmt = this.ibmi.getTempRemote(`${lib}${file}${mbr}`);
+    await this.writeStreamfileRaw(tempRmt, statements.join(`\n`));
+
+    const setccsid = this.ibmi.remoteFeatures.setccsid;
+    if (setccsid) {
+      await this.ibmi.sendCommand({ command: `${setccsid} 1208 ${tempRmt}` });
+    }
+
+    const result = await this.ibmi.sendQsh({
+      command: `system \"RUNSQLSTM SRCSTMF('${tempRmt}') COMMIT(*NONE) NAMING(*SQL)\"`
+    });
+
+    if (result.code !== 0) {
+      throw new Error(`Failed to save member with source dates: ${result.stderr || result.stdout}`);
+    }
+  }
+
+  private async getRecordLength(aliasPath: string, lib: string, file: string): Promise<number> {
+    let recordLength = 80;
+    try {
+      const res = await this.ibmi.runSQL(`select length(SRCDTA) as LENGTH from ${aliasPath} fetch first 1 rows only`);
+      if (res.length > 0 && res[0].LENGTH) {
+        recordLength = Number(res[0].LENGTH);
+        return recordLength;
+      }
+    } catch {}
+
+    try {
+      const res = await this.ibmi.runSQL(`select row_length-12 as LENGTH from QSYS2.SYSTABLES where SYSTEM_TABLE_SCHEMA = '${lib}' and SYSTEM_TABLE_NAME = '${file}' fetch first 1 rows only`);
+      if (res.length > 0 && res[0].LENGTH) {
+        recordLength = Number(res[0].LENGTH);
+      }
+    } catch {}
+    return recordLength;
   }
 
   async createLibrary(library: string) {
@@ -188,4 +418,25 @@ export class IBMiContent {
       throw new Error("Connection is in read-only mode");
     }
   }
+}
+
+function escapeString(val: string): string {
+  return val.replace(/[\0\n\r\b\t'\x1a]/g, function (s) {
+    switch (s) {
+      case `\0`:
+        return `\\0`;
+      case `\n`:
+        return `\\n`;
+      case `\r`:
+        return ``;
+      case `\b`:
+        return `\\b`;
+      case `\x1a`:
+        return `\\Z`;
+      case `'`:
+        return `''`;
+      default:
+        return `\\` + s;
+    }
+  });
 }

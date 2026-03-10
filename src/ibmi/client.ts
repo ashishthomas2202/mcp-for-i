@@ -11,6 +11,7 @@ export class IBMiClient {
   client?: NodeSSH;
   content: IBMiContent;
   remoteFeatures: Record<string, string | undefined> = {};
+  defaultUserLibraries: string[] = [];
 
   currentHost = "";
   currentPort = 22;
@@ -42,6 +43,13 @@ export class IBMiClient {
     return Tools.upperCaseName(value);
   }
 
+  validQsysName(name: string): boolean {
+    if (!name) return false;
+    if (name.length > 10) return false;
+    const upper = this.upperCaseName(name);
+    return /^[A-Z][A-Z0-9_.]{0,9}$/.test(upper);
+  }
+
   async connect(connection: ConnectionData): Promise<void> {
     this.currentHost = connection.host;
     this.currentPort = connection.port;
@@ -61,6 +69,7 @@ export class IBMiClient {
     });
 
     await this.detectRemoteFeatures();
+    await this.loadDefaultLibraryList();
   }
 
   async disconnect(): Promise<void> {
@@ -116,9 +125,10 @@ export class IBMiClient {
 
   async runSQL(statements: string): Promise<Tools.DB2Row[]> {
     const input = Tools.fixSQL(statements, true);
-    const command = `${LOCALE} system "call QSYS/QZDFMDB2 PARM('-d' '-i' '-t')"`;
+    const ccsid = this.config.sqlJobCcsid ?? 1208;
+    const command = `${LOCALE} system "CHGJOB CCSID(${ccsid})" ; ${LOCALE} system "call QSYS/QZDFMDB2 PARM('-d' '-i' '-t')"`;
 
-    const output = await this.sendCommand({ command, stdin: input });
+    const output = await this.sendCommand({ command, stdin: input, env: { QIBM_PASE_CCSID: String(ccsid) } });
     if (output.stderr && output.stderr.trim()) {
       // QZDFMDB2 tends to emit errors in stdout, but keep stderr for debugging
     }
@@ -127,6 +137,72 @@ export class IBMiClient {
       return Tools.db2Parse(output.stdout, input);
     }
     return [];
+  }
+
+  private async loadDefaultLibraryList() {
+    let currentLibrary = "QGPL";
+    this.defaultUserLibraries = [];
+    const userLibraries: string[] = [];
+
+    try {
+      const liblResult = await this.sendQsh({ command: `liblist` });
+      if (liblResult.code === 0) {
+        const lines = (liblResult.stdout || "").split(`\n`);
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const lib = line.substring(0, 10).trim();
+          const type = line.substring(12).trim();
+          switch (type) {
+            case `USR`:
+              if (lib) {
+                userLibraries.push(lib);
+                // QSYS cannot be removed from the library list
+                if (lib !== `QSYS`) this.defaultUserLibraries.push(lib);
+              }
+              break;
+            case `CUR`:
+              if (lib) currentLibrary = lib;
+              break;
+          }
+        }
+      }
+    } catch {
+      // ignore, leave defaults
+    }
+
+    this.defaultUserLibraries = this.defaultUserLibraries.filter(Tools.distinct);
+    if (!this.config.currentLibrary) {
+      this.config.currentLibrary = currentLibrary;
+    }
+    if (!this.config.libraryList || this.config.libraryList.length === 0) {
+      this.config.libraryList = this.defaultUserLibraries.length > 0 ? [...this.defaultUserLibraries] : userLibraries.filter(Tools.distinct);
+    }
+
+    await this.validateConfiguredLibraryList();
+  }
+
+  private async validateConfiguredLibraryList() {
+    const libs = (this.config.libraryList || []).map(l => this.upperCaseName(l));
+    if (libs.length === 0) return;
+
+    const defaultLibs = Tools.sanitizeObjNamesForPase(this.defaultUserLibraries);
+    const sanitized = Tools.sanitizeObjNamesForPase(libs);
+    const commands = [
+      `liblist -d ${IBMiClient.escapeForShell(defaultLibs.join(` `))}`,
+      ...sanitized.map(lib => `liblist -a ${IBMiClient.escapeForShell(lib)}`)
+    ].join(`; `);
+
+    const result = await this.sendQsh({ command: commands });
+    const output = [result.stderr, result.stdout].filter(Boolean).join("\n");
+    if (output) {
+      const bad = libs.filter(lib => {
+        const re = new RegExp(`\\b${lib}\\b`, `i`);
+        return re.test(output);
+      });
+      if (bad.length > 0) {
+        this.config.libraryList = libs.filter(lib => !bad.includes(lib));
+      }
+    }
   }
 
   private async detectRemoteFeatures() {

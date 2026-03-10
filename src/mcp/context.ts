@@ -1,4 +1,4 @@
-import { ConfigStore } from "../config/store.js";
+import { ConfigStore, ConnectionProfile } from "../config/store.js";
 import { IBMiClient } from "../ibmi/client.js";
 import { ConnectionConfig, ConnectionData } from "../ibmi/types.js";
 import { getPassword } from "../security/credentialStore.js";
@@ -39,7 +39,9 @@ export class McpContext {
       password,
       privateKeyPath: stored.privateKeyPath
     };
-    return this.connect(connection, stored.settings);
+    const profile = resolveProfile(stored.currentProfile, stored.profiles);
+    const profileSettings = profileToSettings(profile);
+    return this.connect(connection, { ...stored.settings, ...profileSettings });
   }
 
   ensureActive(): IBMiClient {
@@ -54,4 +56,18 @@ export class McpContext {
       this.activeName = undefined;
     }
   }
+}
+
+function resolveProfile(name?: string, profiles?: ConnectionProfile[]) {
+  if (!name || !profiles) return undefined;
+  return profiles.find(p => p.name === name);
+}
+
+function profileToSettings(profile?: ConnectionProfile): Partial<ConnectionConfig> {
+  if (!profile) return {};
+  return {
+    currentLibrary: profile.currentLibrary,
+    libraryList: profile.libraryList,
+    customVariables: profile.customVariables
+  };
 }

@@ -49,3 +49,15 @@
   }
 }
 ```
+
+## Activate a profile
+```json
+{
+  "tool": "ibmi.profiles.activate",
+  "arguments": {
+    "connectionName": "DEV400",
+    "name": "projectA",
+    "applyToJob": true
+  }
+}
+```

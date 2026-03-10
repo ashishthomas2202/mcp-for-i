@@ -64,11 +64,27 @@ export interface ConnectionConfig {
   tempDir?: string;
   autoClearTempData?: boolean;
   sourceFileCCSID?: string;
+  sqlJobCcsid?: string | number;
   enableSourceDates?: boolean;
   homeDirectory?: string;
   libraryList?: string[];
   currentLibrary?: string;
   customVariables?: { name: string; value: string }[];
+  objectFilters?: ObjectFilter[];
+  ifsShortcuts?: string[];
+  debugPort?: number;
+  debugSepPort?: number;
+}
+
+export interface ObjectFilter {
+  name: string;
+  library: string;
+  object: string;
+  types: string[];
+  member: string;
+  memberType?: string;
+  protected?: boolean;
+  filterType?: "simple" | "regex";
 }
 
 export interface QsysPath {

@@ -34,7 +34,9 @@ export class McpContext {
             password,
             privateKeyPath: stored.privateKeyPath
         };
-        return this.connect(connection, stored.settings);
+        const profile = resolveProfile(stored.currentProfile, stored.profiles);
+        const profileSettings = profileToSettings(profile);
+        return this.connect(connection, { ...stored.settings, ...profileSettings });
     }
     ensureActive() {
         if (!this.active)
@@ -48,4 +50,18 @@ export class McpContext {
             this.activeName = undefined;
         }
     }
+}
+function resolveProfile(name, profiles) {
+    if (!name || !profiles)
+        return undefined;
+    return profiles.find(p => p.name === name);
+}
+function profileToSettings(profile) {
+    if (!profile)
+        return {};
+    return {
+        currentLibrary: profile.currentLibrary,
+        libraryList: profile.libraryList,
+        customVariables: profile.customVariables
+    };
 }

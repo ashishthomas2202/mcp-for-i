@@ -9,15 +9,29 @@ export type Settings = {
   tempDir: string;
   autoClearTempData: boolean;
   sourceFileCCSID: string;
+  sqlJobCcsid: number;
   enableSourceDates: boolean;
   homeDirectory: string;
   libraryList: string[];
   currentLibrary: string;
   customVariables: { name: string; value: string }[];
+  objectFilters: any[];
+  ifsShortcuts: string[];
+  debugPort: number;
+  debugSepPort: number;
+};
+
+export type ConnectionProfile = {
+  name: string;
+  currentLibrary?: string;
+  libraryList?: string[];
+  customVariables?: { name: string; value: string }[];
 };
 
 export type StoredConnection = Omit<ConnectionData, "password"> & {
   settings?: Partial<Settings>;
+  profiles?: ConnectionProfile[];
+  currentProfile?: string;
 };
 
 export type ConfigFile = {
@@ -32,11 +46,16 @@ const defaultSettings: Settings = {
   tempDir: "/tmp",
   autoClearTempData: true,
   sourceFileCCSID: "*FILE",
+  sqlJobCcsid: 1208,
   enableSourceDates: true,
   homeDirectory: ".",
   libraryList: [],
   currentLibrary: "",
-  customVariables: []
+  customVariables: [],
+  objectFilters: [],
+  ifsShortcuts: [],
+  debugPort: 8005,
+  debugSepPort: 8008
 };
 
 export class ConfigStore {
@@ -122,6 +141,38 @@ export class ConfigStore {
     const cfg = await this.load();
     cfg.actions = cfg.actions.filter(a => a.name !== name);
     await this.save();
+  }
+
+  async listProfiles(connectionName: string) {
+    const conn = await this.getConnection(connectionName);
+    return conn?.profiles || [];
+  }
+
+  async saveProfile(connectionName: string, profile: ConnectionProfile) {
+    const conn = await this.getConnection(connectionName);
+    if (!conn) throw new Error(`Connection ${connectionName} not found`);
+    const profiles = conn.profiles || [];
+    const idx = profiles.findIndex(p => p.name === profile.name);
+    if (idx >= 0) profiles[idx] = profile; else profiles.push(profile);
+    conn.profiles = profiles;
+    await this.upsertConnection(conn);
+  }
+
+  async deleteProfile(connectionName: string, profileName: string) {
+    const conn = await this.getConnection(connectionName);
+    if (!conn) throw new Error(`Connection ${connectionName} not found`);
+    conn.profiles = (conn.profiles || []).filter(p => p.name !== profileName);
+    if (conn.currentProfile === profileName) {
+      conn.currentProfile = undefined;
+    }
+    await this.upsertConnection(conn);
+  }
+
+  async setCurrentProfile(connectionName: string, profileName?: string) {
+    const conn = await this.getConnection(connectionName);
+    if (!conn) throw new Error(`Connection ${connectionName} not found`);
+    conn.currentProfile = profileName;
+    await this.upsertConnection(conn);
   }
 }
 

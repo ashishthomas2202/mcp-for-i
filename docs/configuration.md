@@ -33,7 +33,16 @@ Example:
       "privateKeyPath": "C:/keys/id_rsa",
       "settings": {
         "readOnlyMode": false
-      }
+      },
+      "profiles": [
+        {
+          "name": "projectA",
+          "currentLibrary": "PROJALIB",
+          "libraryList": ["QSYS", "QGPL", "PROJALIB"],
+          "customVariables": [{ "name": "ENV", "value": "DEV" }]
+        }
+      ],
+      "currentProfile": "projectA"
     }
   ]
 }

@@ -40,3 +40,42 @@
 - `ibmi.actions.run`
 - `ibmi.actions.save`
 - `ibmi.actions.delete`
+
+## Library List
+- `ibmi.libl.get`
+- `ibmi.libl.set`
+- `ibmi.libl.add`
+- `ibmi.libl.remove`
+- `ibmi.libl.setCurrent`
+- `ibmi.libl.validate`
+
+## Profiles
+- `ibmi.profiles.list`
+- `ibmi.profiles.save`
+- `ibmi.profiles.delete`
+- `ibmi.profiles.activate`
+
+## Resolve
+- `ibmi.resolve.path`
+
+## Deploy
+- `ibmi.deploy.uploadDirectory`
+- `ibmi.deploy.uploadFiles`
+- `ibmi.deploy.setCcsid`
+- `ibmi.deploy.compare`
+- `ibmi.deploy.sync`
+
+## Filters
+- `ibmi.filters.list`
+- `ibmi.filters.save`
+- `ibmi.filters.delete`
+
+## IFS Shortcuts
+- `ibmi.ifs.shortcuts.list`
+- `ibmi.ifs.shortcuts.add`
+- `ibmi.ifs.shortcuts.delete`
+
+## Debug
+- `ibmi.debug.status`
+- `ibmi.debug.startService`
+- `ibmi.debug.stopService`

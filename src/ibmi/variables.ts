@@ -6,12 +6,12 @@ export class Variables extends Map<string, string> {
 
     if (connection) {
       const config = connection.getConfig();
-      this.set(`&BUILDLIB`, this.get(`CURLIB`) || config.currentLibrary || "");
+      this.set(`&BUILDLIB`, this.get(`&CURLIB`) || config.currentLibrary || "");
       if (!this.has(`&CURLIB`)) {
         this.set(`&CURLIB`, config.currentLibrary || "");
       }
-      if (!this.has(`\*CURLIB`)) {
-        this.set(`\*CURLIB`, config.currentLibrary || "");
+      if (!this.has(`\\*CURLIB`)) {
+        this.set(`\\*CURLIB`, config.currentLibrary || "");
       }
       this.set(`&USERNAME`, connection.currentUser)
         .set(`{usrprf}`, connection.currentUser)
@@ -41,7 +41,8 @@ export class Variables extends Map<string, string> {
   public expand(input: string, keysToOmit: string[] = []) {
     for (const [key, value] of this.entries()) {
       if (!keysToOmit.includes(key)) {
-        input = input.replace(new RegExp(key, `g`), value);
+        const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        input = input.replace(new RegExp(escapedKey, `g`), value);
       }
     }
     return input;

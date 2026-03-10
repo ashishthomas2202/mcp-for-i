@@ -9,15 +9,21 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts"
+    "dev": "ts-node src/index.ts",
+    "test": "npm run build && node --test test",
+    "test:ibmi": "npm run build && node --test test/ibmi.integration.test.mjs",
+    "test:mcp": "npm run build && node --test test/mcp.integration.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.3",
+    "diff": "^5.2.0",
     "keytar": "^7.9.0",
     "node-ssh": "^13.1.0",
     "zod-to-json-schema": "^3.23.2"
   },
   "devDependencies": {
+    "@types/diff": "^7.0.2",
+    "dotenv": "^17.2.3",
     "ts-node": "^10.9.0",
     "typescript": "^5.4.0"
   }
