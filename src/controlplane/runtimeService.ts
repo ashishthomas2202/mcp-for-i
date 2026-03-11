@@ -322,15 +322,13 @@ export class RuntimeService {
   }
 
   private async scheduleWindowsSelfUpdate(push: (line: string) => void, action: "install" | "update") {
-    const npm = await resolveNpmLaunch();
     const controlPlaneScript = path.join(path.dirname(fileURLToPath(import.meta.url)), "index.js");
     const jobId = `${Date.now()}-${process.pid}`;
     const logPath = path.join(os.tmpdir(), `${PACKAGE_NAME}-${action}-${jobId}.log`);
     const scriptPath = path.join(os.tmpdir(), `${PACKAGE_NAME}-${action}-${jobId}.cmd`);
-
-    const installCommand = npm.mode === "node-cli"
-      ? `"${process.execPath}" "${npm.path}" install -g ${PACKAGE_NAME}@latest`
-      : `"${npm.path}" install -g ${PACKAGE_NAME}@latest`;
+    const npmCmdPath = path.join(path.dirname(process.execPath), process.platform === "win32" ? "npm.cmd" : "npm");
+    const npmCommand = await pathExists(npmCmdPath) ? `"${npmCmdPath}"` : "npm.cmd";
+    const installCommand = `${npmCommand} install -g ${PACKAGE_NAME}@latest`;
 
     const script = [
       "@echo off",

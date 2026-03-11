@@ -1,6 +1,6 @@
 {
   "name": "mcp-for-i",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": false,
   "description": "Local MCP server and control plane for IBM i workflows",
   "type": "module",
