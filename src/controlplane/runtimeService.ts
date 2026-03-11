@@ -52,16 +52,35 @@ export class RuntimeService {
 
   async installOrRepair() {
     return this.runJob("install", async push => {
-      await this.runNpm(["install"], this.rootDir, push);
-      await this.runNpm(["run", "build"], this.rootDir, push);
+      const mode = await this.detectExecutionMode(push);
+      if (mode === "git-checkout") {
+        await this.runNpm(["install"], this.rootDir, push);
+        await this.buildIfPresent(push);
+        return;
+      }
+      push(`Running global install for ${PACKAGE_NAME}@latest`);
+      await this.runNpm(["install", "-g", `${PACKAGE_NAME}@latest`], this.rootDir, push);
     });
   }
 
   async updateMcp() {
     return this.runJob("updateMcp", async push => {
-      await this.runCommand("git", ["pull", "--ff-only"], this.rootDir, push);
-      await this.runNpm(["install"], this.rootDir, push);
-      await this.runNpm(["run", "build"], this.rootDir, push);
+      const mode = await this.detectExecutionMode(push);
+      if (mode === "git-checkout") {
+        const branch = await this.getGitCurrentBranch(this.rootDir, push);
+        if (branch) {
+          await this.runCommand("git", ["fetch", "origin", branch], this.rootDir, push);
+          await this.runCommand("git", ["pull", "--ff-only", "origin", branch], this.rootDir, push);
+        } else {
+          push("Could not determine current branch. Using plain fast-forward pull.");
+          await this.runCommand("git", ["pull", "--ff-only"], this.rootDir, push);
+        }
+        await this.runNpm(["install"], this.rootDir, push);
+        await this.buildIfPresent(push);
+        return;
+      }
+      push(`Running global update for ${PACKAGE_NAME}@latest`);
+      await this.runNpm(["install", "-g", `${PACKAGE_NAME}@latest`], this.rootDir, push);
     });
   }
 
@@ -222,12 +241,7 @@ export class RuntimeService {
 
   private async getGitRemoteUrl(cwd: string, push: (line: string) => void) {
     try {
-      const lines: string[] = [];
-      await this.runCommandCapture("git", ["remote", "get-url", "origin"], cwd, line => {
-        push(line);
-        lines.push(line);
-      });
-      const value = lines.join("\n").trim();
+      const value = await this.runCommandCapture("git", ["remote", "get-url", "origin"], cwd, push);
       return value || undefined;
     } catch {
       return undefined;
@@ -235,24 +249,61 @@ export class RuntimeService {
   }
 
   private runCommandCapture(command: string, args: string[], cwd: string, push: (line: string) => void) {
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<string>((resolve, reject) => {
       push(`$ ${command} ${args.join(" ")}`);
       const child = spawn(command, args, {
         cwd,
         shell: process.platform === "win32"
       });
+      const lines: string[] = [];
 
-      child.stdout.on("data", chunk => push(String(chunk).trimEnd()));
+      child.stdout.on("data", chunk => {
+        const line = String(chunk).trimEnd();
+        if (!line) return;
+        lines.push(line);
+        push(line);
+      });
       child.stderr.on("data", chunk => push(String(chunk).trimEnd()));
       child.on("error", reject);
       child.on("exit", code => {
         if (code === 0) {
-          resolve();
+          resolve(lines.join("\n").trim());
         } else {
           reject(new Error(`Command failed (${code}): ${command} ${args.join(" ")}`));
         }
       });
     });
+  }
+
+  private async detectExecutionMode(push: (line: string) => void) {
+    const gitDir = path.join(this.rootDir, ".git");
+    if (await pathExists(gitDir)) {
+      return "git-checkout" as const;
+    }
+    push("No git checkout found. Falling back to npm-based package management.");
+    return "package-install" as const;
+  }
+
+  private async buildIfPresent(push: (line: string) => void) {
+    const tsconfigPath = path.join(this.rootDir, "tsconfig.json");
+    if (!await pathExists(tsconfigPath)) {
+      push("Skipping build: tsconfig.json not found.");
+      return;
+    }
+    await this.runNpm(["run", "build"], this.rootDir, push);
+  }
+
+  private async getGitCurrentBranch(cwd: string, push: (line: string) => void) {
+    try {
+      const name = await this.runCommandCapture("git", ["rev-parse", "--abbrev-ref", "HEAD"], cwd, push);
+      const branch = name.trim();
+      if (!branch || branch === "HEAD") {
+        return undefined;
+      }
+      return branch;
+    } catch {
+      return undefined;
+    }
   }
 }
 
@@ -295,7 +346,8 @@ async function safeRename(from: string, to: string) {
   }
 }
 
-const DEFAULT_SKILLS_REPO = "https://github.com/ashishthomas-pcr/mcp-for-i-skills.git";
+const DEFAULT_SKILLS_REPO = "https://github.com/ashishthomas2202/mcp-for-i-skills.git";
+const PACKAGE_NAME = "mcp-for-i";
 
 async function pathExists(target: string) {
   try {

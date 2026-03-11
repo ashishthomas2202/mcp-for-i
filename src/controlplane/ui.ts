@@ -380,7 +380,7 @@ export function renderControlPlaneHtml() {
       <div class="grid-2">
         <div class="field">
           <label>Skills Repo URL</label>
-          <input id="skillsRepoUrl" placeholder="https://github.com/ashishthomas-pcr/mcp-for-i-skills.git" />
+          <input id="skillsRepoUrl" placeholder="https://github.com/ashishthomas2202/mcp-for-i-skills.git" />
         </div>
         <div class="field">
           <label>Skills Branch</label>
@@ -389,7 +389,7 @@ export function renderControlPlaneHtml() {
       </div>
       <div class="actions">
         <button id="installBtn" type="button">Install/Repair MCP</button>
-        <button id="updateMcpBtn" class="secondary" type="button">Update MCP from GitHub</button>
+        <button id="updateMcpBtn" class="secondary" type="button">Update MCP</button>
         <button id="updateSkillsBtn" class="secondary" type="button">Update Skills</button>
         <button id="refreshStatusBtn" class="secondary" type="button">Refresh Status</button>
         <button id="setupAutostartBtn" class="secondary" type="button">Enable Background Startup</button>
@@ -398,7 +398,8 @@ export function renderControlPlaneHtml() {
       </div>
       <div id="autostartInfo" class="hint">Startup status: checking...</div>
       <div id="logs" class="logs">No jobs yet.</div>
-      <div class="hint">Actions stream logs live. Skills update can clone or pull from the repo and branch shown above.</div>
+      <div class="hint">Install/Repair uses local git checkout when available, otherwise global npm install. Update MCP follows the same mode.</div>
+      <div class="hint">Skills update can clone or pull from the repo and branch shown above.</div>
     </section>
 
     <section class="card" style="grid-column: 1 / -1;">
@@ -424,7 +425,7 @@ export function renderControlPlaneHtml() {
     const THEME_KEY = "mcp_for_i_theme";
     const SKILLS_REPO_KEY = "mcp_for_i_skills_repo";
     const SKILLS_BRANCH_KEY = "mcp_for_i_skills_branch";
-    const DEFAULT_SKILLS_REPO = "https://github.com/ashishthomas-pcr/mcp-for-i-skills.git";
+    const DEFAULT_SKILLS_REPO = "https://github.com/ashishthomas2202/mcp-for-i-skills.git";
     const DEFAULT_SKILLS_BRANCH = "main";
 
     const state = {

@@ -1,4 +1,7 @@
 import { spawn } from "child_process";
+import fs from "fs/promises";
+import os from "os";
+import path from "path";
 
 export const AUTOSTART_TASK_NAME = "mcp-for-i-controlplane";
 
@@ -23,81 +26,66 @@ export async function isControlPlaneRunning(baseUrl = getControlPlaneUrl()) {
 
 export async function configureWindowsAutostart(scriptPath: string, nodePath = process.execPath) {
   assertWindowsPlatform();
-  const taskCmd = `"${nodePath}" "${scriptPath}" serve`;
 
-  await runCommand("schtasks", [
-    "/Create",
-    "/F",
-    "/SC",
-    "ONLOGON",
-    "/RL",
-    "LIMITED",
-    "/TN",
-    AUTOSTART_TASK_NAME,
-    "/TR",
-    taskCmd
-  ]);
+  const startupScriptPath = getWindowsStartupScriptPath();
+  await fs.mkdir(path.dirname(startupScriptPath), { recursive: true });
 
-  await runCommand("schtasks", ["/Run", "/TN", AUTOSTART_TASK_NAME]);
+  const command = `${quoteForWindowsCommand(nodePath)} ${quoteForWindowsCommand(scriptPath)} serve`;
+  const startupScript = [
+    "@echo off",
+    "setlocal",
+    `start \"\" /MIN ${command}`,
+    "exit /b 0"
+  ].join("\r\n");
+
+  await fs.writeFile(startupScriptPath, startupScript, "utf8");
+
+  spawn(nodePath, [scriptPath, "serve"], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true
+  }).unref();
 }
 
 export async function removeWindowsAutostart() {
   assertWindowsPlatform();
-  await runCommand("schtasks", ["/Delete", "/TN", AUTOSTART_TASK_NAME, "/F"]);
+  const startupScriptPath = getWindowsStartupScriptPath();
+  await fs.rm(startupScriptPath, { force: true });
 }
 
 export async function getWindowsAutostartStatus() {
   assertWindowsPlatform();
+  const startupScriptPath = getWindowsStartupScriptPath();
   try {
-    const output = await runCommandCapture("schtasks", ["/Query", "/TN", AUTOSTART_TASK_NAME, "/FO", "LIST"]);
-    const lower = output.toLowerCase();
-    const hasTask = lower.includes("taskname:");
-    const stateLine = output
-      .split(/\r?\n/)
-      .find(line => line.trim().toLowerCase().startsWith("status:"));
-
+    const stat = await fs.stat(startupScriptPath);
     return {
-      installed: hasTask,
-      state: stateLine ? stateLine.split(":").slice(1).join(":").trim() : undefined,
-      raw: output
+      installed: true,
+      state: "startup-script",
+      raw: startupScriptPath,
+      updatedAt: stat.mtime.toISOString()
     };
   } catch {
     return {
       installed: false,
       state: undefined,
-      raw: ""
+      raw: startupScriptPath,
+      updatedAt: undefined
     };
   }
 }
 
-export async function runCommand(command: string, args: string[]) {
-  await runCommandCapture(command, args);
-}
-
-export async function runCommandCapture(command: string, args: string[]) {
-  return await new Promise<string>((resolve, reject) => {
-    const child = spawn(command, args, { shell: process.platform === "win32" });
-    let output = "";
-
-    child.stdout.on("data", chunk => {
-      output += String(chunk);
-    });
-    child.stderr.on("data", chunk => {
-      output += String(chunk);
-    });
-    child.on("error", reject);
-    child.on("exit", code => {
-      if (code === 0) {
-        resolve(output.trim());
-      } else {
-        reject(new Error(output.trim() || `Command failed (${code}): ${command} ${args.join(" ")}`));
-      }
-    });
-  });
+function getWindowsStartupScriptPath() {
+  const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+  return path.join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", `${AUTOSTART_TASK_NAME}.cmd`);
 }
 
 function assertWindowsPlatform() {
   if (process.platform !== "win32") {
     throw new Error("This autostart operation is currently supported on Windows only.");
   }
+}
+
+function quoteForWindowsCommand(value: string) {
+  const escaped = value.replaceAll(`"`, `""`);
+  return `"${escaped}"`;
 }

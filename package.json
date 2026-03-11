@@ -1,16 +1,16 @@
 {
   "name": "mcp-for-i",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": false,
   "description": "Local MCP server and control plane for IBM i workflows",
   "type": "module",
-  "homepage": "https://github.com/ashishthomas-pcr/mcp-for-i",
+  "homepage": "https://github.com/ashishthomas2202/mcp-for-i",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ashishthomas-pcr/mcp-for-i.git"
+    "url": "git+https://github.com/ashishthomas2202/mcp-for-i.git"
   },
   "bugs": {
-    "url": "https://github.com/ashishthomas-pcr/mcp-for-i/issues"
+    "url": "https://github.com/ashishthomas2202/mcp-for-i/issues"
   },
   "files": [
     "dist",

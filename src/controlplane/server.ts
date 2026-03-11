@@ -1,5 +1,8 @@
 import http, { IncomingMessage, ServerResponse } from "http";
+import fs from "fs";
+import path from "path";
 import { URL } from "url";
+import { fileURLToPath } from "url";
 import { ConfigStore } from "../config/store.js";
 import { isKeychainAvailable } from "../security/credentialStore.js";
 import { ConnectionService } from "./connectionService.js";
@@ -15,7 +18,7 @@ export type ControlPlaneServer = {
 export async function startControlPlaneServer(opts?: { host?: string; port?: number; rootDir?: string }) {
   const host = opts?.host || process.env.MCP_FOR_I_CONTROL_HOST || "127.0.0.1";
   const port = normalizePort(opts?.port || Number(process.env.MCP_FOR_I_CONTROL_PORT || 3980));
-  const rootDir = opts?.rootDir || process.cwd();
+  const rootDir = opts?.rootDir || process.env.MCP_FOR_I_ROOT_DIR || getDefaultRootDir();
 
   const store = new ConfigStore();
   const connections = new ConnectionService(store);
@@ -208,4 +211,13 @@ async function readJson(req: IncomingMessage) {
 function normalizePort(port: number) {
   if (!Number.isFinite(port) || port <= 0 || port > 65535) return 3980;
   return Math.floor(port);
+}
+
+function getDefaultRootDir() {
+  const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+  const packageJsonPath = path.join(runtimeRoot, "package.json");
+  if (fs.existsSync(packageJsonPath)) {
+    return runtimeRoot;
+  }
+  return process.cwd();
 }
