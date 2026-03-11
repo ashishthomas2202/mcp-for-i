@@ -1,14 +1,36 @@
-import { ConfigStore, ConnectionProfile } from "../config/store.js";
+import crypto from "crypto";
+import { ConfigStore, ConnectionPolicy, ConnectionProfile, PolicyProfile, StoredConnection } from "../config/store.js";
 import { IBMiClient } from "../ibmi/client.js";
 import { ConnectionConfig, ConnectionData } from "../ibmi/types.js";
 import { getPassword } from "../security/credentialStore.js";
 
+type SessionEntry = {
+  name: string;
+  client: IBMiClient;
+  policy: ConnectionPolicy;
+  lastUsedAt: number;
+  expiresAt: number;
+  timeout?: ReturnType<typeof setTimeout>;
+};
+
+type SqlCursorState = {
+  rows: any[];
+  nextIndex: number;
+  expiresAt: number;
+};
+
+const DEFAULT_SESSION_IDLE_MS = 30 * 60 * 1000;
+const DEFAULT_CURSOR_TTL_MS = 5 * 60 * 1000;
+
 export class McpContext {
   store = new ConfigStore();
-  active?: IBMiClient;
   activeName?: string;
+  private sessions = new Map<string, SessionEntry>();
+  private cursors = new Map<string, SqlCursorState>();
+  private sessionIdleMs = toPositiveInt(process.env.MCP_FOR_I_SESSION_IDLE_MS, DEFAULT_SESSION_IDLE_MS);
+  private cursorTtlMs = toPositiveInt(process.env.MCP_FOR_I_SQL_CURSOR_TTL_MS, DEFAULT_CURSOR_TTL_MS);
 
-  async connect(connection: ConnectionData, configOverride?: Partial<ConnectionConfig>) {
+  async connect(connection: ConnectionData, configOverride?: Partial<ConnectionConfig>, policy?: ConnectionPolicy) {
     const baseSettings = await this.store.getSettings();
     const config: ConnectionConfig = {
       name: connection.name,
@@ -21,12 +43,18 @@ export class McpContext {
 
     const client = new IBMiClient(config);
     await client.connect(connection);
-    this.active = client;
-    this.activeName = connection.name;
+    await this.registerSession(connection.name, client, policy || defaultPolicy());
     return client;
   }
 
   async connectByName(name: string) {
+    const existing = this.sessions.get(name);
+    if (existing) {
+      this.touchSession(name);
+      this.activeName = name;
+      return existing.client;
+    }
+
     const stored = await this.store.getConnection(name);
     if (!stored) throw new Error(`Unknown connection: ${name}`);
 
@@ -41,20 +69,150 @@ export class McpContext {
     };
     const profile = resolveProfile(stored.currentProfile, stored.profiles);
     const profileSettings = profileToSettings(profile);
-    return this.connect(connection, { ...stored.settings, ...profileSettings });
+    const policy = normalizePolicy(stored.policy);
+    return this.connect(connection, { ...stored.settings, ...profileSettings }, policy);
   }
 
-  ensureActive(): IBMiClient {
-    if (!this.active) throw new Error("Not connected");
-    return this.active;
+  ensureActive(name?: string): IBMiClient {
+    const sessionName = name || this.activeName;
+    if (!sessionName) throw new Error("Not connected");
+    const session = this.sessions.get(sessionName);
+    if (!session) throw new Error(`Session ${sessionName} is not connected`);
+    this.touchSession(sessionName);
+    return session.client;
   }
 
-  async disconnect() {
-    if (this.active) {
-      await this.active.disconnect();
-      this.active = undefined;
-      this.activeName = undefined;
+  getPolicy(name?: string): ConnectionPolicy {
+    const sessionName = name || this.activeName;
+    if (!sessionName) return defaultPolicy();
+    return this.sessions.get(sessionName)?.policy || defaultPolicy();
+  }
+
+  listSessions() {
+    const now = Date.now();
+    return Array.from(this.sessions.values()).map(session => ({
+      name: session.name,
+      active: session.name === this.activeName,
+      policy: session.policy.profile,
+      lastUsedAt: new Date(session.lastUsedAt).toISOString(),
+      expiresAt: new Date(session.expiresAt).toISOString(),
+      idleSecondsRemaining: Math.max(0, Math.floor((session.expiresAt - now) / 1000))
+    }));
+  }
+
+  statusSession(name?: string) {
+    const target = name || this.activeName;
+    if (!target) return { connected: false };
+    const session = this.sessions.get(target);
+    if (!session) return { connected: false, name: target };
+    const now = Date.now();
+    return {
+      connected: true,
+      name: target,
+      active: target === this.activeName,
+      policy: session.policy.profile,
+      lastUsedAt: new Date(session.lastUsedAt).toISOString(),
+      expiresAt: new Date(session.expiresAt).toISOString(),
+      idleSecondsRemaining: Math.max(0, Math.floor((session.expiresAt - now) / 1000))
+    };
+  }
+
+  keepaliveSession(name?: string) {
+    const target = name || this.activeName;
+    if (!target) throw new Error("connectionName is required (no active session)");
+    this.touchSession(target);
+    return this.statusSession(target);
+  }
+
+  async terminateSession(name?: string) {
+    const target = name || this.activeName;
+    if (!target) throw new Error("connectionName is required (no active session)");
+    await this.disconnect(target);
+  }
+
+  async disconnect(name?: string) {
+    if (name) {
+      const session = this.sessions.get(name);
+      if (!session) return;
+      if (session.timeout) clearTimeout(session.timeout);
+      await session.client.disconnect();
+      this.sessions.delete(name);
+      if (this.activeName === name) {
+        this.activeName = this.sessions.keys().next().value;
+      }
+      return;
     }
+
+    const current = this.activeName;
+    if (current) {
+      await this.disconnect(current);
+    }
+  }
+
+  createSqlCursor(rows: any[], pageSize: number) {
+    const cursor = crypto.randomUUID();
+    const initial = rows.slice(pageSize);
+    if (initial.length === 0) return { cursor: undefined };
+    this.cursors.set(cursor, {
+      rows: initial,
+      nextIndex: 0,
+      expiresAt: Date.now() + this.cursorTtlMs
+    });
+    return { cursor };
+  }
+
+  consumeSqlCursor(cursor: string, pageSize: number) {
+    const state = this.cursors.get(cursor);
+    if (!state) throw new Error(`Unknown cursor: ${cursor}`);
+    if (state.expiresAt < Date.now()) {
+      this.cursors.delete(cursor);
+      throw new Error(`Cursor expired: ${cursor}`);
+    }
+
+    const start = state.nextIndex;
+    const end = start + pageSize;
+    const page = state.rows.slice(start, end);
+    state.nextIndex = end;
+    state.expiresAt = Date.now() + this.cursorTtlMs;
+
+    if (state.nextIndex >= state.rows.length) {
+      this.cursors.delete(cursor);
+      return { rows: page, cursor: undefined };
+    }
+
+    this.cursors.set(cursor, state);
+    return { rows: page, cursor };
+  }
+
+  private async registerSession(name: string, client: IBMiClient, policy: ConnectionPolicy) {
+    const existing = this.sessions.get(name);
+    if (existing) {
+      if (existing.timeout) clearTimeout(existing.timeout);
+      await existing.client.disconnect();
+    }
+
+    const now = Date.now();
+    this.sessions.set(name, {
+      name,
+      client,
+      policy,
+      lastUsedAt: now,
+      expiresAt: now + this.sessionIdleMs
+    });
+    this.activeName = name;
+    this.touchSession(name);
+  }
+
+  private touchSession(name: string) {
+    const session = this.sessions.get(name);
+    if (!session) throw new Error(`Session ${name} not found`);
+    session.lastUsedAt = Date.now();
+    session.expiresAt = session.lastUsedAt + this.sessionIdleMs;
+    if (session.timeout) clearTimeout(session.timeout);
+    session.timeout = setTimeout(() => {
+      this.disconnect(name).catch(() => {});
+    }, this.sessionIdleMs);
+    this.sessions.set(name, session);
   }
 }
 
@@ -70,4 +228,34 @@ function profileToSettings(profile?: ConnectionProfile): Partial<ConnectionConfi
     libraryList: profile.libraryList,
     customVariables: profile.customVariables
   };
+}
+
+function toPositiveInt(input: string | undefined, fallback: number) {
+  const parsed = Number(input || "");
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
+}
+
+function defaultPolicy(): ConnectionPolicy {
+  return {
+    profile: "guarded",
+    requireApprovalFor: ["sql.write", "cl.run", "deploy.sync", "ifs.delete", "qsys.write"]
+  };
+}
+
+function normalizePolicy(policy?: StoredConnection["policy"]): ConnectionPolicy {
+  if (!policy) return defaultPolicy();
+  const profile = normalizeProfile(policy.profile);
+  return {
+    ...defaultPolicy(),
+    ...policy,
+    profile
+  };
+}
+
+function normalizeProfile(profile: PolicyProfile | undefined): PolicyProfile {
+  if (profile === "read-only" || profile === "power-user" || profile === "guarded") {
+    return profile;
+  }
+  return "guarded";
 }

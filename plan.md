@@ -1,172 +1,65 @@
-# MCP-for-i (Client-Side MCP for IBM i) — Implementation Plan
+ï»¿# Master Plan: Secure, Full-Capability MCP-for-i
 
-## Summary
-Build a local MCP server named `mcp-for-i` under `C:\Users\pgmashish\projects\mcp\mcp-for-i` that mirrors Code for IBM i capabilities, exposing them as MCP tools/resources so Codex CLI can perform the same IBM i operations. The server runs on the user’s laptop, connects to IBM i via SSH + QSH/PASE + SQL (when available), and stores credentials securely in OS keychain (via `keytar`). Phase 1 ships core operations + actions + search; subsequent phases add deploy, environment/profile management, library list tools, debug, and terminal emulation.
+## Vision
+Build `mcp-for-i` into a production-grade IBM i agent platform where:
+1. Secrets are managed outside LLM prompts.
+2. Sessions stay warm with sliding inactivity timeout (default 30 minutes).
+3. Tooling reaches broad user-equivalent capability (DB2, CL/QSYS/IFS, deploy, diagnostics, 5250 roadmap).
+4. Policy is guarded-by-default with explicit approval for risky operations.
+5. UI-driven onboarding and updates manage MCP + skills lifecycle.
 
-## Architecture Overview
-- Runtime: Node.js + TypeScript
-- MCP transport: stdio
-- Core subsystems (ported/reused from Code for IBM i):
-  - IBMiConnection (SSH, QSH/PASE command exec, SQL access)
-  - IBMiContent (member/streamfile operations)
-  - Actions + variable expansion
-  - Search (members/IFS)
-  - Diagnostics parsing (EVFEVENT)
-- Persistence:
-  - Config/settings in JSON under user config folder
-  - Credentials in OS keychain via `keytar` (fallback to session-only if unavailable)
-- Tooling:
-  - MCP tools mirror Code for IBM i operations with minimal mapping layer
+## Locked Decisions
+1. UI is part of onboarding/control-plane.
+2. Full 5250 automation is in scope (phased delivery).
+3. Default policy profile is `guarded`.
+4. Session idle timeout defaults to 30 minutes and extends on use.
+5. No IBM i-side service install is required.
+6. Cross-platform target; Windows-first acceptable if sequencing demands.
 
-## Phase 1 Scope (Core + Actions + Search)
-### Core Tools (MCP)
-1. Connection
-   - `ibmi.connect`
-   - `ibmi.disconnect`
-   - `ibmi.connections.list`
-   - `ibmi.connections.add`
-   - `ibmi.connections.update`
-   - `ibmi.connections.delete`
+## Phases
 
-2. QSYS / Member Operations
-   - `ibmi.qsys.libraries.list`
-   - `ibmi.qsys.objects.list`
-   - `ibmi.qsys.sourcefiles.list`
-   - `ibmi.qsys.members.list`
-   - `ibmi.qsys.members.read`
-   - `ibmi.qsys.members.write`
-   - `ibmi.qsys.members.create`
-   - `ibmi.qsys.members.rename`
-   - `ibmi.qsys.members.delete`
-   - `ibmi.qsys.sourcefiles.create`
-   - `ibmi.qsys.libraries.create`
+### Phase 0: Hardening + Build/Test Correctness
+- Fix shell/SQL injection vectors and unsafe command interpolation.
+- Add runtime tool-argument validation.
+- Remove ESM/runtime defects.
+- Make config writes queued/retry-safe and temp-file based.
+- Split default tests (fast unit by default, full suite as explicit script).
+- Improve repo hygiene defaults.
 
-3. IFS Operations
-   - `ibmi.ifs.list`
-   - `ibmi.ifs.read`
-   - `ibmi.ifs.write`
-   - `ibmi.ifs.mkdir`
-   - `ibmi.ifs.delete`
-   - `ibmi.ifs.upload`
-   - `ibmi.ifs.download`
+### Phase 1: Secure Onboarding UI + Local Control Plane
+- UI for install, connection profile lifecycle, credential onboarding, update actions.
+- Local control plane to mediate UI and MCP runtime.
+- Secret isolation: no plaintext credential persistence; no credential-first chat flows.
 
-4. Actions / Compile
-   - `ibmi.actions.list`
-   - `ibmi.actions.run`
-   - `ibmi.actions.create/update/delete`
-   - Built-in action set from Code for IBM i (RPG/COBOL/C/CL/SQL etc.)
+### Phase 2: Session Lifecycle
+- Multi-session tracking and keepalive.
+- Sliding inactivity timeout + configurable TTL.
+- Session tools: list/status/keepalive/terminate.
 
-5. Search
-   - `ibmi.search.members`
-   - `ibmi.search.ifs`
-   - `ibmi.find.ifs`
+### Phase 3: Data/Execution Surface
+- `ibmi.sql.query` (read-only + cursor pagination).
+- `ibmi.sql.execute` (guarded write execution).
+- `ibmi.cl.run` (guarded command execution).
+- Diagnostics + ops primitives (`parseEvfevent`, `joblog`, spool read/list).
 
-6. Diagnostics
-   - `ibmi.diagnostics.parseEvfevent`
-   - Optionally `ibmi.diagnostics.fromServer` (if EVFEVENT table present)
+### Phase 4: Deploy + Diagnostics Parity
+- Strengthen deploy compare/sync semantics.
+- Add diagnostics normalization and robust action execution mapping.
 
-### Resources (Optional in Phase 1)
-- Expose `ibmi://` resources for quick listing of libraries, objects, IFS paths (read-only).
+### Phase 5: TN5250 Engine
+- Connection, screen model, input primitives, waits/retries.
+- Guardrails for risky interactive transactions.
 
-## Phase 2 Scope (Additions)
-- Deployment tools (DeployTools, tar upload/extract, CCSID fixups)
-- Environment profiles + custom variables
-- Library list management
-- Connection profile actions (set LIBL command)
-- Go-To-File (agent version): resolve a member/IFS path with validation
+### Phase 6: Agent Skills + Safe Autonomy
+- Task-to-skill routing and safe autonomy controls.
 
-## Phase 3 Scope (Advanced)
-- Debug (batch + SEP, IBM i Debug integration via service)
-- 5250 terminal emulation (PASE only for MCP; full 5250 may be out of scope for MCP)
-- Sandbox URI handler equivalents (MCP auth flow)
+### Phase 7: Packaging + Updater Distribution
+- Installer/updater across Windows/macOS/Linux.
+- GitHub-backed MCP and skills update channels with rollback safety.
 
-## Detailed Implementation Steps
-
-### 1) Create Project Skeleton
-- Folder: `C:\Users\pgmashish\projects\mcp\mcp-for-i`
-- Standard Node/TS project:
-  - `package.json`
-  - `tsconfig.json`
-  - `src/` with `index.ts` MCP entrypoint
-  - `src/mcp/` for tool registry
-  - `src/ibmi/` for IBM i core logic (ported)
-
-### 2) Port/Reuse Code for IBM i Core
-Port (with minimal adaptation) from current Code for IBM i repo:
-- `src/api/IBMi.ts`
-- `src/api/IBMiContent.ts`
-- `src/api/Search.ts`
-- `src/api/CompileTools.ts`
-- `src/api/variables.ts`
-- `src/api/errors/parser.ts`
-- `src/filesystems/local/LocalLanguageActions.ts`
-- Any related helpers (Tools, QSYS path parsing)
-
-Adjust:
-- Remove VS Code dependencies
-- Replace config and secret storage with MCP server config + `keytar`
-- Replace UI flows with MCP input parameters
-
-### 3) MCP Tool Layer
-- Implement tool registry (`registerTools`)
-- Each MCP tool maps 1:1 to a core function
-- Normalize errors into MCP error payloads
-- Validate inputs with JSON schema
-
-### 4) Config & Storage
-- Config stored in JSON:
-  - Connections list
-  - Settings: temp library, CCSID, readOnlyMode, source dates, etc.
-- Credentials:
-  - `keytar` for Windows/macOS/Linux
-  - If keychain unavailable, fallback to “session only” (warn)
-
-### 5) Security Model
-- Store only encrypted credentials (keychain)
-- Optional: allow “no-store” flag per connection
-- Mask credentials in logs
-- Enforce read-only mode if configured
-
-### 6) Docs (in `/docs`)
-- `docs/overview.md` — what MCP-for-i is
-- `docs/installation.md` — setup, keychain deps (`libsecret` on Linux)
-- `docs/configuration.md` — connections/settings
-- `docs/tools.md` — full tool catalog + examples
-- `docs/security.md` — credential handling
-- `docs/examples.md` — Codex CLI examples and common flows
-
-## Public API / Interface Changes
-- Introduce MCP tool schema for each operation (see Phase 1 tool list).
-- Configuration JSON schema for settings and connections.
-- No UI; all actions are parameterized tools.
-
-## Test Plan
-### Unit Tests
-- QSYS path parsing
-- Variable expansion
-- EVFEVENT parsing
-- Action selection + filtering
-- Search output parsing
-
-### Integration Tests (optional but recommended)
-- Connect to a test IBM i system
-- Read/write member
-- Run action (compile)
-- Search members/IFS
-- Download/upload IFS file
-
-## Acceptance Criteria
-- Codex CLI can connect via MCP and:
-  - List libraries/objects/members
-  - Read/write members and IFS files
-  - Run compile actions
-  - Search members/IFS
-- Credentials stored securely (keychain)
-- Cross-platform support (Windows, macOS, Linux; Linux requires libsecret)
-
-## Assumptions & Defaults
-- Transport: MCP stdio
-- Stack: Node.js + TypeScript
-- Security: keychain via `keytar`, fallback to session-only
-- Phase 1 scope: core + actions + search
-- No UI in MCP (programmatic tools only)
+## Current Status
+- Phase 0: in progress (core injection/validation/build fixes landed; additional hardening pass still open)
+- Phase 1: complete (control-plane UI + secure profile onboarding + keychain secret isolation + secret-arg blocking + legacy plaintext credential migration)
+- Phase 2: next up (expand session lifecycle into robust pooled connection management with stronger reconnect behavior and UI observability)
+- Phase 3: in progress (SQL/CL/joblog/spool/diagnostics tool surface added with guard hooks)
+- Phase 4-7: pending

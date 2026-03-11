@@ -3,6 +3,10 @@
 ## Connection
 - `ibmi.connect`
 - `ibmi.disconnect`
+- `ibmi.session.list`
+- `ibmi.session.status`
+- `ibmi.session.keepalive`
+- `ibmi.session.terminate`
 - `ibmi.connections.list`
 - `ibmi.connections.add`
 - `ibmi.connections.update`
@@ -79,3 +83,23 @@
 - `ibmi.debug.status`
 - `ibmi.debug.startService`
 - `ibmi.debug.stopService`
+
+## SQL / CL
+- `ibmi.sql.query`
+- `ibmi.sql.execute`
+- `ibmi.cl.run`
+
+## Diagnostics / Ops
+- `ibmi.diagnostics.parseEvfevent`
+- `ibmi.joblog.get`
+- `ibmi.spool.list`
+- `ibmi.spool.read`
+
+## TN5250 (Scaffold)
+- `ibmi.tn5250.connect`
+- `ibmi.tn5250.readScreen`
+- `ibmi.tn5250.setField`
+- `ibmi.tn5250.sendKeys`
+- `ibmi.tn5250.waitFor`
+- `ibmi.tn5250.snapshot`
+- `ibmi.tn5250.disconnect`

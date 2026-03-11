@@ -145,6 +145,22 @@ export namespace Tools {
     }
   }
 
+  export function shellQuote(value: string) {
+    return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
+  }
+
+  export function sqlEscapeLiteral(value: string) {
+    return String(value).replace(/'/g, "''");
+  }
+
+  export function sqlString(value: string) {
+    return `'${sqlEscapeLiteral(value)}'`;
+  }
+
+  export function isSafeQshToken(value: string) {
+    return /^[A-Za-z0-9_./*-]+$/.test(value);
+  }
+
   export function sanitizeObjNamesForPase(libraries: string[]): string[] {
     return libraries.map(library => library.startsWith(`#`) ? `"${library}"` : library);
   }

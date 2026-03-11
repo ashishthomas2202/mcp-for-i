@@ -10,17 +10,18 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const host = process.env.IBMI_HOST;
 const username = process.env.IBMI_USER;
-const password = process.env.IBMI_PASSWORD;
 const privateKeyPath = process.env.IBMI_PRIVATE_KEY;
 const port = process.env.IBMI_PORT ? Number(process.env.IBMI_PORT) : 22;
 const connName = process.env.IBMI_CONN_NAME || "itest";
 const allowWrite = process.env.IBMI_TEST_ALLOW_WRITE === "1";
+const preconfiguredConnection = process.env.IBMI_TEST_PRECONFIGURED === "1";
 const keepArtifacts = process.env.IBMI_TEST_KEEP === "1";
 const enableSourceDates = process.env.IBMI_TEST_SOURCE_DATES === "1";
 const runDebug = process.env.IBMI_TEST_DEBUG === "1";
 const runSetCcsid = process.env.IBMI_TEST_SETCCSID === "1";
 const tempLibrary = (process.env.IBMI_TEST_TEMP_LIB || "ILEDITOR").toUpperCase();
-const skipAll = !host || !username || !(password || privateKeyPath) || !allowWrite;
+const canProvisionViaTool = Boolean(host && username && privateKeyPath);
+const skipAll = !allowWrite || (!preconfiguredConnection && !canProvisionViaTool);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -134,7 +135,9 @@ test.after(async () => {
     }));
   }
   await safe(() => callTool("ibmi.disconnect", {}));
-  await safe(() => callTool("ibmi.connections.delete", { name: connName }));
+  if (!preconfiguredConnection) {
+    await safe(() => callTool("ibmi.connections.delete", { name: connName }));
+  }
   if (client) {
     await client.close();
   }
@@ -150,11 +153,10 @@ serialTest("ibmi.connections.add", async () => {
     port,
     username,
     privateKeyPath,
-    password,
-    storePassword: true,
-    settings: { tempLibrary, enableSourceDates }
+    settings: { tempLibrary, enableSourceDates },
+    policy: { profile: "power-user" }
   });
-});
+}, { skip: preconfiguredConnection });
 
 serialTest("ibmi.connections.list", async () => {
   const list = getJson(await callTool("ibmi.connections.list")) || [];
@@ -163,7 +165,7 @@ serialTest("ibmi.connections.list", async () => {
 
 serialTest("ibmi.connections.update", async () => {
   await callTool("ibmi.connections.update", { name: connName, port });
-});
+}, { skip: preconfiguredConnection });
 
 serialTest("ibmi.connect", async () => {
   await callTool("ibmi.connect", { name: connName });
@@ -446,4 +448,4 @@ serialTest("ibmi.disconnect", async () => {
 
 serialTest("ibmi.connections.delete", async () => {
   await callTool("ibmi.connections.delete", { name: connName });
-});
+}, { skip: preconfiguredConnection });

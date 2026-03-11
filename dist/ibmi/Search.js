@@ -18,6 +18,9 @@ export var Search;
         let memberFilter;
         const pfgrep = connection.remoteFeatures.pfgrep;
         if (typeof members === `string`) {
+            if (!isSafeMemberToken(members)) {
+                throw new Error(`Invalid members filter: ${members}`);
+            }
             memberFilter = `${members}.MBR`;
         }
         else if (Array.isArray(members)) {
@@ -26,6 +29,11 @@ export var Search;
                 memberFilter = "*.MBR";
             }
             else {
+                members.forEach(member => {
+                    if (!isSafeMemberToken(member.name)) {
+                        throw new Error(`Invalid member name in filter: ${member.name}`);
+                    }
+                });
                 memberFilter = members.map(member => `${member.name}.MBR`).join(` `);
             }
         }
@@ -71,7 +79,7 @@ export var Search;
         if (!find)
             throw new Error("Find must be installed on the remote system.");
         const findRes = await connection.sendCommand({
-            command: `${find} ${Tools.escapePath(path)} -type f -iname '*${findTerm}*' -print`
+            command: `${find} ${Tools.escapePath(path)} -type f -iname ${Tools.shellQuote(`*${findTerm}*`)} -print`
         });
         if (findRes.code === 0) {
             if (findRes.stdout) {
@@ -111,6 +119,9 @@ export var Search;
     }
     function sanitizeSearchTerm(searchTerm) {
         return searchTerm.replace(/\\/g, `\\\\`).replace(/"/g, `\\"`);
+    }
+    function isSafeMemberToken(name) {
+        return /^[A-Za-z0-9_*#]+$/.test(name);
     }
     function nthIndex(aString, pattern, n) {
         let index = -1;

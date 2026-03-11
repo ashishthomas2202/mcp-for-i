@@ -97,7 +97,12 @@ export class IBMiClient {
     let commands: string[] = [];
 
     if (options.env) {
-      commands.push(...Object.entries(options.env).map(([key, value]) => `export ${key}="${value ? IBMiClient.escapeForShell(value) : ``}"`));
+      commands.push(...Object.entries(options.env).map(([key, value]) => {
+        if (!(/^[A-Za-z_]\w*$/).test(key)) {
+          throw new Error(`Invalid environment variable name: ${key}`);
+        }
+        return `export ${key}=${Tools.shellQuote(value || "")}`;
+      }));
     }
 
     commands.push(options.command);

@@ -5,6 +5,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { getTools, handleTool } from "./mcp/tools.js";
 import { McpContext } from "./mcp/context.js";
 import { log } from "./mcp/logger.js";
+import { validateToolInput } from "./mcp/validation.js";
 
 const server = new Server(
   { name: "mcp-for-i", version: "0.1.0" },
@@ -12,15 +13,23 @@ const server = new Server(
 );
 
 const ctx = new McpContext();
+const tools = getTools();
+const toolMap = new Map(tools.map(tool => [tool.name, tool]));
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: getTools()
+  tools
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   try {
-    log("info", "tool.call", { name, args });
+    const toolDef = toolMap.get(name);
+    if (!toolDef) throw new Error(`Unknown tool: ${name}`);
+    const errors = validateToolInput(toolDef.inputSchema as any, args || {});
+    if (errors.length > 0) {
+      throw new Error(`Invalid arguments: ${errors.join("; ")}`);
+    }
+    log("info", "tool.call", { name, args: redactSensitive(args || {}) });
     const result = await handleTool(ctx, name, args || {});
     log("debug", "tool.result", { name });
     return result;
@@ -35,3 +44,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+
+function redactSensitive(input: unknown): unknown {
+  const secrets = new Set(["password", "passphrase", "secret", "token", "apikey", "apiKey", "authorization"]);
+  if (Array.isArray(input)) {
+    return input.map(redactSensitive);
+  }
+  if (typeof input === "object" && input !== null) {
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+      if (secrets.has(key)) {
+        out[key] = "***REDACTED***";
+      } else {
+        out[key] = redactSensitive(value);
+      }
+    }
+    return out;
+  }
+  return input;
+}

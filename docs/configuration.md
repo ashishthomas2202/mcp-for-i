@@ -20,6 +20,10 @@ Default settings (editable in the config file):
 
 ## Connections
 Connections are stored without passwords. Passwords are stored in OS keychain (or in-session fallback). Each connection can include optional `settings` overrides.
+Connections can also define policy, for example:
+- `read-only`
+- `guarded` (default; approvals required for risky operations)
+- `power-user`
 
 Example:
 ```json
@@ -33,6 +37,10 @@ Example:
       "privateKeyPath": "C:/keys/id_rsa",
       "settings": {
         "readOnlyMode": false
+      },
+      "policy": {
+        "profile": "guarded",
+        "requireApprovalFor": ["sql.write", "cl.run", "deploy.sync"]
       },
       "profiles": [
         {

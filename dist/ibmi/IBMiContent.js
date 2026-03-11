@@ -18,7 +18,7 @@ export class IBMiContent {
         if (desired === "QTEMP")
             return "QTEMP";
         try {
-            const rows = await this.ibmi.runSQL(`select SYSTEM_SCHEMA_NAME from QSYS2.SYSSCHEMAS where SYSTEM_SCHEMA_NAME='${desired}'`);
+            const rows = await this.ibmi.runSQL(`select SYSTEM_SCHEMA_NAME from QSYS2.SYSSCHEMAS where SYSTEM_SCHEMA_NAME=${Tools.sqlString(desired)}`);
             if (rows.length > 0)
                 return desired;
         }
@@ -130,7 +130,7 @@ export class IBMiContent {
     }
     async getLibraries(filter = "*") {
         const libFilter = filter === "*" ? "*ALL" : filter;
-        const rows = await this.ibmi.runSQL(`select OBJNAME, OBJTEXT from table(QSYS2.OBJECT_STATISTICS('${libFilter}', 'LIB', '*ALLSIMPLE'))`);
+        const rows = await this.ibmi.runSQL(`select OBJNAME, OBJTEXT from table(QSYS2.OBJECT_STATISTICS(${Tools.sqlString(libFilter)}, 'LIB', '*ALLSIMPLE'))`);
         return rows.map(r => ({
             library: String(r.OBJNAME),
             name: String(r.OBJNAME),
@@ -142,7 +142,7 @@ export class IBMiContent {
         const libs = libraries.map(l => this.ibmi.upperCaseName(l));
         if (libs.length === 0)
             return [];
-        const inClause = libs.map(l => `'${l}'`).join(", ");
+        const inClause = libs.map(l => Tools.sqlString(l)).join(", ");
         const rows = await this.ibmi.runSQL(`select SYSTEM_SCHEMA_NAME, SCHEMA_TEXT from QSYS2.SYSSCHEMAS where SYSTEM_SCHEMA_NAME in (${inClause})`);
         const found = rows.map(r => ({
             library: "QSYS",
@@ -171,7 +171,7 @@ export class IBMiContent {
         });
         if (libs.length === 0)
             return badLibs;
-        const inClause = libs.map(l => `'${l}'`).join(", ");
+        const inClause = libs.map(l => Tools.sqlString(l)).join(", ");
         const rows = await this.ibmi.runSQL(`select SYSTEM_SCHEMA_NAME from QSYS2.SYSSCHEMAS where SYSTEM_SCHEMA_NAME in (${inClause})`);
         const existing = rows.map(r => String(r.SYSTEM_SCHEMA_NAME));
         libs.forEach(l => {
@@ -182,8 +182,12 @@ export class IBMiContent {
     }
     async getObjectList(library, types = ["*ALL"]) {
         const lib = this.ibmi.upperCaseName(library);
-        const typesList = types.join(" ");
-        const rows = await this.ibmi.runSQL(`select OBJNAME, OBJTYPE, OBJTEXT, OBJATTRIBUTE from table(QSYS2.OBJECT_STATISTICS('${lib}', '${typesList}', '*ALLSIMPLE'))`);
+        const safeTypes = types.map(t => this.ibmi.upperCaseName(t));
+        const hasInvalidType = safeTypes.some(t => !/^[*A-Z0-9]+$/.test(t));
+        if (hasInvalidType)
+            throw new Error("Invalid object type filter");
+        const typesList = safeTypes.join(" ");
+        const rows = await this.ibmi.runSQL(`select OBJNAME, OBJTYPE, OBJTEXT, OBJATTRIBUTE from table(QSYS2.OBJECT_STATISTICS(${Tools.sqlString(lib)}, ${Tools.sqlString(typesList)}, '*ALLSIMPLE'))`);
         return rows.map(r => ({
             library: lib,
             name: String(r.OBJNAME),
@@ -195,7 +199,7 @@ export class IBMiContent {
     async getMemberList(options) {
         const lib = this.ibmi.upperCaseName(options.library);
         const file = this.ibmi.upperCaseName(options.sourceFile);
-        const rows = await this.ibmi.runSQL(`select SYSTEM_TABLE_MEMBER, SOURCE_TYPE, PARTITION_TEXT from QSYS2.SYSPARTITIONSTAT where SYSTEM_TABLE_SCHEMA='${lib}' and SYSTEM_TABLE_NAME='${file}'`);
+        const rows = await this.ibmi.runSQL(`select SYSTEM_TABLE_MEMBER, SOURCE_TYPE, PARTITION_TEXT from QSYS2.SYSPARTITIONSTAT where SYSTEM_TABLE_SCHEMA=${Tools.sqlString(lib)} and SYSTEM_TABLE_NAME=${Tools.sqlString(file)}`);
         return rows.map(r => ({
             library: lib,
             file,
@@ -208,7 +212,7 @@ export class IBMiContent {
         const lib = this.ibmi.upperCaseName(library);
         const file = this.ibmi.upperCaseName(sourceFile);
         const mbr = this.ibmi.upperCaseName(member);
-        const rows = await this.ibmi.runSQL(`select SYSTEM_TABLE_MEMBER, SOURCE_TYPE, PARTITION_TEXT from QSYS2.SYSPARTITIONSTAT where SYSTEM_TABLE_SCHEMA='${lib}' and SYSTEM_TABLE_NAME='${file}' and SYSTEM_TABLE_MEMBER='${mbr}'`);
+        const rows = await this.ibmi.runSQL(`select SYSTEM_TABLE_MEMBER, SOURCE_TYPE, PARTITION_TEXT from QSYS2.SYSPARTITIONSTAT where SYSTEM_TABLE_SCHEMA=${Tools.sqlString(lib)} and SYSTEM_TABLE_NAME=${Tools.sqlString(file)} and SYSTEM_TABLE_MEMBER=${Tools.sqlString(mbr)}`);
         const row = rows[0];
         if (!row)
             return undefined;
@@ -308,7 +312,7 @@ export class IBMiContent {
         }
         catch { }
         try {
-            const res = await this.ibmi.runSQL(`select row_length-12 as LENGTH from QSYS2.SYSTABLES where SYSTEM_TABLE_SCHEMA = '${lib}' and SYSTEM_TABLE_NAME = '${file}' fetch first 1 rows only`);
+            const res = await this.ibmi.runSQL(`select row_length-12 as LENGTH from QSYS2.SYSTABLES where SYSTEM_TABLE_SCHEMA = ${Tools.sqlString(lib)} and SYSTEM_TABLE_NAME = ${Tools.sqlString(file)} fetch first 1 rows only`);
             if (res.length > 0 && res[0].LENGTH) {
                 recordLength = Number(res[0].LENGTH);
             }

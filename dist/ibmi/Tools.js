@@ -132,6 +132,22 @@ export var Tools;
         }
     }
     Tools.escapePath = escapePath;
+    function shellQuote(value) {
+        return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
+    }
+    Tools.shellQuote = shellQuote;
+    function sqlEscapeLiteral(value) {
+        return String(value).replace(/'/g, "''");
+    }
+    Tools.sqlEscapeLiteral = sqlEscapeLiteral;
+    function sqlString(value) {
+        return `'${sqlEscapeLiteral(value)}'`;
+    }
+    Tools.sqlString = sqlString;
+    function isSafeQshToken(value) {
+        return /^[A-Za-z0-9_./*-]+$/.test(value);
+    }
+    Tools.isSafeQshToken = isSafeQshToken;
     function sanitizeObjNamesForPase(libraries) {
         return libraries.map(library => library.startsWith(`#`) ? `"${library}"` : library);
     }

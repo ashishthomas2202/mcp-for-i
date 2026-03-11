@@ -14,6 +14,17 @@
 4. Run:
    - `node dist/index.js`
 
+## Control Plane UI (Onboarding + Updates)
+Run local control plane:
+
+- `npm run start:controlplane`
+
+Open:
+
+- `http://127.0.0.1:3980`
+
+Use the UI to add/edit/delete/rename connections, manage keychain passwords, and run MCP/skills update actions.
+
 ## MCP (stdio) usage
 Configure your MCP client (e.g., Codex CLI) to run `mcp-for-i` via stdio. Example (pseudo-config):
 

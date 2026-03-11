@@ -9,18 +9,19 @@ import { handleTool } from "../dist/mcp/tools.js";
 
 const host = process.env.IBMI_HOST;
 const username = process.env.IBMI_USER;
-const password = process.env.IBMI_PASSWORD;
 const privateKeyPath = process.env.IBMI_PRIVATE_KEY;
 const port = process.env.IBMI_PORT ? Number(process.env.IBMI_PORT) : 22;
 const connName = process.env.IBMI_CONN_NAME || "itest";
 const allowWrite = process.env.IBMI_TEST_ALLOW_WRITE === "1";
+const preconfiguredConnection = process.env.IBMI_TEST_PRECONFIGURED === "1";
 const keepArtifacts = process.env.IBMI_TEST_KEEP === "1";
 const enableSourceDates = process.env.IBMI_TEST_SOURCE_DATES === "1";
 const runDebug = process.env.IBMI_TEST_DEBUG === "1";
 const runSetCcsid = process.env.IBMI_TEST_SETCCSID === "1";
 const tempLibrary = (process.env.IBMI_TEST_TEMP_LIB || "ILEDITOR").toUpperCase();
 
-const hasConn = Boolean(host && username && (password || privateKeyPath));
+const canProvisionViaTool = Boolean(host && username && privateKeyPath);
+const hasConn = preconfiguredConnection || canProvisionViaTool;
 
 function getText(res) {
   return res?.content?.[0]?.text ?? "";
@@ -75,16 +76,15 @@ test("IBM i integration (isolated, one test per tool)", { skip: !hasConn || !all
   await fs.writeFile(localDeployFile, "deploy file", "utf8");
 
   try {
-    await t.test("ibmi.connections.add", async () => {
+    await t.test("ibmi.connections.add", { skip: preconfiguredConnection }, async () => {
       await handleTool(ctx, "ibmi.connections.add", {
         name: connName,
         host,
         port,
         username,
         privateKeyPath,
-        password,
-        storePassword: true,
-        settings: { tempLibrary, enableSourceDates }
+        settings: { tempLibrary, enableSourceDates },
+        policy: { profile: "power-user" }
       });
     });
 
@@ -93,7 +93,7 @@ test("IBM i integration (isolated, one test per tool)", { skip: !hasConn || !all
       assert.ok(Array.isArray(list));
     });
 
-    await t.test("ibmi.connections.update", async () => {
+    await t.test("ibmi.connections.update", { skip: preconfiguredConnection }, async () => {
       await handleTool(ctx, "ibmi.connections.update", { name: connName, port });
     });
 
@@ -365,7 +365,7 @@ test("IBM i integration (isolated, one test per tool)", { skip: !hasConn || !all
       await handleTool(ctx, "ibmi.disconnect", {});
     });
 
-    await t.test("ibmi.connections.delete", async () => {
+    await t.test("ibmi.connections.delete", { skip: preconfiguredConnection }, async () => {
       await handleTool(ctx, "ibmi.connections.delete", { name: connName });
     });
   } finally {
@@ -378,7 +378,9 @@ test("IBM i integration (isolated, one test per tool)", { skip: !hasConn || !all
       }));
     }
     await safe(() => handleTool(ctx, "ibmi.disconnect", {}));
-    await safe(() => handleTool(ctx, "ibmi.connections.delete", { name: connName }));
+    if (!preconfiguredConnection) {
+      await safe(() => handleTool(ctx, "ibmi.connections.delete", { name: connName }));
+    }
     await safe(() => fs.rm(localTemp, { recursive: true, force: true }));
   }
 });

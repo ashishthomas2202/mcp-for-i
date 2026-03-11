@@ -4,13 +4,17 @@
   "private": true,
   "type": "module",
   "bin": {
-    "mcp-for-i": "dist/index.js"
+    "mcp-for-i": "dist/index.js",
+    "mcp-for-i-control": "dist/controlplane/index.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "start:controlplane": "node dist/controlplane/index.js",
     "dev": "ts-node src/index.ts",
-    "test": "npm run build && node --test test",
+    "dev:controlplane": "ts-node src/controlplane/index.ts",
+    "test": "npm run build && node --test test/tools.test.mjs test/variables.test.mjs test/validation.test.mjs test/config.migration.test.mjs",
+    "test:all": "npm run build && node --test test/*.mjs",
     "test:ibmi": "npm run build && node --test test/ibmi.integration.test.mjs",
     "test:mcp": "npm run build && node --test test/mcp.integration.test.mjs"
   },

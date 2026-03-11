@@ -1,16 +1,26 @@
 # Examples
 
-## Connect (direct)
+## Add connection profile
 ```json
 {
-  "tool": "ibmi.connect",
+  "tool": "ibmi.connections.add",
   "arguments": {
+    "name": "DEV400",
     "host": "dev400.myco.com",
     "port": 22,
     "username": "DEVUSER",
     "password": "*****",
-    "storePassword": true
+    "storePassword": true,
+    "policy": { "profile": "guarded" }
   }
+}
+```
+
+## Connect by saved name
+```json
+{
+  "tool": "ibmi.connect",
+  "arguments": { "name": "DEV400" }
 }
 ```
 
