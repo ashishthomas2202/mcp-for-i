@@ -1,13 +1,28 @@
 {
   "name": "mcp-for-i",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
+  "description": "Local MCP server and control plane for IBM i workflows",
   "type": "module",
+  "homepage": "https://github.com/ashishthomas-pcr/mcp-for-i",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ashishthomas-pcr/mcp-for-i.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ashishthomas-pcr/mcp-for-i/issues"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "docs"
+  ],
   "bin": {
     "mcp-for-i": "dist/index.js",
     "mcp-for-i-control": "dist/controlplane/index.js"
   },
   "scripts": {
+    "prepack": "npm run build",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "start:controlplane": "node dist/controlplane/index.js",
