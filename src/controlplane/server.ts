@@ -82,7 +82,11 @@ async function routeRequest(
   }
 
   if (method === "POST" && pathname === "/api/runtime/update/skills") {
-    const job = await services.runtime.updateSkills();
+    const body = await readJson(req);
+    const job = await services.runtime.updateSkills({
+      repoUrl: typeof body.repoUrl === "string" ? body.repoUrl : undefined,
+      branch: typeof body.branch === "string" ? body.branch : undefined
+    });
     sendJson(res, 202, { job });
     return;
   }

@@ -377,6 +377,16 @@ export function renderControlPlaneHtml() {
 
     <section class="card">
       <h2>Runtime Actions</h2>
+      <div class="grid-2">
+        <div class="field">
+          <label>Skills Repo URL</label>
+          <input id="skillsRepoUrl" placeholder="https://github.com/ashishthomas-pcr/mcp-for-i-skills.git" />
+        </div>
+        <div class="field">
+          <label>Skills Branch</label>
+          <input id="skillsBranch" placeholder="main" />
+        </div>
+      </div>
       <div class="actions">
         <button id="installBtn" type="button">Install/Repair MCP</button>
         <button id="updateMcpBtn" class="secondary" type="button">Update MCP from GitHub</button>
@@ -384,7 +394,7 @@ export function renderControlPlaneHtml() {
         <button id="refreshStatusBtn" class="secondary" type="button">Refresh Status</button>
       </div>
       <div id="logs" class="logs">No jobs yet.</div>
-      <div class="hint">Actions stream logs live. Errors include the exact command and exit code for troubleshooting.</div>
+      <div class="hint">Actions stream logs live. Skills update can clone or pull from the repo and branch shown above.</div>
     </section>
 
     <section class="card" style="grid-column: 1 / -1;">
@@ -408,6 +418,10 @@ export function renderControlPlaneHtml() {
 
   <script>
     const THEME_KEY = "mcp_for_i_theme";
+    const SKILLS_REPO_KEY = "mcp_for_i_skills_repo";
+    const SKILLS_BRANCH_KEY = "mcp_for_i_skills_branch";
+    const DEFAULT_SKILLS_REPO = "https://github.com/ashishthomas-pcr/mcp-for-i-skills.git";
+    const DEFAULT_SKILLS_BRANCH = "main";
 
     const state = {
       selectedName: "",
@@ -441,6 +455,32 @@ export function renderControlPlaneHtml() {
     function toggleTheme() {
       const current = document.body.getAttribute("data-theme") === "light" ? "light" : "dark";
       applyTheme(current === "dark" ? "light" : "dark");
+    }
+
+    function loadSkillsUpdateSettings() {
+      let repoUrl = DEFAULT_SKILLS_REPO;
+      let branch = DEFAULT_SKILLS_BRANCH;
+      try {
+        const storedRepo = localStorage.getItem(SKILLS_REPO_KEY);
+        const storedBranch = localStorage.getItem(SKILLS_BRANCH_KEY);
+        if (storedRepo && storedRepo.trim()) repoUrl = storedRepo.trim();
+        if (storedBranch && storedBranch.trim()) branch = storedBranch.trim();
+      } catch {}
+      $("skillsRepoUrl").value = repoUrl;
+      $("skillsBranch").value = branch;
+    }
+
+    function getSkillsUpdatePayload() {
+      const repoUrl = $("skillsRepoUrl").value.trim();
+      const branch = $("skillsBranch").value.trim();
+      try {
+        localStorage.setItem(SKILLS_REPO_KEY, repoUrl || DEFAULT_SKILLS_REPO);
+        localStorage.setItem(SKILLS_BRANCH_KEY, branch || DEFAULT_SKILLS_BRANCH);
+      } catch {}
+      return {
+        repoUrl: repoUrl || DEFAULT_SKILLS_REPO,
+        branch: branch || DEFAULT_SKILLS_BRANCH
+      };
     }
 
     async function api(path, options = {}) {
@@ -619,8 +659,11 @@ export function renderControlPlaneHtml() {
       }
     }
 
-    async function triggerJob(path) {
-      await api(path, { method: "POST" });
+    async function triggerJob(path, payload) {
+      await api(path, {
+        method: "POST",
+        body: payload ? JSON.stringify(payload) : undefined
+      });
       await loadRuntimeStatus();
       startJobPolling();
     }
@@ -654,10 +697,11 @@ export function renderControlPlaneHtml() {
     $("clearBtn").addEventListener("click", resetForm);
     $("installBtn").addEventListener("click", () => triggerJob("/api/runtime/install"));
     $("updateMcpBtn").addEventListener("click", () => triggerJob("/api/runtime/update/mcp"));
-    $("updateSkillsBtn").addEventListener("click", () => triggerJob("/api/runtime/update/skills"));
+    $("updateSkillsBtn").addEventListener("click", () => triggerJob("/api/runtime/update/skills", getSkillsUpdatePayload()));
     $("refreshStatusBtn").addEventListener("click", loadRuntimeStatus);
 
     applyTheme(readStoredTheme());
+    loadSkillsUpdateSettings();
     Promise.all([loadHealth(), loadConnections(), loadRuntimeStatus()]).catch(err => {
       $("logs").textContent = "Startup error: " + err.message;
     });

@@ -19,6 +19,11 @@ type RuntimeState = {
   updateSkills: RuntimeJob;
 };
 
+type UpdateSkillsOptions = {
+  repoUrl?: string;
+  branch?: string;
+};
+
 export class RuntimeService {
   private readonly state: RuntimeState = {
     install: makeJob("install"),
@@ -47,28 +52,43 @@ export class RuntimeService {
     });
   }
 
-  async updateSkills() {
+  async updateSkills(options?: UpdateSkillsOptions) {
     return this.runJob("updateSkills", async push => {
+      const repoUrl = sanitizeRepoUrl(options?.repoUrl) || process.env.MCP_FOR_I_SKILLS_REPO || DEFAULT_SKILLS_REPO;
+      const branch = sanitizeBranch(options?.branch) || process.env.MCP_FOR_I_SKILLS_BRANCH || "main";
       const skillsDir = path.join(this.rootDir, "skills");
       const hasSkills = await pathExists(skillsDir);
+
+      push(`Using skills repository: ${repoUrl} (${branch})`);
+
       if (!hasSkills) {
-        push("No skills directory found.");
+        await this.runCommand("git", ["clone", "--depth", "1", "--branch", branch, repoUrl, skillsDir], this.rootDir, push);
         return;
       }
 
       const skillsGit = path.join(skillsDir, ".git");
       if (await pathExists(skillsGit)) {
-        await this.runCommand("git", ["pull", "--ff-only"], skillsDir, push);
+        const currentRemote = await this.getGitRemoteUrl(skillsDir, push);
+        if (currentRemote && currentRemote !== repoUrl) {
+          push(`Switching skills remote from ${currentRemote} to ${repoUrl}`);
+          await this.runCommand("git", ["remote", "set-url", "origin", repoUrl], skillsDir, push);
+        }
+        await this.runCommand("git", ["fetch", "origin", branch], skillsDir, push);
+        await this.runCommand("git", ["checkout", branch], skillsDir, push);
+        await this.runCommand("git", ["pull", "--ff-only", "origin", branch], skillsDir, push);
         return;
       }
 
-      const rootGit = path.join(this.rootDir, ".git");
-      if (await pathExists(rootGit)) {
-        await this.runCommand("git", ["pull", "--ff-only"], this.rootDir, push);
-        return;
+      const backupDir = `${skillsDir}.backup-${Date.now()}`;
+      push(`Existing skills directory is not a git repository. Backing it up to ${backupDir}`);
+      await fs.rename(skillsDir, backupDir);
+      try {
+        await this.runCommand("git", ["clone", "--depth", "1", "--branch", branch, repoUrl, skillsDir], this.rootDir, push);
+      } catch (error) {
+        push("Clone failed. Restoring previous skills directory.");
+        await safeRename(backupDir, skillsDir);
+        throw error;
       }
-
-      throw new Error("Skills update requires a git repository.");
     });
   }
 
@@ -132,6 +152,41 @@ export class RuntimeService {
     }
     await this.runCommand(npm.path, args, cwd, push);
   }
+
+  private async getGitRemoteUrl(cwd: string, push: (line: string) => void) {
+    try {
+      const lines: string[] = [];
+      await this.runCommandCapture("git", ["remote", "get-url", "origin"], cwd, line => {
+        push(line);
+        lines.push(line);
+      });
+      const value = lines.join("\n").trim();
+      return value || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private runCommandCapture(command: string, args: string[], cwd: string, push: (line: string) => void) {
+    return new Promise<void>((resolve, reject) => {
+      push(`$ ${command} ${args.join(" ")}`);
+      const child = spawn(command, args, {
+        cwd,
+        shell: process.platform === "win32"
+      });
+
+      child.stdout.on("data", chunk => push(String(chunk).trimEnd()));
+      child.stderr.on("data", chunk => push(String(chunk).trimEnd()));
+      child.on("error", reject);
+      child.on("exit", code => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`Command failed (${code}): ${command} ${args.join(" ")}`));
+        }
+      });
+    });
+  }
 }
 
 function makeJob(id: string): RuntimeJob {
@@ -150,6 +205,30 @@ async function resolveNpmLaunch(): Promise<{ mode: "node-cli" | "command"; path:
   if (await pathExists(guessed)) return { mode: "node-cli", path: guessed };
   return { mode: "command", path: process.platform === "win32" ? "npm.cmd" : "npm" };
 }
+
+function sanitizeRepoUrl(value?: string) {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed;
+}
+
+function sanitizeBranch(value?: string) {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed;
+}
+
+async function safeRename(from: string, to: string) {
+  try {
+    await fs.rename(from, to);
+  } catch {
+    // best-effort rollback
+  }
+}
+
+const DEFAULT_SKILLS_REPO = "https://github.com/ashishthomas-pcr/mcp-for-i-skills.git";
 
 async function pathExists(target: string) {
   try {
