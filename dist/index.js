@@ -6,7 +6,7 @@ import { getTools, handleTool } from "./mcp/tools.js";
 import { McpContext } from "./mcp/context.js";
 import { log } from "./mcp/logger.js";
 import { validateToolInput } from "./mcp/validation.js";
-const server = new Server({ name: "mcp-for-i", version: "0.1.3" }, { capabilities: { tools: {} } });
+const server = new Server({ name: "mcp-for-i", version: "0.1.4" }, { capabilities: { tools: {} } });
 const ctx = new McpContext();
 const tools = getTools();
 const toolMap = new Map(tools.map(tool => [tool.name, tool]));

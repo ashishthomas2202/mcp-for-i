@@ -2,13 +2,12 @@ import { LocalLanguageActions } from "../ibmi/LocalLanguageActions.js";
 import { CompileTools } from "../ibmi/CompileTools.js";
 import { Search } from "../ibmi/Search.js";
 import { Tools } from "../ibmi/Tools.js";
-import { IBMiClient } from "../ibmi/client.js";
 import { ConnectionService } from "../controlplane/connectionService.js";
 import { log } from "./logger.js";
 import fs from "fs/promises";
 import path from "path";
 export function getTools() {
-    return [
+    const tools = [
         {
             name: "ibmi.connect",
             description: "Connect to a saved IBM i connection by name.",
@@ -563,6 +562,7 @@ export function getTools() {
             inputSchema: { type: "object", properties: {} }
         }
     ];
+    return tools.map(withGuardedApprovalHint);
 }
 export async function handleTool(ctx, name, args) {
     const connections = new ConnectionService(ctx.store);
@@ -685,13 +685,15 @@ export async function handleTool(ctx, name, args) {
         }
         case "ibmi.ifs.write": {
             const conn = ctx.ensureActive(args?.connectionName);
-            enforceWritable(ctx, conn, "ifs.write", args);
+            const op = resolveIfsWriteOperation(args.path);
+            enforceWritable(ctx, conn, op, args);
             await conn.content.writeStreamfileRaw(args.path, args.content);
             return result("OK");
         }
         case "ibmi.ifs.mkdir": {
             const conn = ctx.ensureActive(args?.connectionName);
-            enforceWritable(ctx, conn, "ifs.write", args);
+            const op = resolveIfsWriteOperation(args.path);
+            enforceWritable(ctx, conn, op, args);
             await conn.sendCommand({ command: `mkdir -p ${Tools.escapePath(args.path)}` });
             return result("OK");
         }
@@ -704,7 +706,8 @@ export async function handleTool(ctx, name, args) {
         }
         case "ibmi.ifs.upload": {
             const conn = ctx.ensureActive(args?.connectionName);
-            enforceWritable(ctx, conn, "ifs.write", args);
+            const op = resolveIfsWriteOperation(args.remotePath);
+            enforceWritable(ctx, conn, op, args);
             await conn.client.putFile(args.localPath, args.remotePath);
             return result("OK");
         }
@@ -1125,7 +1128,13 @@ export async function handleTool(ctx, name, args) {
                 cmdResult = await conn.sendQsh({ command, directory: cwd });
             }
             else {
-                cmdResult = await conn.sendQsh({ command: `system \"${IBMiClient.escapeForShell(command)}\"`, directory: cwd });
+                try {
+                    await conn.runSQL(`CALL QSYS2.QCMDEXC(${Tools.sqlString(command)})`);
+                    cmdResult = { code: 0, signal: null, stdout: "", stderr: "", command };
+                }
+                catch (err) {
+                    cmdResult = { code: 1, signal: null, stdout: "", stderr: err?.message || String(err), command };
+                }
             }
             log("info", "audit.cl.run", { connectionName: args?.connectionName || ctx.activeName, environment });
             return json(cmdResult);
@@ -1310,6 +1319,47 @@ function isDeniedByPolicy(policy, operation, args) {
             return true;
     }
     return false;
+}
+const APPROVAL_HINT_TOOLS = new Set([
+    "ibmi.qsys.members.write",
+    "ibmi.qsys.members.create",
+    "ibmi.qsys.members.rename",
+    "ibmi.qsys.members.delete",
+    "ibmi.qsys.sourcefiles.create",
+    "ibmi.qsys.libraries.create",
+    "ibmi.ifs.write",
+    "ibmi.ifs.mkdir",
+    "ibmi.ifs.delete",
+    "ibmi.ifs.upload",
+    "ibmi.actions.run",
+    "ibmi.profiles.activate",
+    "ibmi.deploy.uploadDirectory",
+    "ibmi.deploy.uploadFiles",
+    "ibmi.deploy.setCcsid",
+    "ibmi.deploy.sync",
+    "ibmi.sql.execute",
+    "ibmi.cl.run"
+]);
+function withGuardedApprovalHint(tool) {
+    if (!APPROVAL_HINT_TOOLS.has(tool.name))
+        return tool;
+    const schema = tool.inputSchema || { type: "object", properties: {} };
+    if (!schema.properties)
+        schema.properties = {};
+    if (!schema.properties.approve) {
+        schema.properties.approve = {
+            type: "boolean",
+            description: "Set true to approve guarded-policy operations."
+        };
+    }
+    return { ...tool, inputSchema: schema };
+}
+function resolveIfsWriteOperation(pathValue) {
+    const target = String(pathValue || "");
+    if (/^\/qsys\.lib\//i.test(target)) {
+        return "qsys.write";
+    }
+    return "ifs.write";
 }
 function parseEvfevent(content) {
     const diagnostics = [];

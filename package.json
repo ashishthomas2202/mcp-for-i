@@ -1,6 +1,6 @@
 {
   "name": "mcp-for-i",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": false,
   "description": "Local MCP server and control plane for IBM i workflows",
   "type": "module",
@@ -28,7 +28,7 @@
     "start:controlplane": "node dist/controlplane/index.js",
     "dev": "ts-node src/index.ts",
     "dev:controlplane": "ts-node src/controlplane/index.ts",
-    "test": "npm run build && node --test test/tools.test.mjs test/variables.test.mjs test/validation.test.mjs test/config.migration.test.mjs",
+    "test": "npm run build && node --test test/tools.test.mjs test/variables.test.mjs test/validation.test.mjs test/config.migration.test.mjs test/sql.parse.test.mjs",
     "test:all": "npm run build && node --test test/*.mjs",
     "test:ibmi": "npm run build && node --test test/ibmi.integration.test.mjs",
     "test:mcp": "npm run build && node --test test/mcp.integration.test.mjs"

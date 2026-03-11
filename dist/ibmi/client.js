@@ -4,6 +4,7 @@ import path from "path";
 import { Tools } from "./Tools.js";
 import { IBMiContent } from "./IBMiContent.js";
 const LOCALE = "LC_ALL=EN_US.UTF-8";
+const SQL_HEREDOC_TAG = "__MCP_FOR_I_SQL__";
 export class IBMiClient {
     client;
     content;
@@ -110,15 +111,25 @@ export class IBMiClient {
         };
     }
     async runSQL(statements) {
-        const input = Tools.fixSQL(statements, true);
+        const input = Tools.fixSQL(statements, true).trim();
+        if (!input)
+            return [];
         const ccsid = this.config.sqlJobCcsid ?? 1208;
-        const command = `${LOCALE} system "CHGJOB CCSID(${ccsid})" ; ${LOCALE} system "call QSYS/QZDFMDB2 PARM('-d' '-i' '-t')"`;
-        const output = await this.sendCommand({ command, stdin: input, env: { QIBM_PASE_CCSID: String(ccsid) } });
-        if (output.stderr && output.stderr.trim()) {
-            // QZDFMDB2 tends to emit errors in stdout, but keep stderr for debugging
-        }
-        if (output.stdout) {
+        const command = [
+            `system "CHGJOB CCSID(${ccsid})"`,
+            `cat <<'${SQL_HEREDOC_TAG}' | system "call QSYS/QZDFMDB2 PARM('-d' '-i' '-t')"`,
+            input,
+            SQL_HEREDOC_TAG
+        ].join("\n");
+        const output = await this.sendQsh({
+            command,
+            env: { QIBM_PASE_CCSID: String(ccsid) }
+        });
+        if (output.stdout && output.stdout.trim()) {
             return Tools.db2Parse(output.stdout, input);
+        }
+        if (hasSqlError(output.stderr || "")) {
+            throw new Tools.SqlError(normalizeSqlError(output.stderr || ""));
         }
         return [];
     }
@@ -210,4 +221,14 @@ export class IBMiClient {
         // QZDFMDB2.PGM is in QSYS/QZDFMDB2 by default; treat as present
         this.remoteFeatures["QZDFMDB2.PGM"] = "/QSYS.LIB/QZDFMDB2.PGM";
     }
+}
+function hasSqlError(stderr) {
+    return /(SQL\d{4}|SQLSTATE|CLI ERROR)/i.test(stderr);
+}
+function normalizeSqlError(stderr) {
+    return stderr
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(line => line && !line.includes("Object is EN_US.UTF-8"))
+        .join(" ");
 }

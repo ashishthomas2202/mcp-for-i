@@ -40,3 +40,18 @@ test("ibmi.connections.add rejects secret-bearing arguments", () => {
   });
   assert.ok(withPassword.some(msg => msg.includes("$.password is not allowed")));
 });
+
+test("guarded write tools advertise optional approve argument", () => {
+  const memberWrite = getTools().find(t => t.name === "ibmi.qsys.members.write");
+  assert.ok(memberWrite, "ibmi.qsys.members.write tool is missing");
+  assert.equal(memberWrite.inputSchema.properties.approve.type, "boolean");
+
+  const withApprove = validateToolInput(memberWrite.inputSchema, {
+    library: "PGMASHISH",
+    sourceFile: "QRPGLESRC",
+    member: "HELLOAI",
+    content: "**free\nreturn;\n",
+    approve: true
+  });
+  assert.equal(withApprove.length, 0);
+});
