@@ -91,6 +91,24 @@ async function routeRequest(
     return;
   }
 
+  if (method === "GET" && pathname === "/api/runtime/autostart/status") {
+    const status = await services.runtime.getAutostartStatus();
+    sendJson(res, 200, { status });
+    return;
+  }
+
+  if (method === "POST" && pathname === "/api/runtime/autostart/setup") {
+    const job = await services.runtime.setupAutostart();
+    sendJson(res, 202, { job });
+    return;
+  }
+
+  if (method === "POST" && pathname === "/api/runtime/autostart/remove") {
+    const job = await services.runtime.removeAutostart();
+    sendJson(res, 202, { job });
+    return;
+  }
+
   if (method === "GET" && pathname === "/api/connections") {
     const list = await services.connections.list();
     sendJson(res, 200, { connections: list });

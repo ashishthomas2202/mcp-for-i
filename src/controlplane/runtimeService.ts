@@ -1,6 +1,15 @@
 import { spawn } from "child_process";
 import fs from "fs/promises";
 import path from "path";
+import { fileURLToPath } from "url";
+import {
+  AUTOSTART_TASK_NAME,
+  configureWindowsAutostart,
+  getControlPlaneUrl,
+  getWindowsAutostartStatus,
+  isControlPlaneRunning,
+  removeWindowsAutostart
+} from "./autostart.js";
 
 type JobStatus = "idle" | "running" | "success" | "failed";
 
@@ -17,6 +26,8 @@ type RuntimeState = {
   install: RuntimeJob;
   updateMcp: RuntimeJob;
   updateSkills: RuntimeJob;
+  setupAutostart: RuntimeJob;
+  removeAutostart: RuntimeJob;
 };
 
 type UpdateSkillsOptions = {
@@ -28,7 +39,9 @@ export class RuntimeService {
   private readonly state: RuntimeState = {
     install: makeJob("install"),
     updateMcp: makeJob("updateMcp"),
-    updateSkills: makeJob("updateSkills")
+    updateSkills: makeJob("updateSkills"),
+    setupAutostart: makeJob("setupAutostart"),
+    removeAutostart: makeJob("removeAutostart")
   };
 
   constructor(private readonly rootDir: string) {}
@@ -90,6 +103,60 @@ export class RuntimeService {
         throw error;
       }
     });
+  }
+
+  async setupAutostart() {
+    return this.runJob("setupAutostart", async push => {
+      if (process.platform !== "win32") {
+        throw new Error("Autostart setup is currently supported on Windows only.");
+      }
+      const scriptPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "index.js");
+      await configureWindowsAutostart(scriptPath, process.execPath);
+      push(`Autostart configured (${AUTOSTART_TASK_NAME}).`);
+      push(`Control plane URL: ${getControlPlaneUrl()}`);
+    });
+  }
+
+  async removeAutostart() {
+    return this.runJob("removeAutostart", async push => {
+      if (process.platform !== "win32") {
+        throw new Error("Autostart removal is currently supported on Windows only.");
+      }
+      try {
+        await removeWindowsAutostart();
+        push(`Autostart removed (${AUTOSTART_TASK_NAME}).`);
+      } catch (err: any) {
+        const msg = err?.message || String(err);
+        if (msg.includes("cannot find the file specified") || msg.includes("ERROR: The system cannot find")) {
+          push(`Autostart task not found (${AUTOSTART_TASK_NAME}).`);
+          return;
+        }
+        throw err;
+      }
+    });
+  }
+
+  async getAutostartStatus() {
+    const url = getControlPlaneUrl();
+    const running = await isControlPlaneRunning(url);
+    if (process.platform !== "win32") {
+      return {
+        platform: process.platform,
+        running,
+        controlPlaneUrl: url,
+        supported: false,
+        installed: false
+      };
+    }
+    const task = await getWindowsAutostartStatus();
+    return {
+      platform: process.platform,
+      running,
+      controlPlaneUrl: url,
+      supported: true,
+      installed: task.installed,
+      state: task.state
+    };
   }
 
   private async runJob(kind: keyof RuntimeState, fn: (push: (line: string) => void) => Promise<void>) {

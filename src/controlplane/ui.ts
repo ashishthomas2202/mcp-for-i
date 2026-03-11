@@ -392,7 +392,11 @@ export function renderControlPlaneHtml() {
         <button id="updateMcpBtn" class="secondary" type="button">Update MCP from GitHub</button>
         <button id="updateSkillsBtn" class="secondary" type="button">Update Skills</button>
         <button id="refreshStatusBtn" class="secondary" type="button">Refresh Status</button>
+        <button id="setupAutostartBtn" class="secondary" type="button">Enable Background Startup</button>
+        <button id="removeAutostartBtn" class="secondary" type="button">Disable Background Startup</button>
+        <button id="autostartStatusBtn" class="secondary" type="button">Refresh Startup Status</button>
       </div>
+      <div id="autostartInfo" class="hint">Startup status: checking...</div>
       <div id="logs" class="logs">No jobs yet.</div>
       <div class="hint">Actions stream logs live. Skills update can clone or pull from the repo and branch shown above.</div>
     </section>
@@ -425,7 +429,8 @@ export function renderControlPlaneHtml() {
 
     const state = {
       selectedName: "",
-      jobs: {}
+      jobs: {},
+      autostart: null
     };
 
     const $ = id => document.getElementById(id);
@@ -581,6 +586,27 @@ export function renderControlPlaneHtml() {
       renderLogs(status.jobs || {});
     }
 
+    function renderAutostart(status) {
+      state.autostart = status || null;
+      const el = $("autostartInfo");
+      if (!status) {
+        el.textContent = "Startup status: unavailable";
+        return;
+      }
+      if (status.supported === false) {
+        el.textContent = \`Startup status: not managed on platform '\${status.platform}'. Running now: \${status.running ? "yes" : "no"}.\`;
+        return;
+      }
+      const installed = status.installed ? "enabled" : "disabled";
+      const stateText = status.state ? \` (\${status.state})\` : "";
+      el.textContent = \`Startup status: \${installed}\${stateText}. Running now: \${status.running ? "yes" : "no"}.\`;
+    }
+
+    async function loadAutostartStatus() {
+      const data = await api("/api/runtime/autostart/status");
+      renderAutostart(data.status || null);
+    }
+
     async function onSave() {
       const payload = formToPayload();
       if (!payload.name || !payload.host || !payload.username) {
@@ -665,6 +691,7 @@ export function renderControlPlaneHtml() {
         body: payload ? JSON.stringify(payload) : undefined
       });
       await loadRuntimeStatus();
+      await loadAutostartStatus();
       startJobPolling();
     }
 
@@ -699,10 +726,13 @@ export function renderControlPlaneHtml() {
     $("updateMcpBtn").addEventListener("click", () => triggerJob("/api/runtime/update/mcp"));
     $("updateSkillsBtn").addEventListener("click", () => triggerJob("/api/runtime/update/skills", getSkillsUpdatePayload()));
     $("refreshStatusBtn").addEventListener("click", loadRuntimeStatus);
+    $("setupAutostartBtn").addEventListener("click", () => triggerJob("/api/runtime/autostart/setup"));
+    $("removeAutostartBtn").addEventListener("click", () => triggerJob("/api/runtime/autostart/remove"));
+    $("autostartStatusBtn").addEventListener("click", loadAutostartStatus);
 
     applyTheme(readStoredTheme());
     loadSkillsUpdateSettings();
-    Promise.all([loadHealth(), loadConnections(), loadRuntimeStatus()]).catch(err => {
+    Promise.all([loadHealth(), loadConnections(), loadRuntimeStatus(), loadAutostartStatus()]).catch(err => {
       $("logs").textContent = "Startup error: " + err.message;
     });
   </script>
