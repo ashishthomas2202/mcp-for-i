@@ -399,6 +399,7 @@ export function renderControlPlaneHtml() {
       <div id="autostartInfo" class="hint">Startup status: checking...</div>
       <div id="logs" class="logs">No jobs yet.</div>
       <div class="hint">Install/Repair uses local git checkout when available, otherwise global npm install. Update MCP follows the same mode.</div>
+      <div class="hint">Windows global updates may briefly restart the local control-plane service.</div>
       <div class="hint">Skills update can clone or pull from the repo and branch shown above.</div>
     </section>
 

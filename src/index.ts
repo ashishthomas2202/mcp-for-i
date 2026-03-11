@@ -8,7 +8,7 @@ import { log } from "./mcp/logger.js";
 import { validateToolInput } from "./mcp/validation.js";
 
 const server = new Server(
-  { name: "mcp-for-i", version: "0.1.0" },
+  { name: "mcp-for-i", version: "0.1.2" },
   { capabilities: { tools: {} } }
 );
 

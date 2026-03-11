@@ -60,7 +60,7 @@ Build `mcp-for-i` into a production-grade IBM i agent platform where:
 ## Current Status
 - Phase 0: in progress (core injection/validation/build fixes landed; additional hardening pass still open)
 - Phase 1: complete (control-plane UI + secure profile onboarding + keychain secret isolation + secret-arg blocking + legacy plaintext credential migration)
-- Pre-Phase-2 release prep: in progress (npm metadata migration to personal GitHub account, npm/global-safe update behavior, npm-facing docs refresh)
+- Pre-Phase-2 release prep: complete (npm metadata migration to personal GitHub account, npm/global-safe update behavior with Windows self-update scheduling, npm-facing docs refresh)
 - Phase 2: next up (expand session lifecycle into robust pooled connection management with stronger reconnect behavior and UI observability)
 - Phase 3: in progress (SQL/CL/joblog/spool/diagnostics tool surface added with guard hooks)
 - Phase 4-7: pending

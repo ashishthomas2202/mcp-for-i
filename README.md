@@ -89,6 +89,7 @@ In the UI, runtime buttons behave as follows:
 - `Update MCP`
   - If running from a git checkout: pulls latest changes from `origin/<current-branch>`, then installs/builds.
   - If running as npm-installed package: upgrades global npm package to latest.
+  - On Windows global installs, update runs in a detached updater and briefly restarts control plane to avoid file-lock (`EBUSY`) errors.
 - `Update Skills`
   - Pulls/clones the configured skills repository and branch into the local `skills` directory.
 

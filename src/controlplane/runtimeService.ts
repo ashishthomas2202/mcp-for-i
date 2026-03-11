@@ -1,5 +1,6 @@
 import { spawn } from "child_process";
 import fs from "fs/promises";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import {
@@ -58,8 +59,7 @@ export class RuntimeService {
         await this.buildIfPresent(push);
         return;
       }
-      push(`Running global install for ${PACKAGE_NAME}@latest`);
-      await this.runNpm(["install", "-g", `${PACKAGE_NAME}@latest`], this.rootDir, push);
+      await this.runGlobalPackageUpdate(push, "install");
     });
   }
 
@@ -79,8 +79,7 @@ export class RuntimeService {
         await this.buildIfPresent(push);
         return;
       }
-      push(`Running global update for ${PACKAGE_NAME}@latest`);
-      await this.runNpm(["install", "-g", `${PACKAGE_NAME}@latest`], this.rootDir, push);
+      await this.runGlobalPackageUpdate(push, "update");
     });
   }
 
@@ -304,6 +303,59 @@ export class RuntimeService {
     } catch {
       return undefined;
     }
+  }
+
+  private async runGlobalPackageUpdate(push: (line: string) => void, action: "install" | "update") {
+    if (process.platform === "win32" && this.isLikelyGlobalInstall()) {
+      await this.scheduleWindowsSelfUpdate(push, action);
+      return;
+    }
+
+    push(`Running global ${action} for ${PACKAGE_NAME}@latest`);
+    await this.runNpm(["install", "-g", `${PACKAGE_NAME}@latest`], this.rootDir, push);
+  }
+
+  private isLikelyGlobalInstall() {
+    const normalizedRoot = path.normalize(this.rootDir).toLowerCase();
+    const marker = `${path.sep}node_modules${path.sep}${PACKAGE_NAME}`.toLowerCase();
+    return normalizedRoot.includes(marker);
+  }
+
+  private async scheduleWindowsSelfUpdate(push: (line: string) => void, action: "install" | "update") {
+    const npm = await resolveNpmLaunch();
+    const controlPlaneScript = path.join(path.dirname(fileURLToPath(import.meta.url)), "index.js");
+    const jobId = `${Date.now()}-${process.pid}`;
+    const logPath = path.join(os.tmpdir(), `${PACKAGE_NAME}-${action}-${jobId}.log`);
+    const scriptPath = path.join(os.tmpdir(), `${PACKAGE_NAME}-${action}-${jobId}.cmd`);
+
+    const installCommand = npm.mode === "node-cli"
+      ? `"${process.execPath}" "${npm.path}" install -g ${PACKAGE_NAME}@latest`
+      : `"${npm.path}" install -g ${PACKAGE_NAME}@latest`;
+
+    const script = [
+      "@echo off",
+      "setlocal",
+      `set \"LOG_PATH=${logPath}\"`,
+      `echo [${new Date().toISOString()}] Scheduled ${action}>>\"%LOG_PATH%\"`,
+      "timeout /t 2 /nobreak >nul",
+      `taskkill /PID ${process.pid} /F >nul 2>nul`,
+      `${installCommand} >>\"%LOG_PATH%\" 2>&1`,
+      "if errorlevel 1 goto :end",
+      `start \"\" \"${process.execPath}\" \"${controlPlaneScript}\" serve`,
+      ":end",
+      `echo [${new Date().toISOString()}] Finished ${action}>>\"%LOG_PATH%\"`,
+      "del \"%~f0\" >nul 2>nul"
+    ].join("\r\n");
+
+    await fs.writeFile(scriptPath, script, "utf8");
+    spawn("cmd.exe", ["/d", "/s", "/c", scriptPath], {
+      detached: true,
+      stdio: "ignore"
+    }).unref();
+
+    push(`Scheduled self-${action} in background to avoid Windows file-lock errors.`);
+    push("Control plane will stop briefly, then restart automatically.");
+    push(`Background update log: ${logPath}`);
   }
 }
 
