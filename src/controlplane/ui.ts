@@ -7,43 +7,45 @@ export function renderControlPlaneHtml() {
   <title>MCP-for-i Control Plane</title>
   <style>
     :root {
-      color-scheme: dark;
-      --bg: #060b11;
-      --bg-grad-1: rgba(20, 184, 166, 0.17);
-      --bg-grad-2: rgba(59, 130, 246, 0.18);
-      --surface: rgba(15, 23, 32, 0.9);
-      --surface-2: #131d2a;
-      --line: #263547;
-      --line-strong: #3c5270;
-      --text: #e6eef8;
-      --muted: #8da4bb;
-      --accent: #14b8a6;
-      --accent-2: #38bdf8;
-      --danger-1: #f97316;
-      --danger-2: #ef4444;
-      --ok: #34d399;
-      --shadow: 0 18px 42px rgba(0, 0, 0, 0.34);
-      --ring: 0 0 0 3px rgba(20, 184, 166, 0.22);
-    }
-
-    body[data-theme="light"] {
       color-scheme: light;
       --bg: #f4f7fb;
-      --bg-grad-1: rgba(20, 184, 166, 0.14);
-      --bg-grad-2: rgba(14, 165, 233, 0.12);
-      --surface: rgba(255, 255, 255, 0.92);
-      --surface-2: #f8fbff;
-      --line: #d5e0ec;
-      --line-strong: #b8c9dd;
-      --text: #0e1b2a;
-      --muted: #516377;
-      --accent: #0f766e;
-      --accent-2: #0284c7;
+      --bg-grad-1: rgba(11, 101, 216, 0.11);
+      --bg-grad-2: rgba(6, 182, 212, 0.08);
+      --surface: rgba(255, 255, 255, 0.96);
+      --surface-2: #f7faff;
+      --line: #d8e1ed;
+      --line-strong: #b8c8dd;
+      --text: #0f1d2d;
+      --muted: #5f738b;
+      --accent: #0b65d8;
+      --accent-2: #0b65d8;
       --danger-1: #dc2626;
-      --danger-2: #b91c1c;
-      --ok: #059669;
+      --danger-2: #dc2626;
+      --ok: #1f9d58;
+      --warn: #c27c00;
       --shadow: 0 14px 34px rgba(13, 35, 66, 0.14);
-      --ring: 0 0 0 3px rgba(2, 132, 199, 0.2);
+      --ring: 0 0 0 3px rgba(11, 101, 216, 0.18);
+    }
+
+    body[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #0a1220;
+      --bg-grad-1: rgba(59, 130, 246, 0.2);
+      --bg-grad-2: rgba(14, 165, 233, 0.14);
+      --surface: rgba(16, 25, 38, 0.94);
+      --surface-2: #152133;
+      --line: #26374e;
+      --line-strong: #39506f;
+      --text: #e5edf7;
+      --muted: #9cb0c8;
+      --accent: #3b82f6;
+      --accent-2: #3b82f6;
+      --danger-1: #ef4444;
+      --danger-2: #ef4444;
+      --ok: #34d399;
+      --warn: #f59e0b;
+      --shadow: 0 18px 42px rgba(0, 0, 0, 0.34);
+      --ring: 0 0 0 3px rgba(59, 130, 246, 0.26);
     }
 
     * { box-sizing: border-box; }
@@ -115,7 +117,7 @@ export function renderControlPlaneHtml() {
       padding: 7px 12px;
       border-radius: 999px;
       border: 1px solid var(--line);
-      background: rgba(0, 0, 0, 0.12);
+      background: var(--surface-2);
       color: var(--muted);
       font-weight: 600;
       font-size: 12px;
@@ -125,9 +127,26 @@ export function renderControlPlaneHtml() {
       width: 8px;
       height: 8px;
       border-radius: 50%;
-      background: var(--ok);
-      box-shadow: 0 0 12px color-mix(in srgb, var(--ok) 75%, transparent);
+      background: var(--muted);
     }
+
+    .status.online {
+      border-color: color-mix(in srgb, var(--ok) 38%, var(--line));
+      color: var(--ok);
+    }
+    .status.online .dot { background: var(--ok); }
+
+    .status.reconnecting {
+      border-color: color-mix(in srgb, var(--warn) 40%, var(--line));
+      color: var(--warn);
+    }
+    .status.reconnecting .dot { background: var(--warn); }
+
+    .status.offline {
+      border-color: color-mix(in srgb, var(--danger-1) 38%, var(--line));
+      color: var(--danger-1);
+    }
+    .status.offline .dot { background: var(--danger-1); }
 
     .card { padding: 16px; }
 
@@ -136,6 +155,55 @@ export function renderControlPlaneHtml() {
       font-size: 15px;
       letter-spacing: 0.03em;
       text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .status-card {
+      background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 6%, var(--surface)) 0%, var(--surface) 100%);
+    }
+
+    .version-grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .version-item {
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: var(--surface-2);
+      padding: 10px 11px;
+    }
+
+    .version-label {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 700;
+      margin-bottom: 5px;
+    }
+
+    .version-value {
+      font-weight: 700;
+      font-size: 13px;
+      margin-bottom: 6px;
+      word-break: break-word;
+    }
+
+    .badge-latest {
+      color: var(--ok);
+      border-color: color-mix(in srgb, var(--ok) 40%, var(--line));
+      background: color-mix(in srgb, var(--ok) 12%, transparent);
+    }
+
+    .badge-update {
+      color: var(--warn);
+      border-color: color-mix(in srgb, var(--warn) 40%, var(--line));
+      background: color-mix(in srgb, var(--warn) 12%, transparent);
+    }
+
+    .badge-unknown {
       color: var(--muted);
     }
 
@@ -191,14 +259,15 @@ export function renderControlPlaneHtml() {
       font-weight: 700;
       cursor: pointer;
       transition: transform 0.12s ease, filter 0.15s ease, box-shadow 0.15s ease;
-      background: linear-gradient(135deg, var(--accent), var(--accent-2));
-      color: #062228;
-      box-shadow: 0 8px 18px color-mix(in srgb, var(--accent) 35%, transparent);
+      background: var(--accent);
+      color: #ffffff;
+      box-shadow: 0 7px 16px color-mix(in srgb, var(--accent) 34%, transparent);
     }
 
     button:hover {
       transform: translateY(-1px);
-      filter: brightness(1.05);
+      background: color-mix(in srgb, var(--accent) 82%, #000 18%);
+      filter: none;
     }
 
     button:focus-visible {
@@ -223,9 +292,16 @@ export function renderControlPlaneHtml() {
     }
 
     button.danger {
-      background: linear-gradient(135deg, var(--danger-1), var(--danger-2));
+      background: var(--danger-1);
       color: #fff;
       box-shadow: 0 8px 18px rgba(239, 68, 68, 0.28);
+    }
+
+    button[disabled] {
+      opacity: 0.58;
+      cursor: not-allowed;
+      transform: none !important;
+      box-shadow: none !important;
     }
 
     button.table-action {
@@ -309,6 +385,7 @@ export function renderControlPlaneHtml() {
     @media (max-width: 1080px) {
       .page { grid-template-columns: 1fr; }
       .grid-2 { grid-template-columns: 1fr; }
+      .version-grid { grid-template-columns: 1fr; }
       .shell { align-items: flex-start; }
     }
   </style>
@@ -321,9 +398,32 @@ export function renderControlPlaneHtml() {
         <p>Secure onboarding, profile management, and runtime updates for agent-driven IBM i workflows.</p>
       </div>
       <div class="top-actions">
-        <div class="status"><span class="dot"></span><span id="healthText">Checking local service...</span></div>
-        <button id="themeBtn" class="theme" type="button">Switch Theme</button>
+        <div id="servicePill" class="status offline"><span class="dot"></span><span id="healthText">Checking local service...</span></div>
+        <button id="themeBtn" class="theme" type="button">Dark Theme</button>
       </div>
+    </section>
+
+    <section class="card status-card" style="grid-column: 1 / -1;">
+      <h2>Runtime Status</h2>
+      <div class="version-grid">
+        <div class="version-item">
+          <div class="version-label">MCP</div>
+          <div class="version-value" id="mcpVersionText">Checking...</div>
+          <span class="pill badge-unknown" id="mcpVersionBadge">Checking</span>
+        </div>
+        <div class="version-item">
+          <div class="version-label">Skills</div>
+          <div class="version-value" id="skillsVersionText">Checking...</div>
+          <span class="pill badge-unknown" id="skillsVersionBadge">Checking</span>
+        </div>
+        <div class="version-item">
+          <div class="version-label">Startup</div>
+          <div class="version-value" id="startupVersionText">Checking...</div>
+          <span class="pill badge-unknown" id="startupVersionBadge">Checking</span>
+        </div>
+      </div>
+      <div class="hint" id="runtimeSummary">No runtime actions yet.</div>
+      <div class="hint" id="versionCheckedAt"></div>
     </section>
 
     <section class="card">
@@ -369,7 +469,6 @@ export function renderControlPlaneHtml() {
       <div class="actions">
         <button id="saveBtn" type="button">Save Connection</button>
         <button id="renameBtn" class="secondary" type="button">Rename Selected</button>
-        <button id="deleteBtn" class="danger" type="button">Delete Selected</button>
         <button id="clearBtn" class="secondary" type="button">Clear Form</button>
       </div>
       <div class="hint">Credentials never persist in plain config. Passwords go only to the local control service and OS keychain.</div>
@@ -391,10 +490,11 @@ export function renderControlPlaneHtml() {
         <button id="installBtn" type="button">Install/Repair MCP</button>
         <button id="updateMcpBtn" class="secondary" type="button">Update MCP</button>
         <button id="updateSkillsBtn" class="secondary" type="button">Update Skills</button>
-        <button id="refreshStatusBtn" class="secondary" type="button">Refresh Status</button>
+      </div>
+      <div class="actions">
         <button id="setupAutostartBtn" class="secondary" type="button">Enable Background Startup</button>
         <button id="removeAutostartBtn" class="secondary" type="button">Disable Background Startup</button>
-        <button id="autostartStatusBtn" class="secondary" type="button">Refresh Startup Status</button>
+        <button id="refreshStatusBtn" class="secondary" type="button">Refresh Status</button>
       </div>
       <div id="autostartInfo" class="hint">Startup status: checking...</div>
       <div id="logs" class="logs">No jobs yet.</div>
@@ -419,7 +519,7 @@ export function renderControlPlaneHtml() {
       </table>
     </section>
 
-    <div class="footer-note">Tip: select a connection from the table to edit, rename, or rotate password.</div>
+    <div class="footer-note">Run <code>mcp-for-i-control serve</code> to start this page. Use <code>setup</code> only to enable startup at login.</div>
   </div>
 
   <script>
@@ -427,12 +527,26 @@ export function renderControlPlaneHtml() {
     const SKILLS_REPO_KEY = "mcp_for_i_skills_repo";
     const SKILLS_BRANCH_KEY = "mcp_for_i_skills_branch";
     const DEFAULT_SKILLS_REPO = "https://github.com/ashishthomas2202/mcp-for-i-skills.git";
+    const LEGACY_SKILLS_REPO = "https://github.com/ashishthomas-pcr/mcp-for-i-skills.git";
     const DEFAULT_SKILLS_BRANCH = "main";
+    const CONTROL_BUTTONS = [
+      "saveBtn",
+      "renameBtn",
+      "clearBtn",
+      "installBtn",
+      "updateMcpBtn",
+      "updateSkillsBtn",
+      "setupAutostartBtn",
+      "removeAutostartBtn",
+      "refreshStatusBtn"
+    ];
 
     const state = {
       selectedName: "",
       jobs: {},
-      autostart: null
+      autostart: null,
+      online: false,
+      busy: false
     };
 
     const $ = id => document.getElementById(id);
@@ -442,17 +556,14 @@ export function renderControlPlaneHtml() {
         const stored = localStorage.getItem(THEME_KEY);
         if (stored === "light" || stored === "dark") return stored;
       } catch {}
-      if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
-        return "light";
-      }
-      return "dark";
+      return "light";
     }
 
     function applyTheme(theme) {
       document.body.setAttribute("data-theme", theme);
       const btn = $("themeBtn");
       if (btn) {
-        btn.textContent = theme === "dark" ? "Switch to Light" : "Switch to Dark";
+        btn.textContent = theme === "dark" ? "Light Theme" : "Dark Theme";
       }
       try {
         localStorage.setItem(THEME_KEY, theme);
@@ -473,20 +584,28 @@ export function renderControlPlaneHtml() {
         if (storedRepo && storedRepo.trim()) repoUrl = storedRepo.trim();
         if (storedBranch && storedBranch.trim()) branch = storedBranch.trim();
       } catch {}
+      if (repoUrl === LEGACY_SKILLS_REPO) {
+        repoUrl = DEFAULT_SKILLS_REPO;
+      }
       $("skillsRepoUrl").value = repoUrl;
       $("skillsBranch").value = branch;
+      persistSkillsUpdateSettings();
     }
 
-    function getSkillsUpdatePayload() {
+    function persistSkillsUpdateSettings() {
       const repoUrl = $("skillsRepoUrl").value.trim();
       const branch = $("skillsBranch").value.trim();
+      const normalizedRepo = repoUrl === LEGACY_SKILLS_REPO ? DEFAULT_SKILLS_REPO : (repoUrl || DEFAULT_SKILLS_REPO);
+      const normalizedBranch = branch || DEFAULT_SKILLS_BRANCH;
+      $("skillsRepoUrl").value = normalizedRepo;
+      $("skillsBranch").value = normalizedBranch;
       try {
-        localStorage.setItem(SKILLS_REPO_KEY, repoUrl || DEFAULT_SKILLS_REPO);
-        localStorage.setItem(SKILLS_BRANCH_KEY, branch || DEFAULT_SKILLS_BRANCH);
+        localStorage.setItem(SKILLS_REPO_KEY, normalizedRepo);
+        localStorage.setItem(SKILLS_BRANCH_KEY, normalizedBranch);
       } catch {}
       return {
-        repoUrl: repoUrl || DEFAULT_SKILLS_REPO,
-        branch: branch || DEFAULT_SKILLS_BRANCH
+        repoUrl: normalizedRepo,
+        branch: normalizedBranch
       };
     }
 
@@ -501,6 +620,39 @@ export function renderControlPlaneHtml() {
       }
       if (res.status === 204) return null;
       return res.json();
+    }
+
+    function setButtonsDisabled(disabled) {
+      for (const id of CONTROL_BUTTONS) {
+        const btn = $(id);
+        if (!btn) continue;
+        btn.disabled = disabled || state.busy;
+      }
+    }
+
+    function setBusy(busy) {
+      state.busy = busy;
+      setButtonsDisabled(!state.online);
+    }
+
+    function setServiceState(mode, text) {
+      const pill = $("servicePill");
+      pill.classList.remove("online", "offline", "reconnecting");
+      pill.classList.add(mode);
+      $("healthText").textContent = text;
+      state.online = mode === "online";
+      setButtonsDisabled(mode !== "online");
+    }
+
+    async function pingHealth() {
+      try {
+        const res = await fetch("/api/health", { cache: "no-store" });
+        if (!res.ok) return false;
+        const data = await res.json();
+        return Boolean(data?.ok);
+      } catch {
+        return false;
+      }
     }
 
     function formToPayload() {
@@ -550,6 +702,7 @@ export function renderControlPlaneHtml() {
           <td>
             <button class="table-action" data-action="select" data-name="\${encodeURIComponent(conn.name)}" type="button">Select</button>
             <button class="table-action" data-action="password" data-name="\${encodeURIComponent(conn.name)}" type="button">Set Password</button>
+            <button class="table-action danger" data-action="delete" data-name="\${encodeURIComponent(conn.name)}" type="button">Delete</button>
           </td>\`;
         body.appendChild(tr);
       }
@@ -561,11 +714,6 @@ export function renderControlPlaneHtml() {
     async function loadConnections() {
       const data = await api("/api/connections");
       renderConnections(data.connections || []);
-    }
-
-    async function loadHealth() {
-      const health = await api("/api/health");
-      $("healthText").textContent = health.ok ? "Local control service online" : "Service unavailable";
     }
 
     function renderLogs(jobs) {
@@ -581,6 +729,62 @@ export function renderControlPlaneHtml() {
         lines.push("");
       }
       $("logs").textContent = lines.length ? lines.join("\\n") : "No jobs yet.";
+      renderRuntimeSummary();
+    }
+
+    function renderRuntimeSummary() {
+      const entries = Object.entries(state.jobs || {});
+      const running = entries.find(([, job]) => job.status === "running");
+      const summary = $("runtimeSummary");
+      if (running) {
+        summary.textContent = \`Running: \${running[0]} action in progress.\`;
+        return;
+      }
+      if (entries.length === 0) {
+        summary.textContent = "No runtime actions yet.";
+        return;
+      }
+      const latest = entries
+        .map(([id, job]) => ({ id, job, at: Date.parse(job.finishedAt || job.startedAt || "") || 0 }))
+        .sort((a, b) => b.at - a.at)[0];
+      if (latest.job.status === "failed") {
+        summary.textContent = \`Last action failed: \${latest.id}. See activity log for details.\`;
+      } else if (latest.job.status === "success") {
+        summary.textContent = \`Last action succeeded: \${latest.id}.\`;
+      } else {
+        summary.textContent = \`Status: \${latest.id} is \${latest.job.status}.\`;
+      }
+    }
+
+    function setBadge(id, text, kind) {
+      const el = $(id);
+      el.textContent = text;
+      el.className = \`pill badge-\${kind}\`;
+    }
+
+    function renderVersions(payload) {
+      const mcp = payload?.mcp || {};
+      const skills = payload?.skills || {};
+      const mcpInstalled = mcp.installedVersion || "Unknown";
+      const mcpLatest = mcp.latestVersion || "Unknown";
+      $("mcpVersionText").textContent = \`\${mcpInstalled} (latest: \${mcpLatest})\`;
+      if (mcp.status === "latest") setBadge("mcpVersionBadge", "Latest", "latest");
+      else if (mcp.status === "update-available") setBadge("mcpVersionBadge", "Update Available", "update");
+      else setBadge("mcpVersionBadge", "Unknown", "unknown");
+
+      const skillsLocal = skills.localCommit
+        ? \`\${skills.localBranch || "branch"} @ \${skills.localCommit}\`
+        : (skills.status === "not-installed" ? "Not installed" : "Unknown");
+      const skillsLatest = skills.latestCommit ? \` (latest: \${skills.latestCommit})\` : "";
+      $("skillsVersionText").textContent = \`\${skillsLocal}\${skillsLatest}\`;
+      if (skills.status === "latest") setBadge("skillsVersionBadge", "Latest", "latest");
+      else if (skills.status === "update-available") setBadge("skillsVersionBadge", "Update Available", "update");
+      else if (skills.status === "not-installed") setBadge("skillsVersionBadge", "Not Installed", "unknown");
+      else setBadge("skillsVersionBadge", "Unknown", "unknown");
+
+      if (payload?.checkedAt) {
+        $("versionCheckedAt").textContent = "Last checked: " + payload.checkedAt;
+      }
     }
 
     async function loadRuntimeStatus() {
@@ -593,20 +797,38 @@ export function renderControlPlaneHtml() {
       const el = $("autostartInfo");
       if (!status) {
         el.textContent = "Startup status: unavailable";
+        $("startupVersionText").textContent = "Unavailable";
+        setBadge("startupVersionBadge", "Unknown", "unknown");
         return;
       }
       if (status.supported === false) {
         el.textContent = \`Startup status: not managed on platform '\${status.platform}'. Running now: \${status.running ? "yes" : "no"}.\`;
+        $("startupVersionText").textContent = "Not managed";
+        setBadge("startupVersionBadge", status.running ? "Running" : "Stopped", status.running ? "latest" : "unknown");
         return;
       }
       const installed = status.installed ? "enabled" : "disabled";
       const stateText = status.state ? \` (\${status.state})\` : "";
       el.textContent = \`Startup status: \${installed}\${stateText}. Running now: \${status.running ? "yes" : "no"}.\`;
+      $("startupVersionText").textContent = installed + stateText;
+      if (status.installed && status.running) setBadge("startupVersionBadge", "Running", "latest");
+      else if (status.installed) setBadge("startupVersionBadge", "Enabled", "update");
+      else setBadge("startupVersionBadge", "Disabled", "unknown");
     }
 
     async function loadAutostartStatus() {
       const data = await api("/api/runtime/autostart/status");
       renderAutostart(data.status || null);
+    }
+
+    async function loadVersions() {
+      const settings = persistSkillsUpdateSettings();
+      const query = new URLSearchParams({
+        repoUrl: settings.repoUrl,
+        branch: settings.branch
+      });
+      const versions = await api("/api/runtime/versions?" + query.toString());
+      renderVersions(versions);
     }
 
     async function onSave() {
@@ -646,14 +868,13 @@ export function renderControlPlaneHtml() {
       await loadConnections();
     }
 
-    async function onDelete() {
-      if (!state.selectedName) {
-        alert("Select a connection first.");
-        return;
+    async function deleteConnection(name) {
+      if (!name) return;
+      if (!confirm("Delete connection '" + name + "'?")) return;
+      await api("/api/connections/" + encodeURIComponent(name), { method: "DELETE" });
+      if (state.selectedName === name) {
+        resetForm();
       }
-      if (!confirm("Delete connection '" + state.selectedName + "'?")) return;
-      await api("/api/connections/" + encodeURIComponent(state.selectedName), { method: "DELETE" });
-      resetForm();
       await loadConnections();
     }
 
@@ -685,30 +906,87 @@ export function renderControlPlaneHtml() {
         });
         alert("Password updated in keychain.");
       }
+      if (action === "delete") {
+        await deleteConnection(name);
+      }
     }
 
-    async function triggerJob(path, payload) {
-      await api(path, {
-        method: "POST",
-        body: payload ? JSON.stringify(payload) : undefined
-      });
-      await loadRuntimeStatus();
-      await loadAutostartStatus();
-      startJobPolling();
+    async function beginReconnectFlow(label) {
+      setServiceState("reconnecting", label + " running. Waiting for service restart...");
+      const deadline = Date.now() + 120000;
+      while (Date.now() < deadline) {
+        await sleep(1800);
+        if (await pingHealth()) {
+          setServiceState("online", "Local control service online");
+          await refreshAll();
+          return;
+        }
+      }
+      setServiceState("offline", "Service offline. Start with mcp-for-i-control serve.");
+    }
+
+    async function triggerJob(path, payload, options = {}) {
+      if (!state.online) {
+        alert("Control plane is offline. Start it with mcp-for-i-control serve.");
+        return;
+      }
+      setBusy(true);
+      try {
+        await api(path, {
+          method: "POST",
+          body: payload ? JSON.stringify(payload) : undefined
+        });
+        await loadRuntimeStatus();
+        if (options.expectRestart) {
+          await beginReconnectFlow(options.label || "Update");
+        } else {
+          await Promise.allSettled([loadAutostartStatus(), loadVersions()]);
+          startJobPolling();
+        }
+      } catch (err) {
+        setServiceState("offline", "Request failed. Waiting for reconnect...");
+        $("runtimeSummary").textContent = "Action failed: " + (err?.message || String(err));
+      } finally {
+        setBusy(false);
+      }
     }
 
     let pollId = 0;
     function startJobPolling() {
       if (pollId) return;
       pollId = setInterval(async () => {
-        await loadRuntimeStatus();
-        const jobs = Object.values(state.jobs || {});
-        const running = jobs.some(j => j.status === "running");
-        if (!running) {
-          clearInterval(pollId);
-          pollId = 0;
+        if (!await pingHealth()) return;
+        try {
+          await loadRuntimeStatus();
+          const jobs = Object.values(state.jobs || {});
+          const running = jobs.some(j => j.status === "running");
+          if (!running) {
+            clearInterval(pollId);
+            pollId = 0;
+            await Promise.allSettled([loadAutostartStatus(), loadVersions()]);
+          }
+        } catch {
+          // best effort polling during reconnects
         }
-      }, 1500);
+      }, 1800);
+    }
+
+    let heartbeatId = 0;
+    function startHeartbeat() {
+      if (heartbeatId) clearInterval(heartbeatId);
+      heartbeatId = setInterval(async () => {
+        const ok = await pingHealth();
+        if (ok && !state.online) {
+          setServiceState("online", "Local control service online");
+          await refreshAll();
+        } else if (!ok && state.online && !state.busy) {
+          setServiceState("offline", "Service offline. Waiting for reconnect...");
+        }
+      }, 2500);
+    }
+
+    function sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
     }
 
     function escapeHtml(str) {
@@ -719,24 +997,47 @@ export function renderControlPlaneHtml() {
         .replaceAll('"', "&quot;");
     }
 
+    async function refreshAll() {
+      const healthy = await pingHealth();
+      if (!healthy) {
+        setServiceState("offline", "Service offline. Start with mcp-for-i-control serve.");
+        return;
+      }
+      setServiceState("online", "Local control service online");
+      await Promise.allSettled([
+        loadConnections(),
+        loadRuntimeStatus(),
+        loadAutostartStatus(),
+        loadVersions()
+      ]);
+    }
+
     $("themeBtn").addEventListener("click", toggleTheme);
     $("saveBtn").addEventListener("click", onSave);
     $("renameBtn").addEventListener("click", onRename);
-    $("deleteBtn").addEventListener("click", onDelete);
     $("clearBtn").addEventListener("click", resetForm);
-    $("installBtn").addEventListener("click", () => triggerJob("/api/runtime/install"));
-    $("updateMcpBtn").addEventListener("click", () => triggerJob("/api/runtime/update/mcp"));
-    $("updateSkillsBtn").addEventListener("click", () => triggerJob("/api/runtime/update/skills", getSkillsUpdatePayload()));
-    $("refreshStatusBtn").addEventListener("click", loadRuntimeStatus);
+    $("installBtn").addEventListener("click", () => triggerJob("/api/runtime/install", null, { expectRestart: true, label: "Install/Repair" }));
+    $("updateMcpBtn").addEventListener("click", () => triggerJob("/api/runtime/update/mcp", null, { expectRestart: true, label: "MCP Update" }));
+    $("updateSkillsBtn").addEventListener("click", () => triggerJob("/api/runtime/update/skills", persistSkillsUpdateSettings()));
+    $("refreshStatusBtn").addEventListener("click", refreshAll);
     $("setupAutostartBtn").addEventListener("click", () => triggerJob("/api/runtime/autostart/setup"));
     $("removeAutostartBtn").addEventListener("click", () => triggerJob("/api/runtime/autostart/remove"));
-    $("autostartStatusBtn").addEventListener("click", loadAutostartStatus);
+    $("skillsRepoUrl").addEventListener("change", () => {
+      persistSkillsUpdateSettings();
+      loadVersions().catch(() => {});
+    });
+    $("skillsBranch").addEventListener("change", () => {
+      persistSkillsUpdateSettings();
+      loadVersions().catch(() => {});
+    });
 
     applyTheme(readStoredTheme());
     loadSkillsUpdateSettings();
-    Promise.all([loadHealth(), loadConnections(), loadRuntimeStatus(), loadAutostartStatus()]).catch(err => {
+    setServiceState("offline", "Checking local service...");
+    refreshAll().catch(err => {
       $("logs").textContent = "Startup error: " + err.message;
     });
+    startHeartbeat();
   </script>
 </body>
 </html>`;

@@ -36,6 +36,25 @@ type UpdateSkillsOptions = {
   branch?: string;
 };
 
+type RuntimeVersions = {
+  checkedAt: string;
+  mcp: {
+    source: "git-checkout" | "package-install";
+    installedVersion?: string;
+    latestVersion?: string;
+    status: "latest" | "update-available" | "unknown";
+  };
+  skills: {
+    configuredRepo: string;
+    configuredBranch: string;
+    localRepo?: string;
+    localBranch?: string;
+    localCommit?: string;
+    latestCommit?: string;
+    status: "latest" | "update-available" | "not-installed" | "unknown";
+  };
+};
+
 export class RuntimeService {
   private readonly state: RuntimeState = {
     install: makeJob("install"),
@@ -49,6 +68,59 @@ export class RuntimeService {
 
   getStatus() {
     return this.state;
+  }
+
+  async getVersions(options?: UpdateSkillsOptions): Promise<RuntimeVersions> {
+    const mode = await this.detectExecutionModeQuiet();
+    const checkedAt = new Date().toISOString();
+    const mcpInstalled = await this.readLocalPackageVersion(this.rootDir);
+    const mcpLatest = await this.readLatestPublishedVersion();
+    const mcpStatus = mcpInstalled && mcpLatest
+      ? (mcpInstalled === mcpLatest ? "latest" : "update-available")
+      : "unknown";
+
+    const configuredRepo = sanitizeRepoUrl(options?.repoUrl) || process.env.MCP_FOR_I_SKILLS_REPO || DEFAULT_SKILLS_REPO;
+    const configuredBranch = sanitizeBranch(options?.branch) || process.env.MCP_FOR_I_SKILLS_BRANCH || "main";
+    const skillsDir = path.join(this.rootDir, "skills");
+    const skillsGit = path.join(skillsDir, ".git");
+
+    const skills: RuntimeVersions["skills"] = {
+      configuredRepo,
+      configuredBranch,
+      status: "not-installed"
+    };
+
+    if (await pathExists(skillsDir)) {
+      if (await pathExists(skillsGit)) {
+        const localRepo = await this.getGitRemoteUrlQuiet(skillsDir);
+        const localBranch = await this.getGitBranchQuiet(skillsDir);
+        const localCommit = await this.getGitCommitQuiet(skillsDir, true);
+        const latestCommit = await this.getRemoteBranchCommitQuiet(configuredRepo, configuredBranch, true);
+        skills.localRepo = localRepo;
+        skills.localBranch = localBranch;
+        skills.localCommit = localCommit;
+        skills.latestCommit = latestCommit;
+
+        if (localCommit && latestCommit) {
+          skills.status = localCommit === latestCommit ? "latest" : "update-available";
+        } else {
+          skills.status = "unknown";
+        }
+      } else {
+        skills.status = "unknown";
+      }
+    }
+
+    return {
+      checkedAt,
+      mcp: {
+        source: mode,
+        installedVersion: mcpInstalled,
+        latestVersion: mcpLatest,
+        status: mcpStatus
+      },
+      skills
+    };
   }
 
   async installOrRepair() {
@@ -283,6 +355,11 @@ export class RuntimeService {
     return "package-install" as const;
   }
 
+  private async detectExecutionModeQuiet() {
+    const gitDir = path.join(this.rootDir, ".git");
+    return await pathExists(gitDir) ? "git-checkout" as const : "package-install" as const;
+  }
+
   private async buildIfPresent(push: (line: string) => void) {
     const tsconfigPath = path.join(this.rootDir, "tsconfig.json");
     if (!await pathExists(tsconfigPath)) {
@@ -354,6 +431,101 @@ export class RuntimeService {
     push(`Scheduled self-${action} in background to avoid Windows file-lock errors.`);
     push("Control plane will stop briefly, then restart automatically.");
     push(`Background update log: ${logPath}`);
+  }
+
+  private async readLocalPackageVersion(cwd: string) {
+    try {
+      const packagePath = path.join(cwd, "package.json");
+      const raw = await fs.readFile(packagePath, "utf8");
+      const parsed = JSON.parse(raw);
+      return typeof parsed.version === "string" ? parsed.version : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async readLatestPublishedVersion() {
+    try {
+      const output = await this.runNpmCapture(["view", PACKAGE_NAME, "version", "--json"], this.rootDir);
+      const parsed = JSON.parse(output || "null");
+      if (typeof parsed === "string") return parsed.trim();
+      if (parsed && typeof parsed.version === "string") return parsed.version.trim();
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async getGitBranchQuiet(cwd: string) {
+    try {
+      const branch = await this.runCommandCaptureSilent("git", ["rev-parse", "--abbrev-ref", "HEAD"], cwd);
+      return branch || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async getGitCommitQuiet(cwd: string, short = false) {
+    try {
+      const args = short ? ["rev-parse", "--short", "HEAD"] : ["rev-parse", "HEAD"];
+      const commit = await this.runCommandCaptureSilent("git", args, cwd);
+      return commit || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async getGitRemoteUrlQuiet(cwd: string) {
+    try {
+      const value = await this.runCommandCaptureSilent("git", ["remote", "get-url", "origin"], cwd);
+      return value || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async getRemoteBranchCommitQuiet(repoUrl: string, branch: string, short = false) {
+    try {
+      const out = await this.runCommandCaptureSilent("git", ["ls-remote", repoUrl, branch], this.rootDir);
+      const firstLine = out.split(/\r?\n/).find(Boolean);
+      if (!firstLine) return undefined;
+      const [hash] = firstLine.trim().split(/\s+/);
+      if (!hash) return undefined;
+      return short ? hash.slice(0, 7) : hash;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async runNpmCapture(args: string[], cwd: string) {
+    const npm = await resolveNpmLaunch();
+    if (npm.mode === "node-cli") {
+      return this.runCommandCaptureSilent(process.execPath, [npm.path, ...args], cwd);
+    }
+    return this.runCommandCaptureSilent(npm.path, args, cwd);
+  }
+
+  private runCommandCaptureSilent(command: string, args: string[], cwd: string) {
+    return new Promise<string>((resolve, reject) => {
+      const child = spawn(command, args, {
+        cwd,
+        shell: process.platform === "win32"
+      });
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+
+      child.stdout.on("data", chunk => stdout.push(String(chunk)));
+      child.stderr.on("data", chunk => stderr.push(String(chunk)));
+      child.on("error", reject);
+      child.on("exit", code => {
+        if (code === 0) {
+          resolve(stdout.join("").trim());
+        } else {
+          const errText = stderr.join("").trim();
+          reject(new Error(errText || `Command failed (${code}): ${command} ${args.join(" ")}`));
+        }
+      });
+    });
   }
 }
 

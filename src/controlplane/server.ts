@@ -72,6 +72,15 @@ async function routeRequest(
     return;
   }
 
+  if (method === "GET" && pathname === "/api/runtime/versions") {
+    const versions = await services.runtime.getVersions({
+      repoUrl: url.searchParams.get("repoUrl") || undefined,
+      branch: url.searchParams.get("branch") || undefined
+    });
+    sendJson(res, 200, versions);
+    return;
+  }
+
   if (method === "POST" && pathname === "/api/runtime/install") {
     const job = await services.runtime.installOrRepair();
     sendJson(res, 202, { job });
