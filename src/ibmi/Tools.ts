@@ -41,7 +41,8 @@ export namespace Tools {
     data.forEach((line, index) => {
       const trimmed = line.trim();
       if (trimmed.length === 0 && iiErrorMessage) iiErrorMessage = false;
-      if (trimmed.length === 0 || index === data.length - 1) return;
+      if (trimmed.length === 0) return;
+      if (/^\d+\s+RECORD\(S\)\s+SELECTED\.$/i.test(trimmed)) return;
 
       if (trimmed === `**** CLI ERROR *****`) {
         iiErrorMessage = true;
@@ -69,12 +70,29 @@ export namespace Tools {
           .map(header => ({ name: header, from: 0, length: 0 }));
         gotHeaders = true;
       } else if (!figuredLengths) {
-        let base = 0;
-        line.split(` `).forEach((header, idx) => {
-          headers[idx].from = base;
-          headers[idx].length = header.length;
-          base += header.length + 1;
-        });
+        const segments: Array<{ from: number; length: number }> = [];
+        const re = /-+/g;
+        let match: RegExpExecArray | null = re.exec(line);
+        while (match) {
+          segments.push({ from: match.index, length: match[0].length });
+          match = re.exec(line);
+        }
+
+        if (segments.length > 0) {
+          segments.forEach((segment, idx) => {
+            if (!headers[idx]) return;
+            headers[idx].from = segment.from;
+            headers[idx].length = segment.length;
+          });
+        } else {
+          let base = 0;
+          line.split(` `).forEach((header, idx) => {
+            if (!headers[idx]) return;
+            headers[idx].from = base;
+            headers[idx].length = header.length;
+            base += header.length + 1;
+          });
+        }
         figuredLengths = true;
       } else {
         let row: DB2Row = {};

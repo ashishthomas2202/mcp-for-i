@@ -36,3 +36,18 @@ test("db2Parse throws SqlError when CLI error is present", () => {
     error => error instanceof Tools.SqlError && error.message.includes("42704")
   );
 });
+
+test("db2Parse keeps last row when record footer is missing", () => {
+  const output = [
+    "DB2>",
+    "",
+    "NOW                       ",
+    "--------------------------",
+    "2026-03-12-12.34.56.789012",
+    "DB2>"
+  ].join("\n");
+
+  const rows = Tools.db2Parse(output, "select current timestamp as now from sysibm.sysdummy1");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].NOW, "2026-03-12-12.34.56.789012");
+});

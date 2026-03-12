@@ -29,7 +29,9 @@ export var Tools;
             const trimmed = line.trim();
             if (trimmed.length === 0 && iiErrorMessage)
                 iiErrorMessage = false;
-            if (trimmed.length === 0 || index === data.length - 1)
+            if (trimmed.length === 0)
+                return;
+            if (/^\d+\s+RECORD\(S\)\s+SELECTED\.$/i.test(trimmed))
                 return;
             if (trimmed === `**** CLI ERROR *****`) {
                 iiErrorMessage = true;
@@ -57,12 +59,31 @@ export var Tools;
                 gotHeaders = true;
             }
             else if (!figuredLengths) {
-                let base = 0;
-                line.split(` `).forEach((header, idx) => {
-                    headers[idx].from = base;
-                    headers[idx].length = header.length;
-                    base += header.length + 1;
-                });
+                const segments = [];
+                const re = /-+/g;
+                let match = re.exec(line);
+                while (match) {
+                    segments.push({ from: match.index, length: match[0].length });
+                    match = re.exec(line);
+                }
+                if (segments.length > 0) {
+                    segments.forEach((segment, idx) => {
+                        if (!headers[idx])
+                            return;
+                        headers[idx].from = segment.from;
+                        headers[idx].length = segment.length;
+                    });
+                }
+                else {
+                    let base = 0;
+                    line.split(` `).forEach((header, idx) => {
+                        if (!headers[idx])
+                            return;
+                        headers[idx].from = base;
+                        headers[idx].length = header.length;
+                        base += header.length + 1;
+                    });
+                }
                 figuredLengths = true;
             }
             else {
