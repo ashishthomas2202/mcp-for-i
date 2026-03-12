@@ -17,7 +17,10 @@ const defaultSettings = {
     objectFilters: [],
     ifsShortcuts: [],
     debugPort: 8005,
-    debugSepPort: 8008
+    debugSepPort: 8008,
+    sessionIdleMinutes: 30,
+    sessionPingSeconds: 15,
+    sessionReconnectAttempts: 2
 };
 export class ConfigStore {
     configDir;

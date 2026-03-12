@@ -74,6 +74,9 @@ export interface ConnectionConfig {
   ifsShortcuts?: string[];
   debugPort?: number;
   debugSepPort?: number;
+  sessionIdleMinutes?: number;
+  sessionPingSeconds?: number;
+  sessionReconnectAttempts?: number;
 }
 
 export interface ObjectFilter {

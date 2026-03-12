@@ -1,9 +1,10 @@
 import http, { IncomingMessage, ServerResponse } from "http";
 import fs from "fs";
+import fsp from "fs/promises";
 import path from "path";
 import { URL } from "url";
 import { fileURLToPath } from "url";
-import { ConfigStore } from "../config/store.js";
+import { ConfigStore, Settings, getConfigDir } from "../config/store.js";
 import { isKeychainAvailable } from "../security/credentialStore.js";
 import { ConnectionService } from "./connectionService.js";
 import { RuntimeService } from "./runtimeService.js";
@@ -26,7 +27,7 @@ export async function startControlPlaneServer(opts?: { host?: string; port?: num
 
   const server = http.createServer(async (req, res) => {
     try {
-      await routeRequest(req, res, { connections, runtime });
+      await routeRequest(req, res, { store, connections, runtime });
     } catch (err: any) {
       sendJson(res, 500, { error: err?.message || String(err) });
     }
@@ -50,7 +51,7 @@ export async function startControlPlaneServer(opts?: { host?: string; port?: num
 async function routeRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  services: { connections: ConnectionService; runtime: RuntimeService }
+  services: { store: ConfigStore; connections: ConnectionService; runtime: RuntimeService }
 ) {
   const method = req.method || "GET";
   const url = new URL(req.url || "/", "http://127.0.0.1");
@@ -64,6 +65,44 @@ async function routeRequest(
 
   if (method === "GET" && pathname === "/api/health") {
     sendJson(res, 200, { ok: true, keychainAvailable: await isKeychainAvailable() });
+    return;
+  }
+
+  if (method === "GET" && pathname === "/api/settings") {
+    const settings = await services.store.getSettings();
+    sendJson(res, 200, { settings });
+    return;
+  }
+
+  if (method === "PUT" && pathname === "/api/settings") {
+    const body = await readJson(req);
+    const update: Partial<Settings> = {};
+    try {
+      if (typeof body.sessionIdleMinutes !== "undefined") {
+        update.sessionIdleMinutes = parseNumberSetting(body.sessionIdleMinutes, 1, 24 * 60, "sessionIdleMinutes");
+      }
+      if (typeof body.sessionPingSeconds !== "undefined") {
+        update.sessionPingSeconds = parseNumberSetting(body.sessionPingSeconds, 5, 300, "sessionPingSeconds");
+      }
+      if (typeof body.sessionReconnectAttempts !== "undefined") {
+        update.sessionReconnectAttempts = parseNumberSetting(body.sessionReconnectAttempts, 1, 5, "sessionReconnectAttempts");
+      }
+    } catch (err: any) {
+      sendJson(res, 400, { error: err?.message || String(err) });
+      return;
+    }
+    if (Object.keys(update).length === 0) {
+      sendJson(res, 400, { error: "No supported settings provided" });
+      return;
+    }
+    await services.store.updateSettings(update);
+    const settings = await services.store.getSettings();
+    sendJson(res, 200, { settings });
+    return;
+  }
+
+  if (method === "GET" && pathname === "/api/sessions") {
+    sendJson(res, 200, { snapshot: await readSessionSnapshot() });
     return;
   }
 
@@ -229,4 +268,28 @@ function getDefaultRootDir() {
     return runtimeRoot;
   }
   return process.cwd();
+}
+
+function parseNumberSetting(input: unknown, min: number, max: number, key: string) {
+  const value = Number(input);
+  if (!Number.isFinite(value)) {
+    throw new Error(`${key} must be a number`);
+  }
+  const normalized = Math.floor(value);
+  if (normalized < min || normalized > max) {
+    throw new Error(`${key} must be between ${min} and ${max}`);
+  }
+  return normalized;
+}
+
+async function readSessionSnapshot() {
+  const snapshotPath = path.join(getConfigDir(), "session-state.json");
+  try {
+    const raw = await fsp.readFile(snapshotPath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
 }

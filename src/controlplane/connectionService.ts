@@ -50,7 +50,7 @@ export class ConnectionService {
       port: input.port ?? existing.port,
       username: input.username ?? existing.username,
       privateKeyPath: input.privateKeyPath ?? existing.privateKeyPath,
-      settings: input.settings ?? existing.settings,
+      settings: input.settings ? { ...(existing.settings || {}), ...input.settings } : existing.settings,
       policy: input.policy ?? existing.policy
     };
 

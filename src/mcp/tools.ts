@@ -594,7 +594,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return json(ctx.statusSession(args?.connectionName));
     }
     case "ibmi.session.keepalive": {
-      return json(ctx.keepaliveSession(args?.connectionName));
+      return json(await ctx.keepaliveSession(args?.connectionName));
     }
     case "ibmi.session.terminate": {
       await ctx.terminateSession(args?.connectionName);
@@ -620,122 +620,122 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return result(`Connection ${args.name} deleted`);
     }
     case "ibmi.qsys.libraries.list": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const data = await conn.content.getLibraries(args.filter || "*");
       return json(data);
     }
     case "ibmi.qsys.objects.list": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const data = await conn.content.getObjectList(args.library, args.types || ["*ALL"]);
       return json(data);
     }
     case "ibmi.qsys.sourcefiles.list": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const data = await conn.content.getObjectList(args.library, ["*SRCPF"]);
       return json(data);
     }
     case "ibmi.qsys.members.list": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const data = await conn.content.getMemberList({ library: args.library, sourceFile: args.sourceFile });
       return json(data);
     }
     case "ibmi.qsys.members.read": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const content = await conn.content.downloadMemberContent(args.library, args.sourceFile, args.member);
       return result(content);
     }
     case "ibmi.qsys.members.write": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.uploadMemberContent(args.library, args.sourceFile, args.member, args.content);
       return result("OK");
     }
     case "ibmi.qsys.members.create": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.createMember(args.library, args.sourceFile, args.member, args.srctype);
       return result("OK");
     }
     case "ibmi.qsys.members.rename": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.renameMember(args.library, args.sourceFile, args.member, args.newMember);
       return result("OK");
     }
     case "ibmi.qsys.members.delete": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.deleteMember(args.library, args.sourceFile, args.member);
       return result("OK");
     }
     case "ibmi.qsys.sourcefiles.create": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.createSourceFile(args.library, args.sourceFile, args.rcdlen || 112);
       return result("OK");
     }
     case "ibmi.qsys.libraries.create": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.createLibrary(args.library);
       return result("OK");
     }
     case "ibmi.ifs.list": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const data = await conn.content.getFileList(args.path);
       return json(data);
     }
     case "ibmi.ifs.read": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const data = await conn.content.downloadStreamfileRaw(args.path);
       return result(Buffer.from(data).toString("utf8"));
     }
     case "ibmi.ifs.write": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const op = resolveIfsWriteOperation(args.path);
       enforceWritable(ctx, conn, op, args);
       await conn.content.writeStreamfileRaw(args.path, args.content);
       return result("OK");
     }
     case "ibmi.ifs.mkdir": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const op = resolveIfsWriteOperation(args.path);
       enforceWritable(ctx, conn, op, args);
       await conn.sendCommand({ command: `mkdir -p ${Tools.escapePath(args.path)}` });
       return result("OK");
     }
     case "ibmi.ifs.delete": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "ifs.delete", args);
       const flag = args.recursive ? "-rf" : "-f";
       await conn.sendCommand({ command: `rm ${flag} ${Tools.escapePath(args.path)}` });
       return result("OK");
     }
     case "ibmi.ifs.upload": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const op = resolveIfsWriteOperation(args.remotePath);
       enforceWritable(ctx, conn, op, args);
       await conn.client!.putFile(args.localPath, args.remotePath);
       return result("OK");
     }
     case "ibmi.ifs.download": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       await conn.client!.getFile(args.localPath, args.remotePath);
       return result("OK");
     }
     case "ibmi.search.members": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const members = args.members || "*";
       const data = await Search.searchMembers(conn, args.library, args.sourceFile, args.term, members, false);
       return json(data);
     }
     case "ibmi.search.ifs": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const data = await Search.searchIFS(conn, args.path, args.term);
       return json(data ?? { term: args.term, hits: [] });
     }
     case "ibmi.find.ifs": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const data = await Search.findIFS(conn, args.path, args.term);
       return json(data ?? { term: args.term, hits: [] });
     }
@@ -751,7 +751,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return json(actions);
     }
     case "ibmi.actions.run": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "qsys.write", args);
       const action = await resolveAction(ctx, args);
       if (!action) throw new Error("Action not found");
@@ -817,7 +817,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const settings = conn.settings || {};
       let activeConfig: any = {};
       try {
-        activeConfig = ctx.ensureActive(name).getConfig();
+        activeConfig = (await ctx.ensureActive(name)).getConfig();
       } catch {
         activeConfig = {};
       }
@@ -828,7 +828,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.libl.set": {
       const name = getConnectionName(ctx, args);
-      const active = ctx.ensureActive(name);
+      const active = await ctx.ensureActive(name);
       enforceWritable(ctx, active, "qsys.write", args);
       await updateConnectionSettings(ctx, name, {
         currentLibrary: args.currentLibrary,
@@ -846,7 +846,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const list = conn.settings?.libraryList || [];
       const lib = String(args.library).toUpperCase();
       if (!list.includes(lib)) list.push(lib);
-      const active = ctx.ensureActive(name);
+      const active = await ctx.ensureActive(name);
       enforceWritable(ctx, active, "qsys.write", args);
       await updateConnectionSettings(ctx, name, { libraryList: list });
       if (args.applyToJob) {
@@ -859,7 +859,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const conn = await ctx.store.getConnection(name);
       if (!conn) throw new Error(`Connection ${name} not found`);
       const list = (conn.settings?.libraryList || []).filter(l => l !== String(args.library).toUpperCase());
-      const active = ctx.ensureActive(name);
+      const active = await ctx.ensureActive(name);
       enforceWritable(ctx, active, "qsys.write", args);
       await updateConnectionSettings(ctx, name, { libraryList: list });
       if (args.applyToJob) {
@@ -870,7 +870,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.libl.setCurrent": {
       const name = getConnectionName(ctx, args);
       const lib = String(args.library).toUpperCase();
-      const active = ctx.ensureActive(name);
+      const active = await ctx.ensureActive(name);
       enforceWritable(ctx, active, "qsys.write", args);
       await updateConnectionSettings(ctx, name, { currentLibrary: lib });
       if (args.applyToJob) {
@@ -879,7 +879,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return result("OK");
     }
     case "ibmi.libl.validate": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const bad = await conn.content.validateLibraryList(args.libraryList);
       return json({ badLibraries: bad });
     }
@@ -906,7 +906,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       if (!connInfo) throw new Error(`Connection ${name} not found`);
       const profile = (connInfo.profiles || []).find(p => p.name === args.name);
       if (!profile) throw new Error(`Profile ${args.name} not found`);
-      const active = ctx.ensureActive(name);
+      const active = await ctx.ensureActive(name);
       enforceWritable(ctx, active, "qsys.write", args);
 
       await ctx.store.setCurrentProfile(name, args.name);
@@ -922,7 +922,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return result(`Profile ${args.name} activated`);
     }
     case "ibmi.resolve.path": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const pathStr = String(args.path);
       if (pathStr.startsWith("/")) {
         const isDir = await conn.content.testStreamFile(pathStr, "d");
@@ -939,13 +939,13 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return json({ type: "member", exists: Boolean(info), details: info || { library: lib, file, name: member } });
     }
     case "ibmi.deploy.uploadDirectory": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "deploy.sync", args);
       await conn.client!.putDirectory(args.localPath, args.remotePath, { recursive: true, concurrency: 5 });
       return result("OK");
     }
     case "ibmi.deploy.uploadFiles": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "deploy.sync", args);
       const remoteDir = String(args.remoteDirectory);
       for (const file of args.localFiles || []) {
@@ -956,7 +956,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return result("OK");
     }
     case "ibmi.deploy.setCcsid": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "deploy.sync", args);
       const setccsid = conn.remoteFeatures.setccsid;
       if (!setccsid) throw new Error("setccsid not available on remote system");
@@ -1014,14 +1014,14 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return result("OK");
     }
     case "ibmi.debug.status": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const port = conn.getConfig().debugPort || 8005;
       const rows = await conn.runSQL(`select job_name, local_port from qsys2.netstat_job_info where local_port = ${port} and remote_address = '0.0.0.0' fetch first 1 row only`);
       if (rows.length === 0) return json({ running: false, port });
       return json({ running: true, port, job: rows[0].JOB_NAME });
     }
     case "ibmi.debug.startService": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "qsys.write", args);
       const submitOptions = `JOBQ(QSYS/QUSRNOMAX) JOBD(QSYS/QSYSJOBD) OUTQ(QUSRSYS/QDBGSRV) USER(QDBGSRV)`;
       const cmd = `QSYS/SBMJOB JOB(QDBGSRV) SYSLIBL(*SYSVAL) CURLIB(*USRPRF) INLLIBL(*JOBD) ${submitOptions} CMD(QSH CMD('/QIBM/ProdData/IBMiDebugService/bin/startDebugService.sh'))`;
@@ -1029,13 +1029,13 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return json(res);
     }
     case "ibmi.debug.stopService": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "qsys.write", args);
       const res = await conn.sendCommand({ command: `/QIBM/ProdData/IBMiDebugService/bin/stopDebugService.sh` });
       return json(res);
     }
     case "ibmi.deploy.compare": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const localPath = String(args.localPath);
       const remotePath = String(args.remotePath);
       const localFiles = await listLocalFiles(localPath);
@@ -1048,7 +1048,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return json({ onlyLocal, onlyRemote, common });
     }
     case "ibmi.deploy.sync": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "deploy.sync", args);
       const localPath = String(args.localPath);
       const remotePath = String(args.remotePath);
@@ -1074,7 +1074,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return result("OK");
     }
     case "ibmi.sql.query": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const pageSize = clampNumber(args?.pageSize, 200, 1, 5000);
       const maxRows = clampNumber(args?.maxRows, 1000, 1, 20000);
 
@@ -1099,7 +1099,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       });
     }
     case "ibmi.sql.execute": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforcePolicyOperation(ctx, "sql.write", args);
       const sql = String(args.sql);
       const rows = await conn.runSQL(sql);
@@ -1107,7 +1107,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return json({ ok: true, rows });
     }
     case "ibmi.cl.run": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       enforcePolicyOperation(ctx, "cl.run", args);
       const command = String(args.command || "");
       if (!command.trim()) throw new Error("command is required");
@@ -1135,19 +1135,19 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return json(parseEvfevent(String(args.content)));
     }
     case "ibmi.joblog.get": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const limit = clampNumber(args?.limit, 200, 1, 5000);
       const rows = await conn.runSQL(`select message_id, message_text, severity, message_timestamp from table(qsys2.joblog_info('*')) order by message_timestamp desc fetch first ${limit} rows only`);
       return json(rows);
     }
     case "ibmi.spool.list": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const limit = clampNumber(args?.limit, 200, 1, 5000);
       const rows = await conn.runSQL(`select job_name, spooled_file_name, spooled_file_number, output_queue_name, total_pages, file_status from qsys2.output_queue_entries fetch first ${limit} rows only`);
       return json(rows);
     }
     case "ibmi.spool.read": {
-      const conn = ctx.ensureActive(args?.connectionName);
+      const conn = await ctx.ensureActive(args?.connectionName);
       const limit = clampNumber(args?.limit, 200, 1, 5000);
       const jobName = Tools.sqlString(String(args.jobName));
       const fileName = Tools.sqlString(String(args.spooledFileName));
@@ -1212,7 +1212,7 @@ async function updateConnectionSettings(ctx: McpContext, name: string, update: R
   conn.settings = { ...(conn.settings || {}), ...stripUndefined(update) };
   await ctx.store.upsertConnection(conn);
   try {
-    const active = ctx.ensureActive(name);
+    const active = await ctx.ensureActive(name);
     active.setConfig({ ...active.getConfig(), ...conn.settings });
   } catch {
     // No active session for this connection.
