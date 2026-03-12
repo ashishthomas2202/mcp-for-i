@@ -104,6 +104,44 @@ npm test
 npm run start:controlplane
 ```
 
+## Automated Release (No Manual Version Bump)
+
+Use the release script instead of raw `npm publish`.
+
+Patch release:
+
+```bash
+npm run release:patch
+```
+
+Minor release:
+
+```bash
+npm run release:minor
+```
+
+Major release:
+
+```bash
+npm run release:major
+```
+
+What it does:
+- Verifies git working tree is clean.
+- Runs `npm test` (unless `--skip-tests` is passed).
+- Checks npm published version.
+- Auto-bumps version only when local version is not ahead.
+- Publishes to npm.
+- Pushes commit/tag to GitHub.
+
+Optional flags:
+
+```bash
+npm run release:patch -- --skip-tests
+npm run release:patch -- --otp=123456
+npm run release:patch -- --no-push
+```
+
 ## Security Model
 
 - Credential-bearing direct tool arguments are blocked for connection creation/update flows.

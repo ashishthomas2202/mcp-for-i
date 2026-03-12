@@ -31,7 +31,11 @@
     "test": "npm run build && node --test test/tools.test.mjs test/variables.test.mjs test/validation.test.mjs test/config.migration.test.mjs test/sql.parse.test.mjs",
     "test:all": "npm run build && node --test test/*.mjs",
     "test:ibmi": "npm run build && node --test test/ibmi.integration.test.mjs",
-    "test:mcp": "npm run build && node --test test/mcp.integration.test.mjs"
+    "test:mcp": "npm run build && node --test test/mcp.integration.test.mjs",
+    "release:auto": "node scripts/release-auto.mjs patch",
+    "release:patch": "node scripts/release-auto.mjs patch",
+    "release:minor": "node scripts/release-auto.mjs minor",
+    "release:major": "node scripts/release-auto.mjs major"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.3",
