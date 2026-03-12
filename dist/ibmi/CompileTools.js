@@ -76,16 +76,34 @@ export var CompileTools;
     }
     CompileTools.runCommand = runCommand;
     function buildLibraryList(config) {
-        return config.libraryList.slice(0).reverse();
+        return config.libraryList
+            .slice(0)
+            .map(lib => String(lib || "").trim().toUpperCase())
+            .filter(Boolean)
+            .reverse();
     }
     function buildLiblistCommands(connection, config) {
-        const defaultLibs = Tools.sanitizeObjNamesForPase((connection.defaultUserLibraries || []).filter(l => l && l !== "QSYS"));
-        const currentLib = Tools.sanitizeObjNamesForPase([config.currentLibrary || "QGPL"])[0];
-        const userLibs = Tools.sanitizeObjNamesForPase(buildLibraryList(config));
-        return [
+        const defaultLibNames = (connection.defaultUserLibraries || [])
+            .filter(l => l && l !== "QSYS")
+            .map(l => assertLibraryName(connection, l, "default library"));
+        const userLibNames = buildLibraryList(config).map(l => assertLibraryName(connection, l, "library list"));
+        const currentLib = assertLibraryName(connection, config.currentLibrary || "QGPL", "current library");
+        const defaultLibs = Tools.sanitizeObjNamesForPase(defaultLibNames);
+        const userLibs = Tools.sanitizeObjNamesForPase(userLibNames);
+        const commands = [
             `liblist -d ${IBMiClient.escapeForShell(defaultLibs.join(` `))}`,
-            `liblist -c ${IBMiClient.escapeForShell(currentLib)}`,
-            `liblist -a ${IBMiClient.escapeForShell(userLibs.join(` `))}`
+            `liblist -c ${IBMiClient.escapeForShell(Tools.sanitizeObjNamesForPase([currentLib])[0])}`
         ];
+        if (userLibs.length > 0) {
+            commands.push(`liblist -a ${IBMiClient.escapeForShell(userLibs.join(` `))}`);
+        }
+        return commands;
     }
 })(CompileTools || (CompileTools = {}));
+function assertLibraryName(connection, value, context) {
+    const normalized = String(value || "").trim().toUpperCase();
+    if (!normalized || !connection.validQsysName(normalized)) {
+        throw new Error(`Invalid ${context}: ${value}`);
+    }
+    return normalized;
+}

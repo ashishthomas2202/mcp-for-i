@@ -29,3 +29,15 @@ test("getTools exposes expected tool names", () => {
   const uniqueCount = new Set(names).size;
   assert.equal(uniqueCount, names.length, "tool names should be unique");
 });
+
+test("all tools enforce strict top-level input schemas", () => {
+  const tools = getTools();
+  for (const tool of tools) {
+    assert.ok(tool.inputSchema, `missing inputSchema for ${tool.name}`);
+    assert.equal(
+      tool.inputSchema.additionalProperties,
+      false,
+      `expected additionalProperties=false for ${tool.name}`
+    );
+  }
+});

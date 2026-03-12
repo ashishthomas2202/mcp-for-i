@@ -58,10 +58,11 @@ Build `mcp-for-i` into a production-grade IBM i agent platform where:
 - GitHub-backed MCP and skills update channels with rollback safety.
 
 ## Current Status
-- Phase 0: in progress (core injection/validation/build fixes landed; additional hardening pass still open)
+- Phase 0: complete (strict runtime schemas across tools, nested payload validation, QSYS/source-setting input hardening, safer deploy/debug interpolation paths, compile-time library-name validation, and green default test suite)
 - Phase 1: complete (control-plane UI + secure profile onboarding + keychain secret isolation + secret-arg blocking + legacy plaintext credential migration + post-launch UX polish: auto-reconnect after install/update, runtime version badges, clearer status, row-level delete)
 - Pre-Phase-2 release prep: complete (npm metadata migration to personal GitHub account, npm/global-safe update behavior with Windows self-update scheduling, npm-facing docs refresh)
 - Release automation: complete (one-command auto-bump + publish + tag push workflow via npm scripts)
 - Phase 2: complete (pooled async session manager, sliding inactivity timeout, heartbeat + transient reconnect strategy, session tooling, and control-plane UI observability/settings)
-- Phase 3: in progress (SQL/CL/joblog/spool/diagnostics tool surface added with guard hooks)
-- Phase 4-7: pending
+- Phase 3: complete (SQL query/execute/CL run finished with timeout controls, metadata, guarded policy gates, diagnostics/joblog/spool ops, and structured machine-safe tool envelopes)
+- Phase 4: complete (deploy compare/sync parity with drift classification + dry-run/delete mapping, normalized diagnostics payloads, and robust `actions.run` execution mapping with parsed command diagnostics)
+- Phase 5-7: pending

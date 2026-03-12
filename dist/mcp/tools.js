@@ -6,6 +6,89 @@ import { ConnectionService } from "../controlplane/connectionService.js";
 import { log } from "./logger.js";
 import fs from "fs/promises";
 import path from "path";
+const CUSTOM_VARIABLE_SCHEMA = {
+    type: "object",
+    properties: {
+        name: { type: "string" },
+        value: { type: "string" }
+    },
+    required: ["name", "value"]
+};
+const OBJECT_FILTER_SCHEMA = {
+    type: "object",
+    properties: {
+        name: { type: "string" },
+        library: { type: "string" },
+        object: { type: "string" },
+        types: { type: "array", items: { type: "string" } },
+        member: { type: "string" },
+        memberType: { type: "string" },
+        protected: { type: "boolean" },
+        filterType: { type: "string", enum: ["simple", "regex"] }
+    },
+    required: ["name", "library", "object", "types", "member"]
+};
+const SETTINGS_SCHEMA = {
+    type: "object",
+    properties: {
+        readOnlyMode: { type: "boolean" },
+        tempLibrary: { type: "string" },
+        tempDir: { type: "string" },
+        autoClearTempData: { type: "boolean" },
+        sourceFileCCSID: { type: "string" },
+        sqlJobCcsid: { type: ["string", "number"] },
+        enableSourceDates: { type: "boolean" },
+        homeDirectory: { type: "string" },
+        libraryList: { type: "array", items: { type: "string" } },
+        currentLibrary: { type: "string" },
+        customVariables: { type: "array", items: CUSTOM_VARIABLE_SCHEMA },
+        objectFilters: { type: "array", items: OBJECT_FILTER_SCHEMA },
+        ifsShortcuts: { type: "array", items: { type: "string" } },
+        debugPort: { type: "number" },
+        debugSepPort: { type: "number" },
+        sessionIdleMinutes: { type: "number" },
+        sessionPingSeconds: { type: "number" },
+        sessionReconnectAttempts: { type: "number" }
+    }
+};
+const POLICY_SCHEMA = {
+    type: "object",
+    properties: {
+        profile: { type: "string", enum: ["read-only", "guarded", "power-user"] },
+        requireApprovalFor: { type: "array", items: { type: "string" } },
+        allowCommands: { type: "array", items: { type: "string" } },
+        denyCommands: { type: "array", items: { type: "string" } },
+        allowLibraries: { type: "array", items: { type: "string" } },
+        denyLibraries: { type: "array", items: { type: "string" } },
+        allowPaths: { type: "array", items: { type: "string" } },
+        denyPaths: { type: "array", items: { type: "string" } }
+    }
+};
+const ACTION_SCHEMA = {
+    type: "object",
+    properties: {
+        name: { type: "string" },
+        command: { type: "string" },
+        type: { type: "string", enum: ["member", "streamfile", "object", "file"] },
+        environment: { type: "string", enum: ["ile", "qsh", "pase"] },
+        extensions: { type: "array", items: { type: "string" } },
+        deployFirst: { type: "boolean" },
+        postDownload: { type: "array", items: { type: "string" } },
+        runOnProtected: { type: "boolean" },
+        outputToFile: { type: "string" }
+    },
+    required: ["name", "command", "environment"]
+};
+const PROFILE_SCHEMA = {
+    type: "object",
+    properties: {
+        name: { type: "string" },
+        currentLibrary: { type: "string" },
+        libraryList: { type: "array", items: { type: "string" } },
+        customVariables: { type: "array", items: CUSTOM_VARIABLE_SCHEMA }
+    },
+    required: ["name"]
+};
 export function getTools() {
     const tools = [
         {
@@ -61,8 +144,8 @@ export function getTools() {
                     port: { type: "number", default: 22 },
                     username: { type: "string" },
                     privateKeyPath: { type: "string" },
-                    settings: { type: "object" },
-                    policy: { type: "object" }
+                    settings: SETTINGS_SCHEMA,
+                    policy: POLICY_SCHEMA
                 },
                 required: ["name", "host", "username"],
                 additionalProperties: false
@@ -79,8 +162,8 @@ export function getTools() {
                     port: { type: "number" },
                     username: { type: "string" },
                     privateKeyPath: { type: "string" },
-                    settings: { type: "object" },
-                    policy: { type: "object" }
+                    settings: SETTINGS_SCHEMA,
+                    policy: POLICY_SCHEMA
                 },
                 required: ["name"],
                 additionalProperties: false
@@ -260,7 +343,7 @@ export function getTools() {
                 type: "object",
                 properties: {
                     actionName: { type: "string" },
-                    action: { type: "object" },
+                    action: ACTION_SCHEMA,
                     targetType: { type: "string", enum: ["member", "streamfile", "file"] },
                     targetPath: { type: "string" },
                     library: { type: "string" },
@@ -274,7 +357,7 @@ export function getTools() {
         {
             name: "ibmi.actions.save",
             description: "Create or update a custom action.",
-            inputSchema: { type: "object", properties: { action: { type: "object" } }, required: ["action"] }
+            inputSchema: { type: "object", properties: { action: ACTION_SCHEMA }, required: ["action"] }
         },
         {
             name: "ibmi.actions.delete",
@@ -345,7 +428,7 @@ export function getTools() {
             description: "Create or update a connection profile.",
             inputSchema: {
                 type: "object",
-                properties: { connectionName: { type: "string" }, profile: { type: "object" } },
+                properties: { connectionName: { type: "string" }, profile: PROFILE_SCHEMA },
                 required: ["profile"]
             }
         },
@@ -407,7 +490,7 @@ export function getTools() {
         {
             name: "ibmi.filters.save",
             description: "Create or update an object filter.",
-            inputSchema: { type: "object", properties: { connectionName: { type: "string" }, filter: { type: "object" } }, required: ["filter"] }
+            inputSchema: { type: "object", properties: { connectionName: { type: "string" }, filter: OBJECT_FILTER_SCHEMA }, required: ["filter"] }
         },
         {
             name: "ibmi.filters.delete",
@@ -452,7 +535,17 @@ export function getTools() {
         {
             name: "ibmi.deploy.sync",
             description: "Sync local directory to remote (upload missing or overwrite).",
-            inputSchema: { type: "object", properties: { localPath: { type: "string" }, remotePath: { type: "string" }, overwrite: { type: "boolean", default: false } }, required: ["localPath", "remotePath"] }
+            inputSchema: {
+                type: "object",
+                properties: {
+                    localPath: { type: "string" },
+                    remotePath: { type: "string" },
+                    overwrite: { type: "boolean", default: false },
+                    dryRun: { type: "boolean", default: false },
+                    deleteExtraRemote: { type: "boolean", default: false }
+                },
+                required: ["localPath", "remotePath"]
+            }
         },
         {
             name: "ibmi.sql.query",
@@ -464,6 +557,8 @@ export function getTools() {
                     cursor: { type: "string" },
                     pageSize: { type: "number" },
                     maxRows: { type: "number" },
+                    timeoutMs: { type: "number" },
+                    includeMetadata: { type: "boolean" },
                     connectionName: { type: "string" }
                 }
             }
@@ -475,6 +570,7 @@ export function getTools() {
                 type: "object",
                 properties: {
                     sql: { type: "string" },
+                    timeoutMs: { type: "number" },
                     connectionName: { type: "string" },
                     approve: { type: "boolean" }
                 },
@@ -490,6 +586,7 @@ export function getTools() {
                     command: { type: "string" },
                     environment: { type: "string", enum: ["ile", "qsh", "pase"] },
                     cwd: { type: "string" },
+                    timeoutMs: { type: "number" },
                     connectionName: { type: "string" },
                     approve: { type: "boolean" }
                 },
@@ -562,7 +659,9 @@ export function getTools() {
             inputSchema: { type: "object", properties: {} }
         }
     ];
-    return tools.map(withGuardedApprovalHint);
+    return tools
+        .map(withGuardedApprovalHint)
+        .map(withStrictInputSchema);
 }
 export async function handleTool(ctx, name, args) {
     const connections = new ConnectionService(ctx.store);
@@ -764,9 +863,9 @@ export async function handleTool(ctx, name, args) {
                 envVars["&RELATIVEPATH"] = targetPath;
             }
             if (targetType === "member") {
-                const lib = String(args.library || "").toUpperCase();
-                const src = String(args.sourceFile || "").toUpperCase();
-                const mbr = String(args.member || targetPath.split("/").pop() || "").toUpperCase();
+                const lib = requireQsysName(conn, args.library, "library");
+                const src = requireQsysName(conn, args.sourceFile, "sourceFile");
+                const mbr = requireQsysName(conn, args.member || targetPath.split("/").pop(), "member");
                 const ext = String(args.extension || "");
                 envVars["&LIBRARY"] = lib;
                 envVars["&SRCFILE"] = src;
@@ -786,7 +885,7 @@ export async function handleTool(ctx, name, args) {
                 environment: action.environment,
                 env: envVars
             });
-            return json(resultCmd);
+            return json(mapActionExecution(action, targetType, targetPath, resultCmd));
         }
         case "ibmi.actions.save": {
             const action = args.action;
@@ -1023,7 +1122,7 @@ export async function handleTool(ctx, name, args) {
         }
         case "ibmi.debug.status": {
             const conn = await ctx.ensureActive(args?.connectionName);
-            const port = conn.getConfig().debugPort || 8005;
+            const port = clampNumber(conn.getConfig().debugPort, 8005, 1, 65535);
             const rows = await conn.runSQL(`select job_name, local_port from qsys2.netstat_job_info where local_port = ${port} and remote_address = '0.0.0.0' fetch first 1 row only`);
             if (rows.length === 0)
                 return json({ running: false, port });
@@ -1047,14 +1146,8 @@ export async function handleTool(ctx, name, args) {
             const conn = await ctx.ensureActive(args?.connectionName);
             const localPath = String(args.localPath);
             const remotePath = String(args.remotePath);
-            const localFiles = await listLocalFiles(localPath);
-            const remoteFiles = await listRemoteFiles(conn, remotePath);
-            const localSet = new Set(localFiles);
-            const remoteSet = new Set(remoteFiles);
-            const onlyLocal = localFiles.filter(f => !remoteSet.has(f));
-            const onlyRemote = remoteFiles.filter(f => !localSet.has(f));
-            const common = localFiles.filter(f => remoteSet.has(f));
-            return json({ onlyLocal, onlyRemote, common });
+            const comparison = await compareDeployTrees(conn, localPath, remotePath);
+            return json(comparison);
         }
         case "ibmi.deploy.sync": {
             const conn = await ctx.ensureActive(args?.connectionName);
@@ -1062,55 +1155,151 @@ export async function handleTool(ctx, name, args) {
             const localPath = String(args.localPath);
             const remotePath = String(args.remotePath);
             const overwrite = Boolean(args.overwrite);
-            const localFiles = await listLocalFiles(localPath);
-            const remoteFiles = await listRemoteFiles(conn, remotePath);
-            const remoteSet = new Set(remoteFiles);
-            const createdDirs = new Set();
-            for (const rel of localFiles) {
-                if (!overwrite && remoteSet.has(rel))
-                    continue;
-                const localFile = path.join(localPath, rel);
-                const remoteFile = `${remotePath}/${rel}`.replace(/\\/g, "/");
-                const remoteDir = remoteFile.split("/").slice(0, -1).join("/");
-                if (!createdDirs.has(remoteDir)) {
-                    await conn.sendCommand({ command: `mkdir -p ${Tools.escapePath(remoteDir)}` });
-                    createdDirs.add(remoteDir);
-                }
-                await conn.client.putFile(localFile, remoteFile);
+            const dryRun = Boolean(args.dryRun);
+            const deleteExtraRemote = Boolean(args.deleteExtraRemote);
+            const comparison = await compareDeployTrees(conn, localPath, remotePath);
+            const uploadSet = new Set(comparison.onlyLocal);
+            if (overwrite) {
+                comparison.changed.forEach(entry => uploadSet.add(entry.path));
+                comparison.unresolved.forEach(entry => uploadSet.add(entry.path));
             }
-            return result("OK");
+            const uploadPlan = Array.from(uploadSet).sort((a, b) => a.localeCompare(b));
+            const skipChanged = overwrite ? [] : comparison.changed.map(entry => entry.path).sort((a, b) => a.localeCompare(b));
+            const unresolved = overwrite ? [] : comparison.unresolved.map(entry => entry.path).sort((a, b) => a.localeCompare(b));
+            const deletePlan = deleteExtraRemote ? [...comparison.onlyRemote] : [];
+            const uploaded = [];
+            const deleted = [];
+            const errors = [];
+            if (!dryRun) {
+                const createdDirs = new Set();
+                for (const rel of uploadPlan) {
+                    const localFile = path.join(localPath, rel);
+                    const remoteFile = joinRemotePath(remotePath, rel);
+                    const remoteDir = remoteFile.split("/").slice(0, -1).join("/");
+                    try {
+                        if (!createdDirs.has(remoteDir)) {
+                            await conn.sendCommand({ command: `mkdir -p ${Tools.escapePath(remoteDir)}` });
+                            createdDirs.add(remoteDir);
+                        }
+                        await conn.client.putFile(localFile, remoteFile);
+                        uploaded.push(rel);
+                    }
+                    catch (err) {
+                        errors.push({ operation: "upload", path: rel, message: err?.message || String(err) });
+                    }
+                }
+                for (const rel of deletePlan) {
+                    const remoteFile = joinRemotePath(remotePath, rel);
+                    try {
+                        await conn.sendCommand({ command: `rm -f ${Tools.escapePath(remoteFile)}` });
+                        deleted.push(rel);
+                    }
+                    catch (err) {
+                        errors.push({ operation: "delete", path: rel, message: err?.message || String(err) });
+                    }
+                }
+            }
+            return json({
+                ok: errors.length === 0,
+                mode: { overwrite, deleteExtraRemote, dryRun },
+                comparison,
+                planned: {
+                    upload: uploadPlan,
+                    delete: deletePlan,
+                    skippedChanged: skipChanged,
+                    unresolved
+                },
+                applied: {
+                    uploaded: dryRun ? [] : uploaded,
+                    deleted: dryRun ? [] : deleted
+                },
+                errors
+            });
         }
         case "ibmi.sql.query": {
             const conn = await ctx.ensureActive(args?.connectionName);
             const pageSize = clampNumber(args?.pageSize, 200, 1, 5000);
             const maxRows = clampNumber(args?.maxRows, 1000, 1, 20000);
+            const timeoutMs = clampNumber(args?.timeoutMs, 45000, 1000, 300000);
+            const includeMetadata = Boolean(args?.includeMetadata);
             if (args?.cursor) {
                 const next = ctx.consumeSqlCursor(String(args.cursor), pageSize);
-                return json({ rows: next.rows, cursor: next.cursor });
+                return json({
+                    rows: next.rows,
+                    cursor: next.cursor,
+                    ...(includeMetadata
+                        ? { metadata: { source: "cursor", pageSize, timeoutMs } }
+                        : {})
+                });
             }
             if (!args?.sql)
                 throw new Error("sql is required when cursor is not provided");
             const sql = String(args.sql);
             if (!isReadOnlySql(sql))
                 throw new Error("ibmi.sql.query only supports read-only SQL");
-            const rows = await conn.runSQL(sql);
+            const startedAt = Date.now();
+            const rows = await withTimeout(conn.runSQL(sql), timeoutMs, `SQL query timed out after ${timeoutMs}ms`);
             const limited = rows.slice(0, maxRows);
             const firstPage = limited.slice(0, pageSize);
             const cursorInfo = ctx.createSqlCursor(limited, pageSize);
+            const executionMs = Date.now() - startedAt;
             return json({
                 rows: firstPage,
                 cursor: cursorInfo.cursor,
                 totalRows: limited.length,
-                truncated: rows.length > limited.length
+                truncated: rows.length > limited.length,
+                ...(includeMetadata
+                    ? {
+                        metadata: {
+                            statementType: getSqlStatementType(sql),
+                            columns: getRowColumns(firstPage),
+                            pageSize,
+                            maxRows,
+                            timeoutMs,
+                            executionMs
+                        }
+                    }
+                    : {})
             });
         }
         case "ibmi.sql.execute": {
             const conn = await ctx.ensureActive(args?.connectionName);
             enforcePolicyOperation(ctx, "sql.write", args);
             const sql = String(args.sql);
-            const rows = await conn.runSQL(sql);
-            log("info", "audit.sql.execute", { connectionName: args?.connectionName || ctx.activeName, readOnly: isReadOnlySql(sql) });
-            return json({ ok: true, rows });
+            const timeoutMs = clampNumber(args?.timeoutMs, 45000, 1000, 300000);
+            const statementType = getSqlStatementType(sql);
+            const startedAt = Date.now();
+            try {
+                const rows = await withTimeout(conn.runSQL(sql), timeoutMs, `SQL execute timed out after ${timeoutMs}ms`);
+                const executionMs = Date.now() - startedAt;
+                const affectedRows = inferAffectedRows(rows);
+                log("info", "audit.sql.execute", {
+                    connectionName: args?.connectionName || ctx.activeName,
+                    readOnly: isReadOnlySql(sql),
+                    statementType,
+                    timeoutMs,
+                    affectedRows
+                });
+                return json({
+                    ok: true,
+                    statementType,
+                    timeoutMs,
+                    executionMs,
+                    affectedRows,
+                    returnedRows: rows.length,
+                    rows
+                });
+            }
+            catch (err) {
+                const safe = toSafeSqlError(err, sql, timeoutMs);
+                log("error", "audit.sql.execute.failed", {
+                    connectionName: args?.connectionName || ctx.activeName,
+                    statementType,
+                    errorType: safe.type,
+                    code: safe.code
+                });
+                return toolError(`SQL execute failed (${safe.type})`, safe);
+            }
         }
         case "ibmi.cl.run": {
             const conn = await ctx.ensureActive(args?.connectionName);
@@ -1120,16 +1309,17 @@ export async function handleTool(ctx, name, args) {
                 throw new Error("command is required");
             const environment = String(args.environment || "ile");
             const cwd = args.cwd ? String(args.cwd) : undefined;
+            const timeoutMs = clampNumber(args?.timeoutMs, 45000, 1000, 300000);
             let cmdResult;
             if (environment === "pase") {
-                cmdResult = await conn.sendCommand({ command, directory: cwd });
+                cmdResult = await withTimeout(conn.sendCommand({ command, directory: cwd }), timeoutMs, `CL command timed out after ${timeoutMs}ms`);
             }
             else if (environment === "qsh") {
-                cmdResult = await conn.sendQsh({ command, directory: cwd });
+                cmdResult = await withTimeout(conn.sendQsh({ command, directory: cwd }), timeoutMs, `CL command timed out after ${timeoutMs}ms`);
             }
             else {
                 try {
-                    await conn.runSQL(`CALL QSYS2.QCMDEXC(${Tools.sqlString(command)})`);
+                    await withTimeout(conn.runSQL(`CALL QSYS2.QCMDEXC(${Tools.sqlString(command)})`), timeoutMs, `CL command timed out after ${timeoutMs}ms`);
                     cmdResult = { code: 0, signal: null, stdout: "", stderr: "", command };
                 }
                 catch (err) {
@@ -1137,7 +1327,12 @@ export async function handleTool(ctx, name, args) {
                 }
             }
             log("info", "audit.cl.run", { connectionName: args?.connectionName || ctx.activeName, environment });
-            return json(cmdResult);
+            return json({
+                ok: cmdResult?.code === 0,
+                timeoutMs,
+                environment,
+                ...cmdResult
+            });
         }
         case "ibmi.diagnostics.parseEvfevent": {
             return json(parseEvfevent(String(args.content)));
@@ -1146,13 +1341,13 @@ export async function handleTool(ctx, name, args) {
             const conn = await ctx.ensureActive(args?.connectionName);
             const limit = clampNumber(args?.limit, 200, 1, 5000);
             const rows = await conn.runSQL(`select message_id, message_text, severity, message_timestamp from table(qsys2.joblog_info('*')) order by message_timestamp desc fetch first ${limit} rows only`);
-            return json(rows);
+            return json(rows.map(normalizeJoblogRow));
         }
         case "ibmi.spool.list": {
             const conn = await ctx.ensureActive(args?.connectionName);
             const limit = clampNumber(args?.limit, 200, 1, 5000);
             const rows = await conn.runSQL(`select job_name, spooled_file_name, spooled_file_number, output_queue_name, total_pages, file_status from qsys2.output_queue_entries fetch first ${limit} rows only`);
-            return json(rows);
+            return json(rows.map(normalizeSpoolEntry));
         }
         case "ibmi.spool.read": {
             const conn = await ctx.ensureActive(args?.connectionName);
@@ -1161,7 +1356,7 @@ export async function handleTool(ctx, name, args) {
             const fileName = Tools.sqlString(String(args.spooledFileName));
             const fileNbr = clampNumber(args.spooledFileNumber, 1, 1, 999999999);
             const rows = await conn.runSQL(`select line_number, spooled_data from table(qsys2.display_spooled_file_data(${jobName}, ${fileName}, ${fileNbr})) fetch first ${limit} rows only`);
-            return json(rows);
+            return json(rows.map(normalizeSpoolLine));
         }
         case "ibmi.tn5250.connect":
         case "ibmi.tn5250.readScreen":
@@ -1199,16 +1394,43 @@ function rejectCredentialArgs(args, toolName) {
     }
 }
 function result(text) {
-    return { content: [{ type: "text", text }] };
+    return {
+        content: [{ type: "text", text }],
+        structuredContent: { ok: true, text }
+    };
 }
 function json(obj) {
-    return { content: [{ type: "text", text: JSON.stringify(obj, null, 2) }] };
+    return {
+        content: [{ type: "text", text: JSON.stringify(obj, null, 2) }],
+        structuredContent: { ok: true, data: obj }
+    };
+}
+function toolError(message, error) {
+    return {
+        isError: true,
+        content: [{ type: "text", text: message }],
+        structuredContent: {
+            ok: false,
+            error: {
+                message,
+                ...(error || {})
+            }
+        }
+    };
 }
 function getConnectionName(ctx, args) {
     const name = args?.connectionName || ctx.activeName;
     if (!name)
         throw new Error("connectionName is required (no active connection)");
     return name;
+}
+function requireQsysName(conn, value, label) {
+    const raw = String(value || "").trim().toUpperCase();
+    if (!raw)
+        throw new Error(`${label} is required`);
+    if (!conn.validQsysName(raw))
+        throw new Error(`Invalid ${label}: ${raw}`);
+    return raw;
 }
 async function updateConnectionSettings(ctx, name, update) {
     const conn = await ctx.store.getConnection(name);
@@ -1248,35 +1470,301 @@ function stripUndefined(obj) {
     }
     return out;
 }
+async function compareDeployTrees(conn, localRoot, remoteRoot) {
+    const local = await listLocalFiles(localRoot);
+    const remote = await listRemoteFiles(conn, remoteRoot);
+    const onlyLocal = [];
+    const onlyRemote = [];
+    const identical = [];
+    const changed = [];
+    const unresolved = [];
+    const localKeys = new Set(local.keys());
+    const remoteKeys = new Set(remote.keys());
+    for (const rel of localKeys) {
+        if (!remoteKeys.has(rel)) {
+            onlyLocal.push(rel);
+            continue;
+        }
+        const l = local.get(rel);
+        const r = remote.get(rel);
+        if (typeof l.size === "number" && typeof r.size === "number") {
+            if (l.size === r.size) {
+                identical.push(rel);
+            }
+            else {
+                changed.push({ path: rel, localSize: l.size, remoteSize: r.size, reason: "size_mismatch" });
+            }
+        }
+        else {
+            unresolved.push({ path: rel, localSize: l.size, remoteSize: r.size, reason: "unknown_size" });
+        }
+    }
+    for (const rel of remoteKeys) {
+        if (!localKeys.has(rel)) {
+            onlyRemote.push(rel);
+        }
+    }
+    onlyLocal.sort((a, b) => a.localeCompare(b));
+    onlyRemote.sort((a, b) => a.localeCompare(b));
+    identical.sort((a, b) => a.localeCompare(b));
+    changed.sort((a, b) => a.path.localeCompare(b.path));
+    unresolved.sort((a, b) => a.path.localeCompare(b.path));
+    return {
+        localRoot: path.resolve(localRoot),
+        remoteRoot: remoteRoot.replace(/\/$/, ""),
+        onlyLocal,
+        onlyRemote,
+        identical,
+        changed,
+        unresolved,
+        summary: {
+            localFiles: local.size,
+            remoteFiles: remote.size,
+            onlyLocal: onlyLocal.length,
+            onlyRemote: onlyRemote.length,
+            identical: identical.length,
+            changed: changed.length,
+            unresolved: unresolved.length
+        }
+    };
+}
 async function listLocalFiles(root) {
-    const results = [];
+    const resolvedRoot = path.resolve(root);
+    const results = new Map();
     async function walk(dir) {
         const entries = await fs.readdir(dir, { withFileTypes: true });
         for (const entry of entries) {
             const full = path.join(dir, entry.name);
-            const rel = path.relative(root, full).replace(/\\/g, "/");
+            const rel = path.relative(resolvedRoot, full).replace(/\\/g, "/");
             if (entry.isDirectory()) {
                 await walk(full);
             }
             else {
-                results.push(rel);
+                const stat = await fs.stat(full);
+                results.set(rel, { path: rel, size: stat.size });
             }
         }
     }
-    await walk(root);
+    await walk(resolvedRoot);
     return results;
 }
 async function listRemoteFiles(conn, remoteRoot) {
+    const normalizedRoot = remoteRoot.replace(/\/$/, "");
     const find = conn.remoteFeatures.find || "/QOpenSys/pkgs/bin/find";
-    const res = await conn.sendCommand({ command: `${find} ${Tools.escapePath(remoteRoot)} -type f -print` });
-    const lines = res.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
-    return lines.map((line) => line.replace(remoteRoot.replace(/\/$/, ""), "").replace(/^[\\/]/, ""));
+    const stat = conn.remoteFeatures.stat;
+    if (stat) {
+        const statCmd = `${find} ${Tools.escapePath(normalizedRoot)} -type f -exec ${stat} -c '%n|%s' {} \\;`;
+        const statRes = await conn.sendCommand({ command: statCmd });
+        if (statRes.code === 0) {
+            const mapped = parseRemoteStatLines(statRes.stdout || "", normalizedRoot);
+            if (mapped.size > 0)
+                return mapped;
+        }
+    }
+    const res = await conn.sendCommand({ command: `${find} ${Tools.escapePath(normalizedRoot)} -type f -print` });
+    if (res.code !== 0) {
+        throw new Error(res.stderr || `Failed to list remote files under ${normalizedRoot}`);
+    }
+    const mapped = new Map();
+    const lines = String(res.stdout || "").split("\n").map((l) => l.trim()).filter(Boolean);
+    for (const line of lines) {
+        const rel = toRelativeRemotePath(line, normalizedRoot);
+        mapped.set(rel, { path: rel });
+    }
+    return mapped;
+}
+function parseRemoteStatLines(output, remoteRoot) {
+    const mapped = new Map();
+    const lines = output.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    for (const line of lines) {
+        const split = line.lastIndexOf("|");
+        if (split < 0)
+            continue;
+        const absolute = line.substring(0, split);
+        const sizeText = line.substring(split + 1);
+        const size = Number(sizeText);
+        const rel = toRelativeRemotePath(absolute, remoteRoot);
+        mapped.set(rel, { path: rel, size: Number.isFinite(size) ? size : undefined });
+    }
+    return mapped;
+}
+function toRelativeRemotePath(absolutePath, remoteRoot) {
+    const trimmedRoot = remoteRoot.replace(/\/$/, "");
+    const normalizedPath = absolutePath.replace(/\\/g, "/");
+    if (normalizedPath === trimmedRoot)
+        return "";
+    if (normalizedPath.startsWith(`${trimmedRoot}/`)) {
+        return normalizedPath.substring(trimmedRoot.length + 1);
+    }
+    return normalizedPath.replace(/^[\\/]/, "");
+}
+function joinRemotePath(root, rel) {
+    const base = root.replace(/\/$/, "");
+    return `${base}/${rel}`.replace(/\\/g, "/");
+}
+function mapActionExecution(action, targetType, targetPath, result) {
+    const diagnostics = normalizeCommandDiagnostics(result);
+    const code = Number(result?.code);
+    const ok = Number.isFinite(code) ? code === 0 : false;
+    const status = ok ? (diagnostics.some(d => d.severity === "ERROR") ? "warning" : "success") : "error";
+    return {
+        ...result,
+        ok,
+        status,
+        action: {
+            name: action.name,
+            type: action.type || "member",
+            environment: action.environment
+        },
+        target: {
+            type: targetType,
+            path: targetPath
+        },
+        diagnostics
+    };
+}
+function normalizeCommandDiagnostics(result) {
+    const stdout = String(result?.stdout || "");
+    const stderr = String(result?.stderr || "");
+    const diagnostics = [
+        ...extractDiagnostics(stdout, "stdout"),
+        ...extractDiagnostics(stderr, "stderr")
+    ];
+    return diagnostics.slice(0, 500);
+}
+function extractDiagnostics(text, stream) {
+    const diagnostics = [];
+    for (const rawLine of text.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line)
+            continue;
+        const codeMatch = line.match(/\b(CPF\d{4}|SQL\d{4}|RNX\d{4}|MCH\d{4}|RNQ\d{4})\b/i);
+        diagnostics.push({
+            stream,
+            severity: inferSeverity(line),
+            code: codeMatch ? codeMatch[1].toUpperCase() : undefined,
+            message: line
+        });
+    }
+    return diagnostics;
+}
+function inferSeverity(line) {
+    const text = line.toUpperCase();
+    if (/(ERROR|FAILED|EXCEPTION|SEV\s*[4-9]|SEVERITY\s*[4-9])/.test(text))
+        return "ERROR";
+    if (/(WARN|WARNING|SEV\s*[1-3]|SEVERITY\s*[1-3])/.test(text))
+        return "WARN";
+    return "INFO";
+}
+function normalizeJoblogRow(row) {
+    return {
+        ...row,
+        source: "joblog",
+        id: String(row.MESSAGE_ID || ""),
+        text: String(row.MESSAGE_TEXT || ""),
+        severity: Number.isFinite(Number(row.SEVERITY)) ? Number(row.SEVERITY) : null,
+        timestamp: row.MESSAGE_TIMESTAMP ? String(row.MESSAGE_TIMESTAMP) : undefined
+    };
+}
+function normalizeSpoolEntry(row) {
+    return {
+        ...row,
+        source: "spool",
+        jobName: String(row.JOB_NAME || ""),
+        spooledFileName: String(row.SPOOLED_FILE_NAME || ""),
+        spooledFileNumber: Number(row.SPOOLED_FILE_NUMBER || 0),
+        outputQueue: String(row.OUTPUT_QUEUE_NAME || ""),
+        totalPages: Number.isFinite(Number(row.TOTAL_PAGES)) ? Number(row.TOTAL_PAGES) : null,
+        status: String(row.FILE_STATUS || "")
+    };
+}
+function normalizeSpoolLine(row) {
+    return {
+        ...row,
+        source: "spool",
+        lineNumber: Number.isFinite(Number(row.LINE_NUMBER)) ? Number(row.LINE_NUMBER) : null,
+        text: String(row.SPOOLED_DATA || "")
+    };
 }
 function clampNumber(value, fallback, min, max) {
     const n = Number(value);
     if (!Number.isFinite(n))
         return fallback;
     return Math.max(min, Math.min(max, Math.floor(n)));
+}
+async function withTimeout(promise, timeoutMs, timeoutMessage) {
+    let timeoutHandle;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise((_, reject) => {
+                timeoutHandle = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+            })
+        ]);
+    }
+    finally {
+        if (timeoutHandle)
+            clearTimeout(timeoutHandle);
+    }
+}
+function getSqlStatementType(sql) {
+    const stripped = sql
+        .replace(/\/\*[\s\S]*?\*\//g, " ")
+        .split("\n")
+        .filter(line => !line.trim().startsWith("--"))
+        .join(" ")
+        .trim();
+    const token = stripped.split(/\s+/)[0] || "UNKNOWN";
+    return token.toUpperCase();
+}
+function getRowColumns(rows) {
+    if (!Array.isArray(rows) || rows.length === 0)
+        return [];
+    return Object.keys(rows[0] || {});
+}
+function inferAffectedRows(rows) {
+    if (!Array.isArray(rows) || rows.length === 0)
+        return null;
+    const candidateKeys = [
+        "ROWS_AFFECTED",
+        "ROW_COUNT",
+        "AFFECTED_ROWS",
+        "NUM_ROWS",
+        "NUMBER_ROWS"
+    ];
+    const first = rows[0] || {};
+    for (const key of candidateKeys) {
+        const value = first[key];
+        if (typeof value === "number" && Number.isFinite(value))
+            return value;
+        const parsed = Number(value);
+        if (Number.isFinite(parsed))
+            return parsed;
+    }
+    return null;
+}
+function toSafeSqlError(err, sql, timeoutMs) {
+    const message = err?.message || String(err);
+    const lower = String(message).toLowerCase();
+    let type = "unknown_error";
+    if (lower.includes("timed out"))
+        type = "timeout";
+    else if (lower.includes("blocked by policy"))
+        type = "policy_error";
+    else if (lower.includes("transport closed") || lower.includes("not connected") || lower.includes("socket"))
+        type = "connection_error";
+    else if (err?.name === "SqlError" || /sql\d{4}/i.test(message) || /sqlstate/i.test(message))
+        type = "sql_error";
+    const sqlStateMatch = String(message).match(/sqlstate[^a-z0-9]*([0-9a-z]{5})/i);
+    const codeMatch = String(message).match(/\b([A-Z]{2,}\d{3,5})\b/);
+    return {
+        type,
+        message,
+        statementType: getSqlStatementType(sql),
+        timeoutMs,
+        sqlState: sqlStateMatch ? sqlStateMatch[1].toUpperCase() : undefined,
+        code: codeMatch ? codeMatch[1].toUpperCase() : undefined
+    };
 }
 function isReadOnlySql(sql) {
     const stripped = sql
@@ -1354,6 +1842,34 @@ function withGuardedApprovalHint(tool) {
     }
     return { ...tool, inputSchema: schema };
 }
+function withStrictInputSchema(tool) {
+    const schema = strictifySchema(tool.inputSchema || { type: "object", properties: {} });
+    return { ...tool, inputSchema: schema };
+}
+function strictifySchema(schema) {
+    const next = { ...schema };
+    if (isObjectSchema(next) && typeof next.additionalProperties === "undefined") {
+        next.additionalProperties = false;
+    }
+    if (next.properties) {
+        const strictProps = {};
+        for (const [key, child] of Object.entries(next.properties)) {
+            strictProps[key] = strictifySchema(child);
+        }
+        next.properties = strictProps;
+    }
+    if (next.items) {
+        next.items = strictifySchema(next.items);
+    }
+    return next;
+}
+function isObjectSchema(schema) {
+    if (!schema.type)
+        return false;
+    if (Array.isArray(schema.type))
+        return schema.type.includes("object");
+    return schema.type === "object";
+}
 function resolveIfsWriteOperation(pathValue) {
     const target = String(pathValue || "");
     if (/^\/qsys\.lib\//i.test(target)) {
@@ -1370,6 +1886,7 @@ function parseEvfevent(content) {
         const match = line.match(/^\s*(\d+)\s+(\d+)\s+([A-Z0-9]+)\s+(INFO|WARN|ERROR)?\s*(.*)$/i);
         if (match) {
             diagnostics.push({
+                source: "evfevent",
                 line: Number(match[1]),
                 column: Number(match[2]),
                 code: match[3],
@@ -1378,7 +1895,7 @@ function parseEvfevent(content) {
             });
         }
         else {
-            diagnostics.push({ message: line });
+            diagnostics.push({ source: "evfevent", severity: inferSeverity(line), message: line });
         }
     }
     return diagnostics;

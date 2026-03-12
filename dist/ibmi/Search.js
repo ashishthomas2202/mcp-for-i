@@ -14,6 +14,14 @@ export var Search;
         };
     }
     async function searchMembers(connection, library, sourceFile, searchTerm, members, readOnly) {
+        const lib = String(library || "").trim().toUpperCase();
+        const src = String(sourceFile || "").trim().toUpperCase();
+        if (!connection.validQsysName(lib)) {
+            throw new Error(`Invalid library: ${library}`);
+        }
+        if (!connection.validQsysName(src)) {
+            throw new Error(`Invalid source file: ${sourceFile}`);
+        }
         let detailedMembers;
         let memberFilter;
         const pfgrep = connection.remoteFeatures.pfgrep;
@@ -42,7 +50,7 @@ export var Search;
             : `/usr/bin/grep -inHR -F "${sanitizeSearchTerm(searchTerm)}" ${memberFilter}`;
         const result = await connection.sendCommand({
             command,
-            directory: `/QSYS.LIB/${library}.LIB/${sourceFile}.FILE`
+            directory: `/QSYS.LIB/${lib}.LIB/${src}.FILE`
         });
         if (!result.stderr) {
             let hits = parseGrepOutput(result.stdout || '', readOnly);

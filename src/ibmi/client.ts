@@ -48,7 +48,7 @@ export class IBMiClient {
     if (!name) return false;
     if (name.length > 10) return false;
     const upper = this.upperCaseName(name);
-    return /^[A-Z][A-Z0-9_.]{0,9}$/.test(upper);
+    return /^[A-Z#@$][A-Z0-9#@$._]{0,9}$/.test(upper);
   }
 
   async connect(connection: ConnectionData): Promise<void> {

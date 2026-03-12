@@ -17,6 +17,15 @@ export namespace Search {
   }
 
   export async function searchMembers(connection: IBMiClient, library: string, sourceFile: string, searchTerm: string, members: string | IBMiMember[], readOnly?: boolean): Promise<SearchResults> {
+    const lib = String(library || "").trim().toUpperCase();
+    const src = String(sourceFile || "").trim().toUpperCase();
+    if (!connection.validQsysName(lib)) {
+      throw new Error(`Invalid library: ${library}`);
+    }
+    if (!connection.validQsysName(src)) {
+      throw new Error(`Invalid source file: ${sourceFile}`);
+    }
+
     let detailedMembers: IBMiMember[] | undefined;
     let memberFilter: string | undefined;
 
@@ -46,7 +55,7 @@ export namespace Search {
 
     const result: CommandResult = await connection.sendCommand({
       command,
-      directory: `/QSYS.LIB/${library}.LIB/${sourceFile}.FILE`
+      directory: `/QSYS.LIB/${lib}.LIB/${src}.FILE`
     });
 
     if (!result.stderr) {

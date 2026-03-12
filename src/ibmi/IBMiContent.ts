@@ -88,12 +88,12 @@ export class IBMiContent {
       const withDates = await this.downloadMemberContentWithDates(library, sourceFile, member);
       if (withDates !== undefined) return withDates;
     }
-    const lib = this.ibmi.upperCaseName(library);
-    const file = this.ibmi.upperCaseName(sourceFile);
-    const mbr = this.ibmi.upperCaseName(member);
+    const lib = this.requireQsysName(library, "library");
+    const file = this.requireQsysName(sourceFile, "sourceFile");
+    const mbr = this.requireQsysName(member, "member");
 
     const tempRemote = this.ibmi.getTempRemote("mbr");
-    const ccsid = this.config.sourceFileCCSID || "*FILE";
+    const ccsid = this.normalizeSourceFileCcsid(this.config.sourceFileCCSID);
     const cmd = `QSYS/CPYTOSTMF FROMMBR('${Tools.qualifyPath(lib, file, mbr, undefined, true)}') ` +
       `TOSTMF('${tempRemote}') STMFOPT(*REPLACE) STMFCCSID(1208) DBFCCSID(${ccsid})`;
 
@@ -119,14 +119,14 @@ export class IBMiContent {
 
   private async uploadMemberContentRaw(library: string, sourceFile: string, member: string, content: Uint8Array | string) {
     this.assertWritable();
-    const lib = this.ibmi.upperCaseName(library);
-    const file = this.ibmi.upperCaseName(sourceFile);
-    const mbr = this.ibmi.upperCaseName(member);
+    const lib = this.requireQsysName(library, "library");
+    const file = this.requireQsysName(sourceFile, "sourceFile");
+    const mbr = this.requireQsysName(member, "member");
 
     const tempRemote = this.ibmi.getTempRemote("mbr");
     await this.writeStreamfileRaw(tempRemote, content);
 
-    const ccsid = this.config.sourceFileCCSID || "*FILE";
+    const ccsid = this.normalizeSourceFileCcsid(this.config.sourceFileCCSID);
     const cmd = `QSYS/CPYFRMSTMF FROMSTMF('${tempRemote}') ` +
       `TOMBR('${Tools.qualifyPath(lib, file, mbr, undefined, true)}') MBROPT(*REPLACE) ` +
       `STMFCCSID(1208) DBFCCSID(${ccsid})`;
@@ -202,7 +202,7 @@ export class IBMiContent {
   }
 
   async getObjectList(library: string, types: string[] = ["*ALL"]): Promise<IBMiObject[]> {
-    const lib = this.ibmi.upperCaseName(library);
+    const lib = this.requireQsysName(library, "library");
     const safeTypes = types.map(t => this.ibmi.upperCaseName(t));
     const hasInvalidType = safeTypes.some(t => !/^[*A-Z0-9]+$/.test(t));
     if (hasInvalidType) throw new Error("Invalid object type filter");
@@ -220,8 +220,8 @@ export class IBMiContent {
   }
 
   async getMemberList(options: { library: string; sourceFile: string }): Promise<IBMiMember[]> {
-    const lib = this.ibmi.upperCaseName(options.library);
-    const file = this.ibmi.upperCaseName(options.sourceFile);
+    const lib = this.requireQsysName(options.library, "library");
+    const file = this.requireQsysName(options.sourceFile, "sourceFile");
     const rows = await this.ibmi.runSQL(
       `select SYSTEM_TABLE_MEMBER, SOURCE_TYPE, PARTITION_TEXT from QSYS2.SYSPARTITIONSTAT where SYSTEM_TABLE_SCHEMA=${Tools.sqlString(lib)} and SYSTEM_TABLE_NAME=${Tools.sqlString(file)}`
     );
@@ -235,9 +235,9 @@ export class IBMiContent {
   }
 
   async getMemberInfo(library: string, sourceFile: string, member: string): Promise<IBMiMember | undefined> {
-    const lib = this.ibmi.upperCaseName(library);
-    const file = this.ibmi.upperCaseName(sourceFile);
-    const mbr = this.ibmi.upperCaseName(member);
+    const lib = this.requireQsysName(library, "library");
+    const file = this.requireQsysName(sourceFile, "sourceFile");
+    const mbr = this.requireQsysName(member, "member");
     const rows = await this.ibmi.runSQL(
       `select SYSTEM_TABLE_MEMBER, SOURCE_TYPE, PARTITION_TEXT from QSYS2.SYSPARTITIONSTAT where SYSTEM_TABLE_SCHEMA=${Tools.sqlString(lib)} and SYSTEM_TABLE_NAME=${Tools.sqlString(file)} and SYSTEM_TABLE_MEMBER=${Tools.sqlString(mbr)}`
     );
@@ -253,9 +253,9 @@ export class IBMiContent {
   }
 
   async downloadMemberContentWithDates(library: string, sourceFile: string, member: string): Promise<string | undefined> {
-    const lib = this.ibmi.upperCaseName(library);
-    const file = this.ibmi.upperCaseName(sourceFile);
-    const mbr = this.ibmi.upperCaseName(member);
+    const lib = this.requireQsysName(library, "library");
+    const file = this.requireQsysName(sourceFile, "sourceFile");
+    const mbr = this.requireQsysName(member, "member");
 
     const tempLib = await this.getTempLibrary();
     if (!tempLib) return undefined;
@@ -287,9 +287,9 @@ export class IBMiContent {
 
   async uploadMemberContentWithDates(library: string, sourceFile: string, member: string, body: string) {
     this.assertWritable();
-    const lib = this.ibmi.upperCaseName(library);
-    const file = this.ibmi.upperCaseName(sourceFile);
-    const mbr = this.ibmi.upperCaseName(member);
+    const lib = this.requireQsysName(library, "library");
+    const file = this.requireQsysName(sourceFile, "sourceFile");
+    const mbr = this.requireQsysName(member, "member");
 
     const tempLib = await this.getTempLibrary();
     if (!tempLib) {
@@ -374,46 +374,69 @@ export class IBMiContent {
 
   async createLibrary(library: string) {
     this.assertWritable();
-    const lib = this.ibmi.upperCaseName(library);
+    const lib = this.requireQsysName(library, "library");
     return this.ibmi.sendQsh({ command: `system \"CRTLIB LIB(${lib})\"` });
   }
 
   async createSourceFile(library: string, file: string, rcdlen = 112) {
     this.assertWritable();
-    const lib = this.ibmi.upperCaseName(library);
-    const src = this.ibmi.upperCaseName(file);
+    const lib = this.requireQsysName(library, "library");
+    const src = this.requireQsysName(file, "sourceFile");
     return this.ibmi.sendQsh({ command: `system \"CRTSRCPF FILE(${lib}/${src}) RCDLEN(${rcdlen})\"` });
   }
 
   async createMember(library: string, file: string, member: string, srctype?: string) {
     this.assertWritable();
-    const lib = this.ibmi.upperCaseName(library);
-    const src = this.ibmi.upperCaseName(file);
-    const mbr = this.ibmi.upperCaseName(member);
-    const type = srctype ? this.ibmi.upperCaseName(srctype) : "*NONE";
+    const lib = this.requireQsysName(library, "library");
+    const src = this.requireQsysName(file, "sourceFile");
+    const mbr = this.requireQsysName(member, "member");
+    const type = this.normalizeSourceType(srctype);
     return this.ibmi.sendQsh({ command: `system \"ADDPFM FILE(${lib}/${src}) MBR(${mbr}) SRCTYPE(${type})\"` });
   }
 
   async renameMember(library: string, file: string, member: string, newMember: string) {
     this.assertWritable();
-    const lib = this.ibmi.upperCaseName(library);
-    const src = this.ibmi.upperCaseName(file);
-    const mbr = this.ibmi.upperCaseName(member);
-    const newMbr = this.ibmi.upperCaseName(newMember);
+    const lib = this.requireQsysName(library, "library");
+    const src = this.requireQsysName(file, "sourceFile");
+    const mbr = this.requireQsysName(member, "member");
+    const newMbr = this.requireQsysName(newMember, "newMember");
     return this.ibmi.sendQsh({ command: `system \"RNMM FILE(${lib}/${src}) MBR(${mbr}) NEWMBR(${newMbr})\"` });
   }
 
   async deleteMember(library: string, file: string, member: string) {
     this.assertWritable();
-    const lib = this.ibmi.upperCaseName(library);
-    const src = this.ibmi.upperCaseName(file);
-    const mbr = this.ibmi.upperCaseName(member);
+    const lib = this.requireQsysName(library, "library");
+    const src = this.requireQsysName(file, "sourceFile");
+    const mbr = this.requireQsysName(member, "member");
     return this.ibmi.sendQsh({ command: `system \"RMVM FILE(${lib}/${src}) MBR(${mbr})\"` });
   }
 
   private async createTempFile(): Promise<string> {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mcpfori-"));
     return path.join(dir, "tmp");
+  }
+
+  private requireQsysName(value: string, label: string) {
+    const normalized = this.ibmi.upperCaseName(String(value || "").trim());
+    if (!normalized || !this.ibmi.validQsysName(normalized)) {
+      throw new Error(`Invalid ${label}: ${value}`);
+    }
+    return normalized;
+  }
+
+  private normalizeSourceType(value?: string) {
+    const normalized = this.ibmi.upperCaseName(String(value || "*NONE").trim());
+    if (!/^\*?[A-Z0-9#@$._]{1,10}$/.test(normalized)) {
+      throw new Error(`Invalid source type: ${value}`);
+    }
+    return normalized;
+  }
+
+  private normalizeSourceFileCcsid(value: unknown) {
+    const normalized = String(value || "*FILE").trim().toUpperCase();
+    if (/^\d{1,5}$/.test(normalized)) return normalized;
+    if (/^\*[A-Z0-9]{2,10}$/.test(normalized)) return normalized;
+    throw new Error(`Invalid sourceFileCCSID setting: ${value}`);
   }
 
   private assertWritable() {

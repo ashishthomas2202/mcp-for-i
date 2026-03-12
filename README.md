@@ -148,6 +148,8 @@ npm run release:patch -- --no-push
 - Passwords are stored in keychain when available.
 - Control plane is local-first (`127.0.0.1` by default).
 - Guarded policy profile is the default for operational safety.
+- Tool schemas are strict (`additionalProperties: false`) with runtime argument validation, including nested connection/action/filter/profile payloads.
+- QSYS object names and source settings are validated before command execution to reduce interpolation and injection risk.
 
 ## Links
 

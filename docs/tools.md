@@ -69,6 +69,11 @@
 - `ibmi.deploy.compare`
 - `ibmi.deploy.sync`
 
+### Deploy Notes
+- `ibmi.deploy.compare` returns richer drift data: `onlyLocal`, `onlyRemote`, `identical`, `changed`, `unresolved`, and a `summary`.
+- `ibmi.deploy.sync` supports `overwrite`, `dryRun`, and `deleteExtraRemote`.
+- `ibmi.deploy.sync` returns execution mapping (`planned`, `applied`, `errors`) for safer automation.
+
 ## Filters
 - `ibmi.filters.list`
 - `ibmi.filters.save`
@@ -89,11 +94,21 @@
 - `ibmi.sql.execute`
 - `ibmi.cl.run`
 
+### SQL / CL Notes
+- `ibmi.sql.query` supports cursor paging (`cursor`), `pageSize`, `maxRows`, `timeoutMs`, and optional `includeMetadata`.
+- `ibmi.sql.execute` supports guarded writes with `approve=true` and optional `timeoutMs`.
+- `ibmi.cl.run` supports `ile`, `qsh`, or `pase` execution with optional `timeoutMs`.
+- Tool responses include structured envelopes (`structuredContent`) for machine-safe agent parsing.
+
 ## Diagnostics / Ops
 - `ibmi.diagnostics.parseEvfevent`
 - `ibmi.joblog.get`
 - `ibmi.spool.list`
 - `ibmi.spool.read`
+
+### Diagnostics Notes
+- Diagnostics tools return normalized records suitable for downstream agents (`source`, normalized severity/status fields, and preserved raw fields).
+- `ibmi.actions.run` now returns mapped execution status (`ok`, `status`) and parsed command diagnostics alongside raw command output.
 
 ## TN5250 (Scaffold)
 - `ibmi.tn5250.connect`
