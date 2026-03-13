@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { getTools } from "../dist/mcp/tools.js";
+import { getTools, handleTool } from "../dist/mcp/tools.js";
 import { validateToolInput } from "../dist/mcp/validation.js";
+
+function getJson(result) {
+  const text = result?.content?.[0]?.text ?? "";
+  return text ? JSON.parse(text) : null;
+}
 
 test("ibmi.connect requires saved connection name", () => {
   const tool = getTools().find(t => t.name === "ibmi.connect");
@@ -330,4 +335,68 @@ test("phase 7 operations schemas validate required arguments", () => {
     reply: "C"
   });
   assert.equal(validMsgqReply.length, 0);
+});
+
+test("ibmi.qsys.sourcefiles.list falls back when *FILE object query is rejected", async () => {
+  const calls = [];
+  const conn = {
+    content: {
+      async getObjectList(_library, types) {
+        calls.push(types);
+        if (types?.[0] === "*FILE") throw new Error("OBJTYPELIST ARGUMENT NOT VALID (42616)");
+        return [
+          { library: "TESTLIB", name: "QRPGLESRC", type: "*FILE", text: "", attribute: "PF-SRC" }
+        ];
+      }
+    },
+    async runSQL() {
+      throw new Error("runSQL fallback should not be required in this scenario");
+    }
+  };
+  const ctx = {
+    activeName: "TEST",
+    async ensureActive() {
+      return conn;
+    }
+  };
+
+  const rows = getJson(await handleTool(ctx, "ibmi.qsys.sourcefiles.list", { library: "TESTLIB" }));
+  assert.ok(Array.isArray(rows));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].name, "QRPGLESRC");
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0][0], "*FILE");
+  assert.equal(calls[1][0], "*ALL");
+});
+
+test("ibmi.spool.list retries with fallback queries when preferred query fails", async () => {
+  const sqlCalls = [];
+  const conn = {
+    async runSQL(sql) {
+      sqlCalls.push(sql);
+      if (sqlCalls.length === 1) throw new Error("Column or global variable FILE_STATUS not found. (42703)");
+      return [
+        {
+          JOB_NAME: "123456/USER/JOB",
+          SPOOLED_FILE_NAME: "QSYSPRT",
+          SPOOLED_FILE_NUMBER: 7,
+          OUTPUT_QUEUE_NAME: "QPRINT",
+          TOTAL_PAGES: 1
+        }
+      ];
+    }
+  };
+  const ctx = {
+    activeName: "TEST",
+    async ensureActive() {
+      return conn;
+    }
+  };
+
+  const rows = getJson(await handleTool(ctx, "ibmi.spool.list", { limit: 10 }));
+  assert.ok(Array.isArray(rows));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].spooledFileName, "QSYSPRT");
+  assert.equal(rows[0].spooledFileNumber, 7);
+  assert.equal(sqlCalls.length, 2);
 });

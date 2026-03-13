@@ -1277,7 +1277,26 @@ export async function handleTool(ctx, name, args) {
         }
         case "ibmi.qsys.sourcefiles.list": {
             const conn = await ctx.ensureActive(args?.connectionName);
-            const files = await conn.content.getObjectList(args.library, ["*FILE"]);
+            let files;
+            try {
+                files = await conn.content.getObjectList(args.library, ["*FILE"]);
+            }
+            catch {
+                try {
+                    const allObjects = await conn.content.getObjectList(args.library, ["*ALL"]);
+                    files = allObjects.filter((obj) => String(obj?.type || "").toUpperCase() === "*FILE");
+                }
+                catch {
+                    const rows = await conn.runSQL(`select system_table_name as name, coalesce(table_text, '') as text from qsys2.systables where upper(system_table_schema)=${Tools.sqlString(String(args.library || "").toUpperCase())} fetch first 5000 rows only`);
+                    files = rows.map((row) => ({
+                        library: String(args.library || "").toUpperCase(),
+                        name: String(row?.NAME || row?.SYSTEM_TABLE_NAME || ""),
+                        type: "*FILE",
+                        text: String(row?.TEXT || row?.TABLE_TEXT || ""),
+                        attribute: ""
+                    }));
+                }
+            }
             const sourceByAttr = files.filter((obj) => {
                 const attr = String(obj?.attribute || "").toUpperCase();
                 return attr === "PF-SRC" || attr === "SOURCE";
@@ -2632,28 +2651,33 @@ async function queryJournalEntries(conn, options) {
 }
 async function queryJobs(conn, options) {
     const scanLimit = Math.min(options.limit * 5, 5000);
-    let activeRows = [];
+    const rows = [];
+    const activeWhere = buildJobWhereClause(options, {
+        subsystem: "SUBSYSTEM",
+        userName: "AUTHORIZATION_NAME",
+        status: "JOB_STATUS"
+    });
     try {
-        activeRows = await conn.runSQL(`select * from table(qsys2.active_job_info()) fetch first ${scanLimit} rows only`);
+        const activeRows = await conn.runSQL(`select * from table(qsys2.active_job_info())${activeWhere} fetch first ${scanLimit} rows only`);
+        rows.push(...activeRows.map((row) => normalizeActiveJobRow(row)));
     }
     catch {
         // Continue with job_info fallback.
     }
-    let rows = filterNormalizedJobs(activeRows.map((row) => normalizeActiveJobRow(row)), options);
-    if (rows.length >= options.limit)
-        return rows.slice(0, options.limit);
+    const allWhere = buildJobWhereClause(options, {
+        subsystem: "JOB_SUBSYSTEM",
+        userName: "JOB_USER",
+        status: "JOB_STATUS"
+    });
     try {
-        const allRows = await conn.runSQL(`select * from table(qsys2.job_info('*ALL')) fetch first ${scanLimit} rows only`);
-        const fallback = filterNormalizedJobs(allRows.map((row) => normalizeActiveJobRow(row)), options);
+        const allRows = await conn.runSQL(`select * from table(qsys2.job_info('*ALL'))${allWhere} fetch first ${scanLimit} rows only`);
         const seen = new Set(rows.map((row) => String(row.jobName || "")));
-        for (const row of fallback) {
+        for (const row of allRows.map((raw) => normalizeActiveJobRow(raw))) {
             const key = String(row.jobName || "");
             if (!key || seen.has(key))
                 continue;
             rows.push(row);
             seen.add(key);
-            if (rows.length >= options.limit)
-                break;
         }
     }
     catch {
@@ -2661,21 +2685,24 @@ async function queryJobs(conn, options) {
     }
     return rows.slice(0, options.limit);
 }
-function filterNormalizedJobs(rows, options) {
-    let filtered = rows;
+function buildJobWhereClause(options, columns) {
+    const predicates = [];
     if (options.subsystem) {
         const subsystem = String(options.subsystem).trim().toUpperCase();
-        filtered = filtered.filter((row) => (row.subsystem || "") === subsystem);
+        if (subsystem)
+            predicates.push(`upper(${columns.subsystem})=${Tools.sqlString(subsystem)}`);
     }
     if (options.userName) {
         const userName = String(options.userName).trim().toUpperCase();
-        filtered = filtered.filter((row) => (row.userName || "") === userName);
+        if (userName)
+            predicates.push(`upper(${columns.userName})=${Tools.sqlString(userName)}`);
     }
     if (options.status) {
-        const status = String(options.status).trim().toUpperCase();
-        filtered = filtered.filter((row) => (row.status || "").includes(status));
+        const status = String(options.status).trim().toUpperCase().replace(/'/g, "''");
+        if (status)
+            predicates.push(`upper(${columns.status}) like '%${status}%'`);
     }
-    return filtered;
+    return predicates.length > 0 ? ` where ${predicates.join(" and ")}` : "";
 }
 async function querySubsystemSummary(conn, limit) {
     const jobs = await queryJobs(conn, { limit: 5000 });
@@ -2713,11 +2740,14 @@ async function queryMessageQueueEntries(conn, options) {
 }
 async function querySpoolEntries(conn, limit) {
     const queries = [
+        `select * from qsys2.output_queue_entries fetch first ${limit} rows only`,
+        `select * from table(qsys2.output_queue_entries()) fetch first ${limit} rows only`,
         `select job_name, spooled_file_name, spooled_file_number, output_queue_name, total_pages, file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
         `select job_name, spooled_file_name, spooled_file_number, output_queue_name, total_pages, cast('' as varchar(10)) as file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
         `select job_name, spooled_file_name, cast(0 as integer) as spooled_file_number, output_queue_name, total_pages, file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
         `select job_name, spooled_file_name, cast(0 as integer) as spooled_file_number, output_queue_name, total_pages, cast('' as varchar(10)) as file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
-        `select * from qsys2.output_queue_entries fetch first ${limit} rows only`
+        `select * from qsys2.spooled_file_info fetch first ${limit} rows only`,
+        `select * from table(qsys2.spooled_file_info()) fetch first ${limit} rows only`
     ];
     let lastError;
     for (const sql of queries) {
@@ -2848,7 +2878,10 @@ function normalizeDataAreaInfoRow(row) {
 function buildSpoolCommand(commandName, args) {
     const jobName = requireJobName(args.jobName);
     const spooledFileName = requireIbmObjectName(args.spooledFileName, "spooledFileName");
-    const spooledFileNumber = clampNumber(args.spooledFileNumber, 1, 1, 999999999);
+    const rawNumber = Number(args.spooledFileNumber);
+    const spooledFileNumber = Number.isFinite(rawNumber) && rawNumber > 0
+        ? String(Math.floor(rawNumber))
+        : "*LAST";
     return `${commandName} FILE(${spooledFileName}) JOB(${jobName}) SPLNBR(${spooledFileNumber})`;
 }
 async function queryJournalEntriesViaDisplayJournal(conn, options) {
