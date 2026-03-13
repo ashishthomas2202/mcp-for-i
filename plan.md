@@ -50,10 +50,28 @@ Build `mcp-for-i` into a production-grade IBM i agent platform where:
 - Connection, screen model, input primitives, waits/retries.
 - Guardrails for risky interactive transactions.
 
-### Phase 6: Agent Skills + Safe Autonomy
-- Task-to-skill routing and safe autonomy controls.
+### Phase 6: Audit, Journaling, and Compliance
+- Add tamper-evident MCP action audit trails (who/what/when/approval/result/correlation IDs).
+- Add IBM i journaling lifecycle tooling (receiver management, start/end journaling, normalized journal queries).
+- Add compliance-friendly export/retention controls for audit evidence.
 
-### Phase 7: Packaging + Updater Distribution
+### Phase 7: IBM i Operations Control
+- Job and subsystem lifecycle controls (list/hold/release/end/status).
+- Message queue workflows (read/send/reply for inquiry and operational queues).
+- Lock/contention and authority visibility before risky writes.
+- Add key IBM i operational surfaces not yet covered: data queue/data area operations, and richer output queue controls.
+
+### Phase 8: Reliability, Recovery, and Change Assurance
+- Guarded backup/restore primitives with preflight/postflight verification.
+- Journal receiver-chain health checks and retention/rotation safeguards.
+- System health checks (ASP usage, job pressure, service availability) with automation-ready status payloads.
+- Change safety checkpoints (verification and rollback-oriented workflows).
+
+### Phase 9: Agent Skills + Safe Autonomy
+- Task-to-skill routing and safe autonomy controls.
+- Scoped learning/memory model with private and shared boundaries.
+
+### Phase 10: Packaging + Updater Distribution
 - Installer/updater across Windows/macOS/Linux.
 - GitHub-backed MCP and skills update channels with rollback safety.
 
@@ -65,4 +83,8 @@ Build `mcp-for-i` into a production-grade IBM i agent platform where:
 - Phase 2: complete (pooled async session manager, sliding inactivity timeout, heartbeat + transient reconnect strategy, session tooling, and control-plane UI observability/settings)
 - Phase 3: complete (SQL query/execute/CL run finished with timeout controls, metadata, guarded policy gates, diagnostics/joblog/spool ops, and structured machine-safe tool envelopes)
 - Phase 4: complete (deploy compare/sync parity with drift classification + dry-run/delete mapping, normalized diagnostics payloads, and robust `actions.run` execution mapping with parsed command diagnostics)
-- Phase 5-7: pending
+- Post-Phase-4 compatibility hardening (2026-03-12): complete (`ibmi.qsys.sourcefiles.list` no longer uses invalid OBJTYPELIST, `ibmi.spool.list` now falls back when `FILE_STATUS` is unavailable, and `ibmi.libl.{set,add,remove,setCurrent}` now advertise `approve` under guarded policy)
+- Phase 5: complete (stateful TN5250 command session tools implemented: connect/read/set/send/wait/snapshot/disconnect, key handling, wait/retry loop, session snapshots, and guarded policy enforcement for interactive command execution)
+- Phase 6: complete (tamper-evident tool audit chain with verify/export/purge controls, journaling lifecycle across PF and IFS, QAUDJRN compliance event querying, receiver-retention automation with policy gates, and compliance report/bundle generation with optional signing)
+- Phase 7: complete (IBM i operations control expansion with spool hold/release/delete/move, job lifecycle controls, subsystem lifecycle/status tooling, message-queue send/read/reply workflows, lock + object-authority visibility, and data queue/data area operations)
+- Phase 8-10: pending

@@ -7,8 +7,10 @@ import { Tools } from "../ibmi/Tools.js";
 import { ConnectionPolicy } from "../config/store.js";
 import { ConnectionService } from "../controlplane/connectionService.js";
 import { log } from "./logger.js";
+import { exportAuditRecords, listAuditRecords, purgeAuditRecords, verifyAuditChain } from "./audit.js";
 import fs from "fs/promises";
 import path from "path";
+import crypto from "crypto";
 
 type JsonSchema = {
   type?: string | string[];
@@ -109,6 +111,48 @@ const PROFILE_SCHEMA: JsonSchema = {
   },
   required: ["name"]
 };
+
+type Tn5250Field = {
+  id: string;
+  label: string;
+  value: string;
+  row: number;
+  col: number;
+  length: number;
+  protected?: boolean;
+};
+
+type Tn5250HistoryEntry = {
+  at: string;
+  command: string;
+  ok: boolean;
+  code: number;
+  stderr?: string;
+  messages: string[];
+};
+
+type Tn5250Screen = {
+  sessionId: string;
+  connectionName: string;
+  title: string;
+  status: "ready" | "busy";
+  textLines: string[];
+  fields: Tn5250Field[];
+  cursorFieldId: string;
+  lastKeys: string[];
+  commandHistory: Tn5250HistoryEntry[];
+  updatedAt: string;
+};
+
+type Tn5250Session = {
+  connectionName: string;
+  createdAt: number;
+  screen: Tn5250Screen;
+};
+
+const tn5250Sessions = new Map<string, Tn5250Session>();
+const TN5250_MAX_LINES = 30;
+const TN5250_MAX_HISTORY = 20;
 
 export function getTools() {
   const tools = [
@@ -648,39 +692,578 @@ export function getTools() {
       }
     },
     {
+      name: "ibmi.spool.hold",
+      description: "Hold a spool file entry.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          jobName: { type: "string" },
+          spooledFileName: { type: "string" },
+          spooledFileNumber: { type: "number" },
+          connectionName: { type: "string" }
+        },
+        required: ["jobName", "spooledFileName", "spooledFileNumber"]
+      }
+    },
+    {
+      name: "ibmi.spool.release",
+      description: "Release a held spool file entry.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          jobName: { type: "string" },
+          spooledFileName: { type: "string" },
+          spooledFileNumber: { type: "number" },
+          connectionName: { type: "string" }
+        },
+        required: ["jobName", "spooledFileName", "spooledFileNumber"]
+      }
+    },
+    {
+      name: "ibmi.spool.delete",
+      description: "Delete a spool file entry.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          jobName: { type: "string" },
+          spooledFileName: { type: "string" },
+          spooledFileNumber: { type: "number" },
+          connectionName: { type: "string" }
+        },
+        required: ["jobName", "spooledFileName", "spooledFileNumber"]
+      }
+    },
+    {
+      name: "ibmi.spool.move",
+      description: "Move a spool file entry to another output queue.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          jobName: { type: "string" },
+          spooledFileName: { type: "string" },
+          spooledFileNumber: { type: "number" },
+          outQueueLibrary: { type: "string" },
+          outQueue: { type: "string" },
+          connectionName: { type: "string" }
+        },
+        required: ["jobName", "spooledFileName", "spooledFileNumber", "outQueueLibrary", "outQueue"]
+      }
+    },
+    {
+      name: "ibmi.jobs.list",
+      description: "List active jobs with optional filters.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          subsystem: { type: "string" },
+          userName: { type: "string" },
+          status: { type: "string" },
+          limit: { type: "number" },
+          connectionName: { type: "string" }
+        }
+      }
+    },
+    {
+      name: "ibmi.jobs.hold",
+      description: "Hold a job.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          jobName: { type: "string" },
+          holdOnJobQueue: { type: "boolean", default: false },
+          connectionName: { type: "string" }
+        },
+        required: ["jobName"]
+      }
+    },
+    {
+      name: "ibmi.jobs.release",
+      description: "Release a held job.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          jobName: { type: "string" },
+          connectionName: { type: "string" }
+        },
+        required: ["jobName"]
+      }
+    },
+    {
+      name: "ibmi.jobs.end",
+      description: "End a job.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          jobName: { type: "string" },
+          option: { type: "string", enum: ["*CNTRLD", "*IMMED"], default: "*CNTRLD" },
+          delaySeconds: { type: "number", default: 30 },
+          connectionName: { type: "string" }
+        },
+        required: ["jobName"]
+      }
+    },
+    {
+      name: "ibmi.subsystems.list",
+      description: "List active subsystems and active job counts.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: { type: "number" },
+          connectionName: { type: "string" }
+        }
+      }
+    },
+    {
+      name: "ibmi.subsystems.status",
+      description: "Get runtime status details for one subsystem.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          subsystem: { type: "string" },
+          limit: { type: "number" },
+          connectionName: { type: "string" }
+        },
+        required: ["subsystem"]
+      }
+    },
+    {
+      name: "ibmi.subsystems.start",
+      description: "Start a subsystem from subsystem description.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          subsystemDescription: { type: "string" },
+          connectionName: { type: "string" }
+        },
+        required: ["subsystemDescription"]
+      }
+    },
+    {
+      name: "ibmi.subsystems.end",
+      description: "End a subsystem.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          subsystem: { type: "string" },
+          option: { type: "string", enum: ["*CNTRLD", "*IMMED"], default: "*CNTRLD" },
+          delaySeconds: { type: "number", default: 30 },
+          connectionName: { type: "string" }
+        },
+        required: ["subsystem"]
+      }
+    },
+    {
+      name: "ibmi.msgq.read",
+      description: "Read messages from a message queue.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          library: { type: "string", default: "QSYS" },
+          messageQueue: { type: "string", default: "QSYSOPR" },
+          limit: { type: "number" },
+          connectionName: { type: "string" }
+        }
+      }
+    },
+    {
+      name: "ibmi.msgq.send",
+      description: "Send a message to a message queue.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          library: { type: "string", default: "QSYS" },
+          messageQueue: { type: "string", default: "QSYSOPR" },
+          message: { type: "string" },
+          messageType: { type: "string", enum: ["*INFO", "*INQ", "*COMP", "*DIAG"], default: "*INFO" },
+          connectionName: { type: "string" }
+        },
+        required: ["message"]
+      }
+    },
+    {
+      name: "ibmi.msgq.reply",
+      description: "Reply to an inquiry message by key.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          library: { type: "string", default: "QSYS" },
+          messageQueue: { type: "string", default: "QSYSOPR" },
+          messageKey: { type: "string" },
+          reply: { type: "string" },
+          connectionName: { type: "string" }
+        },
+        required: ["messageKey", "reply"]
+      }
+    },
+    {
+      name: "ibmi.locks.list",
+      description: "List lock/contention entries with optional filters.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          objectLibrary: { type: "string" },
+          objectName: { type: "string" },
+          objectType: { type: "string" },
+          member: { type: "string" },
+          limit: { type: "number" },
+          connectionName: { type: "string" }
+        }
+      }
+    },
+    {
+      name: "ibmi.authority.object.get",
+      description: "Get authority details for an object.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          library: { type: "string" },
+          object: { type: "string" },
+          objectType: { type: "string", default: "*FILE" },
+          limit: { type: "number" },
+          connectionName: { type: "string" }
+        },
+        required: ["library", "object"]
+      }
+    },
+    {
+      name: "ibmi.dataqueue.send",
+      description: "Send an entry to a data queue.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          library: { type: "string" },
+          queue: { type: "string" },
+          message: { type: "string" },
+          connectionName: { type: "string" }
+        },
+        required: ["library", "queue", "message"]
+      }
+    },
+    {
+      name: "ibmi.dataqueue.receive",
+      description: "Receive (or peek) an entry from a data queue.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          library: { type: "string" },
+          queue: { type: "string" },
+          waitSeconds: { type: "number", default: 0 },
+          remove: { type: "boolean", default: true },
+          connectionName: { type: "string" }
+        },
+        required: ["library", "queue"]
+      }
+    },
+    {
+      name: "ibmi.dataarea.read",
+      description: "Read data area metadata and value.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          library: { type: "string" },
+          dataArea: { type: "string" },
+          connectionName: { type: "string" }
+        },
+        required: ["library", "dataArea"]
+      }
+    },
+    {
+      name: "ibmi.dataarea.write",
+      description: "Write value into a data area.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          library: { type: "string" },
+          dataArea: { type: "string" },
+          value: { type: "string" },
+          startPosition: { type: "number", default: 1 },
+          length: { type: "number" },
+          connectionName: { type: "string" }
+        },
+        required: ["library", "dataArea", "value"]
+      }
+    },
+    {
+      name: "ibmi.audit.list",
+      description: "Read MCP tool audit records.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: { type: "number" },
+          tool: { type: "string" },
+          status: { type: "string", enum: ["ok", "error"] },
+          connectionName: { type: "string" },
+          correlationId: { type: "string" },
+          since: { type: "string" }
+        }
+      }
+    },
+    {
+      name: "ibmi.audit.verify",
+      description: "Verify audit record hash-chain integrity.",
+      inputSchema: { type: "object", properties: {} }
+    },
+    {
+      name: "ibmi.audit.export",
+      description: "Export audit records for compliance review.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          outputPath: { type: "string" },
+          format: { type: "string", enum: ["jsonl", "json", "csv"] },
+          limit: { type: "number" },
+          tool: { type: "string" },
+          status: { type: "string", enum: ["ok", "error"] },
+          connectionName: { type: "string" },
+          correlationId: { type: "string" },
+          since: { type: "string" }
+        },
+        required: ["outputPath"]
+      }
+    },
+    {
+      name: "ibmi.audit.purge",
+      description: "Purge audit records older than a timestamp (with optional dry run).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          before: { type: "string" },
+          dryRun: { type: "boolean" },
+          approve: { type: "boolean" }
+        },
+        required: ["before"]
+      }
+    },
+    {
+      name: "ibmi.journal.objects.list",
+      description: "List journal and journal receiver objects in a library.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          library: { type: "string" },
+          types: { type: "array", items: { type: "string" } }
+        },
+        required: ["library"]
+      }
+    },
+    {
+      name: "ibmi.journal.entries.query",
+      description: "Read normalized entries from a journal.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          journalLibrary: { type: "string" },
+          journal: { type: "string" },
+          objectLibrary: { type: "string" },
+          objectName: { type: "string" },
+          journalCode: { type: "string" },
+          entryType: { type: "string" },
+          userName: { type: "string" },
+          jobName: { type: "string" },
+          programName: { type: "string" },
+          limit: { type: "number" },
+          sinceSequence: { type: "number" },
+          sinceTimestamp: { type: "string" },
+          connectionName: { type: "string" }
+        },
+        required: ["journalLibrary", "journal"]
+      }
+    },
+    {
+      name: "ibmi.qaudjrn.events.query",
+      description: "Query QAUDJRN security/compliance events with normalized output.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          journalCode: { type: "string" },
+          entryType: { type: "string" },
+          userName: { type: "string" },
+          jobName: { type: "string" },
+          programName: { type: "string" },
+          limit: { type: "number" },
+          sinceSequence: { type: "number" },
+          sinceTimestamp: { type: "string" },
+          connectionName: { type: "string" }
+        }
+      }
+    },
+    {
+      name: "ibmi.journal.receiver.create",
+      description: "Create a journal receiver.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          library: { type: "string" },
+          receiver: { type: "string" },
+          threshold: { type: "number" },
+          connectionName: { type: "string" }
+        },
+        required: ["library", "receiver"]
+      }
+    },
+    {
+      name: "ibmi.journal.create",
+      description: "Create a journal and attach it to a receiver.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          library: { type: "string" },
+          journal: { type: "string" },
+          receiverLibrary: { type: "string" },
+          receiver: { type: "string" },
+          connectionName: { type: "string" }
+        },
+        required: ["library", "journal", "receiverLibrary", "receiver"]
+      }
+    },
+    {
+      name: "ibmi.journal.receiver.change",
+      description: "Switch a journal to a new receiver.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          journalLibrary: { type: "string" },
+          journal: { type: "string" },
+          receiverLibrary: { type: "string" },
+          receiver: { type: "string" },
+          connectionName: { type: "string" }
+        },
+        required: ["journalLibrary", "journal", "receiverLibrary", "receiver"]
+      }
+    },
+    {
+      name: "ibmi.journal.startPf",
+      description: "Start journaling for a physical file.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          library: { type: "string" },
+          file: { type: "string" },
+          journalLibrary: { type: "string" },
+          journal: { type: "string" },
+          images: { type: "string", enum: ["*AFTER", "*BOTH"] },
+          connectionName: { type: "string" }
+        },
+        required: ["library", "file", "journalLibrary", "journal"]
+      }
+    },
+    {
+      name: "ibmi.journal.endPf",
+      description: "End journaling for a physical file.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          library: { type: "string" },
+          file: { type: "string" },
+          connectionName: { type: "string" }
+        },
+        required: ["library", "file"]
+      }
+    },
+    {
+      name: "ibmi.journal.startIfs",
+      description: "Start journaling for an IFS object.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          objectType: { type: "string", enum: ["*STMF", "*DIR"], default: "*STMF" },
+          journalLibrary: { type: "string" },
+          journal: { type: "string" },
+          connectionName: { type: "string" }
+        },
+        required: ["path", "journalLibrary", "journal"]
+      }
+    },
+    {
+      name: "ibmi.journal.endIfs",
+      description: "End journaling for an IFS object.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          objectType: { type: "string", enum: ["*STMF", "*DIR"], default: "*STMF" },
+          connectionName: { type: "string" }
+        },
+        required: ["path"]
+      }
+    },
+    {
+      name: "ibmi.journal.receivers.retention",
+      description: "Apply retention policy to detached journal receivers.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          journalLibrary: { type: "string" },
+          journal: { type: "string" },
+          retentionDays: { type: "number" },
+          maxDeletes: { type: "number" },
+          dryRun: { type: "boolean", default: true },
+          connectionName: { type: "string" }
+        },
+        required: ["journalLibrary", "journal", "retentionDays"]
+      }
+    },
+    {
+      name: "ibmi.compliance.report.generate",
+      description: "Generate a compliance report preset and optional signed evidence bundle.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          preset: { type: "string", enum: ["phase6_baseline", "qaudjrn_daily", "journal_retention"], default: "phase6_baseline" },
+          sinceTimestamp: { type: "string" },
+          auditLimit: { type: "number" },
+          qaudLimit: { type: "number" },
+          outputPath: { type: "string" },
+          sign: { type: "boolean", default: false },
+          signingKey: { type: "string" },
+          includeRaw: { type: "boolean", default: false },
+          connectionName: { type: "string" }
+        }
+      }
+    },
+    {
       name: "ibmi.tn5250.connect",
-      description: "Connect to TN5250 (phase scaffold).",
+      description: "Connect to a TN5250 command session.",
       inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
     },
     {
       name: "ibmi.tn5250.readScreen",
-      description: "Read TN5250 screen model (phase scaffold).",
-      inputSchema: { type: "object", properties: {} }
+      description: "Read TN5250 screen model.",
+      inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
     },
     {
       name: "ibmi.tn5250.setField",
-      description: "Set TN5250 field (phase scaffold).",
-      inputSchema: { type: "object", properties: { fieldId: { type: "string" }, value: { type: "string" } }, required: ["fieldId", "value"] }
+      description: "Set TN5250 field value.",
+      inputSchema: {
+        type: "object",
+        properties: { fieldId: { type: "string" }, value: { type: "string" }, connectionName: { type: "string" } },
+        required: ["fieldId", "value"]
+      }
     },
     {
       name: "ibmi.tn5250.sendKeys",
-      description: "Send TN5250 keys (phase scaffold).",
-      inputSchema: { type: "object", properties: { keys: { type: "string" } }, required: ["keys"] }
+      description: "Send TN5250 keys.",
+      inputSchema: {
+        type: "object",
+        properties: { keys: { type: "string" }, timeoutMs: { type: "number" }, connectionName: { type: "string" }, approve: { type: "boolean" } },
+        required: ["keys"]
+      }
     },
     {
       name: "ibmi.tn5250.waitFor",
-      description: "Wait for TN5250 condition (phase scaffold).",
-      inputSchema: { type: "object", properties: { text: { type: "string" }, timeoutMs: { type: "number" } } }
+      description: "Wait for TN5250 text condition.",
+      inputSchema: { type: "object", properties: { text: { type: "string" }, timeoutMs: { type: "number" }, connectionName: { type: "string" } } }
     },
     {
       name: "ibmi.tn5250.snapshot",
-      description: "Capture TN5250 snapshot (phase scaffold).",
-      inputSchema: { type: "object", properties: {} }
+      description: "Capture TN5250 snapshot.",
+      inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
     },
     {
       name: "ibmi.tn5250.disconnect",
-      description: "Disconnect TN5250 session (phase scaffold).",
-      inputSchema: { type: "object", properties: {} }
+      description: "Disconnect TN5250 session.",
+      inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
     }
   ];
   return tools
@@ -700,7 +1283,13 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return result(`Connected to ${args.name}`);
     }
     case "ibmi.disconnect": {
+      const name = args?.connectionName || ctx.activeName;
       await ctx.disconnect(args?.connectionName);
+      if (name) {
+        tn5250Sessions.delete(name);
+      } else {
+        tn5250Sessions.clear();
+      }
       return result("Disconnected");
     }
     case "ibmi.session.list": {
@@ -713,7 +1302,9 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return json(await ctx.keepaliveSession(args?.connectionName));
     }
     case "ibmi.session.terminate": {
+      const name = args?.connectionName || ctx.activeName;
       await ctx.terminateSession(args?.connectionName);
+      if (name) tn5250Sessions.delete(name);
       return result("Terminated");
     }
     case "ibmi.connections.list": {
@@ -747,8 +1338,15 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.qsys.sourcefiles.list": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      const data = await conn.content.getObjectList(args.library, ["*SRCPF"]);
-      return json(data);
+      const files = await conn.content.getObjectList(args.library, ["*FILE"]);
+      const sourceByAttr = files.filter((obj: any) => {
+        const attr = String(obj?.attribute || "").toUpperCase();
+        return attr === "PF-SRC" || attr === "SOURCE";
+      });
+      if (sourceByAttr.length > 0) return json(sourceByAttr);
+
+      const sourceByName = files.filter((obj: any) => String(obj?.name || "").toUpperCase().endsWith("SRC"));
+      return json(sourceByName.length > 0 ? sourceByName : files);
     }
     case "ibmi.qsys.members.list": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -1328,32 +1926,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const environment = String(args.environment || "ile");
       const cwd = args.cwd ? String(args.cwd) : undefined;
       const timeoutMs = clampNumber(args?.timeoutMs, 45000, 1000, 300000);
-      let cmdResult: any;
-
-      if (environment === "pase") {
-        cmdResult = await withTimeout(
-          conn.sendCommand({ command, directory: cwd }),
-          timeoutMs,
-          `CL command timed out after ${timeoutMs}ms`
-        );
-      } else if (environment === "qsh") {
-        cmdResult = await withTimeout(
-          conn.sendQsh({ command, directory: cwd }),
-          timeoutMs,
-          `CL command timed out after ${timeoutMs}ms`
-        );
-      } else {
-        try {
-          await withTimeout(
-            conn.runSQL(`CALL QSYS2.QCMDEXC(${Tools.sqlString(command)})`),
-            timeoutMs,
-            `CL command timed out after ${timeoutMs}ms`
-          );
-          cmdResult = { code: 0, signal: null, stdout: "", stderr: "", command };
-        } catch (err: any) {
-          cmdResult = { code: 1, signal: null, stdout: "", stderr: err?.message || String(err), command };
-        }
-      }
+      const cmdResult = await runClCommand(conn, command, environment, cwd, timeoutMs);
 
       log("info", "audit.cl.run", { connectionName: args?.connectionName || ctx.activeName, environment });
       return json({
@@ -1375,7 +1948,13 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.spool.list": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const limit = clampNumber(args?.limit, 200, 1, 5000);
-      const rows = await conn.runSQL(`select job_name, spooled_file_name, spooled_file_number, output_queue_name, total_pages, file_status from qsys2.output_queue_entries fetch first ${limit} rows only`);
+      let rows: Array<Record<string, unknown>>;
+      try {
+        rows = await conn.runSQL(`select job_name, spooled_file_name, spooled_file_number, output_queue_name, total_pages, file_status from qsys2.output_queue_entries fetch first ${limit} rows only`);
+      } catch (err: any) {
+        if (!isMissingColumnError(err, "FILE_STATUS")) throw err;
+        rows = await conn.runSQL(`select job_name, spooled_file_name, spooled_file_number, output_queue_name, total_pages, cast('' as varchar(10)) as file_status from qsys2.output_queue_entries fetch first ${limit} rows only`);
+      }
       return json(rows.map(normalizeSpoolEntry));
     }
     case "ibmi.spool.read": {
@@ -1387,14 +1966,632 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const rows = await conn.runSQL(`select line_number, spooled_data from table(qsys2.display_spooled_file_data(${jobName}, ${fileName}, ${fileNbr})) fetch first ${limit} rows only`);
       return json(rows.map(normalizeSpoolLine));
     }
-    case "ibmi.tn5250.connect":
-    case "ibmi.tn5250.readScreen":
-    case "ibmi.tn5250.setField":
-    case "ibmi.tn5250.sendKeys":
-    case "ibmi.tn5250.waitFor":
-    case "ibmi.tn5250.snapshot":
+    case "ibmi.spool.hold": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const command = buildSpoolCommand("HLDSPFL", args);
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+    }
+    case "ibmi.spool.release": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const command = buildSpoolCommand("RLSSPLF", args);
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+    }
+    case "ibmi.spool.delete": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const command = buildSpoolCommand("DLTSPLF", args);
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+    }
+    case "ibmi.spool.move": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const baseCommand = buildSpoolCommand("CHGSPLFA", args);
+      const outQueueLibrary = requireIbmObjectName(args.outQueueLibrary, "outQueueLibrary");
+      const outQueue = requireIbmObjectName(args.outQueue, "outQueue");
+      const command = `${baseCommand} OUTQ(${outQueueLibrary}/${outQueue})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+    }
+    case "ibmi.jobs.list": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      const limit = clampNumber(args?.limit, 200, 1, 5000);
+      const rows = await queryJobs(conn, {
+        subsystem: args?.subsystem,
+        userName: args?.userName,
+        status: args?.status,
+        limit
+      });
+      return json(rows);
+    }
+    case "ibmi.jobs.hold": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const jobName = requireJobName(args.jobName);
+      const hold = Boolean(args?.holdOnJobQueue) ? "*JOBQ" : "*NO";
+      const command = `HLDJOB JOB(${quoteClString(jobName)}) HOLD(${hold})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+    }
+    case "ibmi.jobs.release": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const jobName = requireJobName(args.jobName);
+      const command = `RLSJOB JOB(${quoteClString(jobName)})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+    }
+    case "ibmi.jobs.end": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const jobName = requireJobName(args.jobName);
+      const option = String(args?.option || "*CNTRLD").toUpperCase();
+      if (option !== "*CNTRLD" && option !== "*IMMED") {
+        throw new Error("option must be *CNTRLD or *IMMED");
+      }
+      const delaySeconds = clampNumber(args?.delaySeconds, 30, 0, 99999);
+      const command = `ENDJOB JOB(${quoteClString(jobName)}) OPTION(${option}) DELAY(${delaySeconds})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+    }
+    case "ibmi.subsystems.list": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      const limit = clampNumber(args?.limit, 200, 1, 5000);
+      const rows = await querySubsystemSummary(conn, limit);
+      return json(rows);
+    }
+    case "ibmi.subsystems.status": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      const subsystem = requireIbmObjectName(args.subsystem, "subsystem");
+      const limit = clampNumber(args?.limit, 500, 1, 5000);
+      const rows = await queryJobs(conn, { subsystem, limit });
+      return json({
+        subsystem,
+        activeJobs: rows.length,
+        jobs: rows
+      });
+    }
+    case "ibmi.subsystems.start": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const subsystemDescription = requireQualifiedObject(args.subsystemDescription, "subsystemDescription");
+      const command = `STRSBS SBSD(${subsystemDescription.library}/${subsystemDescription.object})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+    }
+    case "ibmi.subsystems.end": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const subsystem = requireIbmObjectName(args.subsystem, "subsystem");
+      const option = String(args?.option || "*CNTRLD").toUpperCase();
+      if (option !== "*CNTRLD" && option !== "*IMMED") {
+        throw new Error("option must be *CNTRLD or *IMMED");
+      }
+      const delaySeconds = clampNumber(args?.delaySeconds, 30, 0, 99999);
+      const command = `ENDSBS SBS(${subsystem}) OPTION(${option}) DELAY(${delaySeconds})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+    }
+    case "ibmi.msgq.read": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      const library = requireIbmObjectName(args?.library || "QSYS", "library");
+      const messageQueue = requireIbmObjectName(args?.messageQueue || "QSYSOPR", "messageQueue");
+      const limit = clampNumber(args?.limit, 200, 1, 5000);
+      const rows = await queryMessageQueueEntries(conn, { library, messageQueue, limit });
+      return json(rows);
+    }
+    case "ibmi.msgq.send": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const library = requireIbmObjectName(args?.library || "QSYS", "library");
+      const messageQueue = requireIbmObjectName(args?.messageQueue || "QSYSOPR", "messageQueue");
+      const messageType = String(args?.messageType || "*INFO").toUpperCase();
+      if (!["*INFO", "*INQ", "*COMP", "*DIAG"].includes(messageType)) {
+        throw new Error("messageType must be *INFO, *INQ, *COMP, or *DIAG");
+      }
+      const message = String(args.message || "");
+      if (!message.trim()) throw new Error("message is required");
+      const command = `SNDPGMMSG MSG(${quoteClString(message)}) TOMSGQ(${library}/${messageQueue}) MSGTYPE(${messageType})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+    }
+    case "ibmi.msgq.reply": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const library = requireIbmObjectName(args?.library || "QSYS", "library");
+      const messageQueue = requireIbmObjectName(args?.messageQueue || "QSYSOPR", "messageQueue");
+      const messageKey = requireMessageKey(args.messageKey);
+      const reply = String(args.reply || "");
+      if (!reply.trim()) throw new Error("reply is required");
+      const command = `SNDRPY MSGKEY(${messageKey}) MSGQ(${library}/${messageQueue}) RPY(${quoteClString(reply)})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+    }
+    case "ibmi.locks.list": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      const limit = clampNumber(args?.limit, 200, 1, 5000);
+      const rows = await queryLockEntries(conn, {
+        objectLibrary: args?.objectLibrary,
+        objectName: args?.objectName,
+        objectType: args?.objectType,
+        member: args?.member,
+        limit
+      });
+      return json(rows);
+    }
+    case "ibmi.authority.object.get": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      const library = requireIbmObjectName(args.library, "library");
+      const object = requireIbmObjectName(args.object, "object");
+      const objectType = String(args?.objectType || "*FILE").toUpperCase();
+      const limit = clampNumber(args?.limit, 500, 1, 5000);
+      const rows = await queryObjectAuthorities(conn, { library, object, objectType, limit });
+      return json(rows);
+    }
+    case "ibmi.dataqueue.send": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const library = requireIbmObjectName(args.library, "library");
+      const queue = requireIbmObjectName(args.queue, "queue");
+      const message = String(args.message || "");
+      if (!message) throw new Error("message is required");
+      const command = `SNDDTAQ DTAQ(${library}/${queue}) MSG(${quoteClString(message)})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+    }
+    case "ibmi.dataqueue.receive": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      const library = requireIbmObjectName(args.library, "library");
+      const queue = requireIbmObjectName(args.queue, "queue");
+      const waitSeconds = clampNumber(args?.waitSeconds, 0, 0, 999999);
+      const remove = Boolean(args?.remove ?? true);
+      const rows = await queryDataQueueEntries(conn, { library, queue, waitSeconds, remove });
+      return json(rows);
+    }
+    case "ibmi.dataarea.read": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      const library = requireIbmObjectName(args.library, "library");
+      const dataArea = requireIbmObjectName(args.dataArea, "dataArea");
+      const rows = await queryDataAreaInfo(conn, { library, dataArea });
+      return json(rows);
+    }
+    case "ibmi.dataarea.write": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const library = requireIbmObjectName(args.library, "library");
+      const dataArea = requireIbmObjectName(args.dataArea, "dataArea");
+      const value = String(args.value || "");
+      const startPosition = clampNumber(args?.startPosition, 1, 1, 2000);
+      const length = clampNumber(args?.length, Math.max(value.length, 1), 1, 2000);
+      const command = `CHGDTAARA DTAARA(${library}/${dataArea} (${startPosition} ${length})) VALUE(${quoteClString(value)})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+    }
+    case "ibmi.audit.list": {
+      const data = await listAuditRecords({
+        limit: args?.limit,
+        tool: args?.tool,
+        status: args?.status,
+        connectionName: args?.connectionName,
+        correlationId: args?.correlationId,
+        since: args?.since
+      });
+      return json(data);
+    }
+    case "ibmi.audit.verify": {
+      const verification = await verifyAuditChain();
+      return json(verification);
+    }
+    case "ibmi.audit.export": {
+      const exported = await exportAuditRecords({
+        outputPath: String(args.outputPath),
+        format: args?.format,
+        filter: {
+          limit: args?.limit,
+          tool: args?.tool,
+          status: args?.status,
+          connectionName: args?.connectionName,
+          correlationId: args?.correlationId,
+          since: args?.since
+        }
+      });
+      return json(exported);
+    }
+    case "ibmi.audit.purge": {
+      if (!Boolean(args?.dryRun) && !Boolean(args?.approve)) {
+        throw new Error("ibmi.audit.purge requires approve=true unless dryRun=true.");
+      }
+      const purged = await purgeAuditRecords({
+        before: String(args.before),
+        dryRun: Boolean(args?.dryRun)
+      });
+      return json(purged);
+    }
+    case "ibmi.journal.objects.list": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      const data = await conn.content.getObjectList(args.library, args.types || ["*JRN", "*JRNRCV"]);
+      return json(data);
+    }
+    case "ibmi.journal.entries.query": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      const journalLibrary = requireIbmObjectName(args.journalLibrary, "journalLibrary");
+      const journal = requireIbmObjectName(args.journal, "journal");
+      const objectLibrary = args?.objectLibrary ? requireIbmObjectName(args.objectLibrary, "objectLibrary") : undefined;
+      const objectName = args?.objectName ? requireIbmObjectName(args.objectName, "objectName") : undefined;
+      const journalCode = args?.journalCode ? requireJournalCode(args.journalCode) : undefined;
+      const entryType = args?.entryType ? requireJournalEntryType(args.entryType) : undefined;
+      const userName = args?.userName ? requireIbmObjectName(args.userName, "userName") : undefined;
+      const jobName = args?.jobName ? String(args.jobName).trim().toUpperCase() : undefined;
+      const programName = args?.programName ? requireIbmObjectName(args.programName, "programName") : undefined;
+      const limit = clampNumber(args?.limit, 200, 1, 5000);
+      const sinceSequence = Number.isFinite(Number(args?.sinceSequence)) ? Number(args.sinceSequence) : undefined;
+      const sinceTimestamp = args?.sinceTimestamp ? String(args.sinceTimestamp) : undefined;
+      const rows = await queryJournalEntries(conn, {
+        journalLibrary,
+        journal,
+        objectLibrary,
+        objectName,
+        journalCode,
+        entryType,
+        userName,
+        jobName,
+        programName,
+        limit,
+        sinceSequence,
+        sinceTimestamp
+      });
+      return json(rows);
+    }
+    case "ibmi.qaudjrn.events.query": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      const journalCode = args?.journalCode ? requireJournalCode(args.journalCode) : undefined;
+      const entryType = args?.entryType ? requireJournalEntryType(args.entryType) : undefined;
+      const userName = args?.userName ? requireIbmObjectName(args.userName, "userName") : undefined;
+      const jobName = args?.jobName ? String(args.jobName).trim().toUpperCase() : undefined;
+      const programName = args?.programName ? requireIbmObjectName(args.programName, "programName") : undefined;
+      const limit = clampNumber(args?.limit, 200, 1, 5000);
+      const sinceSequence = Number.isFinite(Number(args?.sinceSequence)) ? Number(args.sinceSequence) : undefined;
+      const sinceTimestamp = args?.sinceTimestamp ? String(args.sinceTimestamp) : undefined;
+
+      const events = await queryJournalEntries(conn, {
+        journalLibrary: "QSYS",
+        journal: "QAUDJRN",
+        journalCode,
+        entryType,
+        userName,
+        jobName,
+        programName,
+        limit,
+        sinceSequence,
+        sinceTimestamp
+      });
+      return json({
+        events,
+        summary: summarizeQaudjrnEvents(events)
+      });
+    }
+    case "ibmi.journal.receiver.create": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const lib = requireIbmObjectName(args.library, "library");
+      const rcv = requireIbmObjectName(args.receiver, "receiver");
+      const threshold = clampNumber(args?.threshold, 1000000, 1, 1000000000);
+      const command = `CRTJRNRCV JRNRCV(${lib}/${rcv}) THRESHOLD(${threshold})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({
+        ok: cmdResult.code === 0,
+        command,
+        ...cmdResult
+      });
+    }
+    case "ibmi.journal.create": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const lib = requireIbmObjectName(args.library, "library");
+      const jrn = requireIbmObjectName(args.journal, "journal");
+      const rcvLib = requireIbmObjectName(args.receiverLibrary, "receiverLibrary");
+      const rcv = requireIbmObjectName(args.receiver, "receiver");
+      const command = `CRTJRN JRN(${lib}/${jrn}) JRNRCV(${rcvLib}/${rcv})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({
+        ok: cmdResult.code === 0,
+        command,
+        ...cmdResult
+      });
+    }
+    case "ibmi.journal.receiver.change": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const jrnLib = requireIbmObjectName(args.journalLibrary, "journalLibrary");
+      const jrn = requireIbmObjectName(args.journal, "journal");
+      const rcvLib = requireIbmObjectName(args.receiverLibrary, "receiverLibrary");
+      const rcv = requireIbmObjectName(args.receiver, "receiver");
+      const command = `CHGJRN JRN(${jrnLib}/${jrn}) JRNRCV(${rcvLib}/${rcv})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({
+        ok: cmdResult.code === 0,
+        command,
+        ...cmdResult
+      });
+    }
+    case "ibmi.journal.startPf": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const lib = requireIbmObjectName(args.library, "library");
+      const file = requireIbmObjectName(args.file, "file");
+      const jrnLib = requireIbmObjectName(args.journalLibrary, "journalLibrary");
+      const jrn = requireIbmObjectName(args.journal, "journal");
+      const images = String(args?.images || "*BOTH").toUpperCase();
+      if (images !== "*AFTER" && images !== "*BOTH") {
+        throw new Error("images must be *AFTER or *BOTH");
+      }
+      const command = `STRJRNPF FILE(${lib}/${file}) JRN(${jrnLib}/${jrn}) IMAGES(${images})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({
+        ok: cmdResult.code === 0,
+        command,
+        ...cmdResult
+      });
+    }
+    case "ibmi.journal.endPf": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const lib = requireIbmObjectName(args.library, "library");
+      const file = requireIbmObjectName(args.file, "file");
+      const command = `ENDJRNPF FILE(${lib}/${file})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({
+        ok: cmdResult.code === 0,
+        command,
+        ...cmdResult
+      });
+    }
+    case "ibmi.journal.startIfs": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const objectType = requireIfsJournalObjectType(args?.objectType);
+      const journalLibrary = requireIbmObjectName(args.journalLibrary, "journalLibrary");
+      const journal = requireIbmObjectName(args.journal, "journal");
+      const objectPath = requireIfsPath(args.path, "path");
+      const command = `STRJRNOBJ OBJ((${quoteClString(objectPath)} ${objectType})) JRN(${journalLibrary}/${journal})`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({
+        ok: cmdResult.code === 0,
+        command,
+        ...cmdResult
+      });
+    }
+    case "ibmi.journal.endIfs": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const objectType = requireIfsJournalObjectType(args?.objectType);
+      const objectPath = requireIfsPath(args.path, "path");
+      const command = `ENDJRNOBJ OBJ((${quoteClString(objectPath)} ${objectType}))`;
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return json({
+        ok: cmdResult.code === 0,
+        command,
+        ...cmdResult
+      });
+    }
+    case "ibmi.journal.receivers.retention": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      const journalLibrary = requireIbmObjectName(args.journalLibrary, "journalLibrary");
+      const journal = requireIbmObjectName(args.journal, "journal");
+      const retentionDays = clampNumber(args?.retentionDays, 30, 1, 36500);
+      const maxDeletes = clampNumber(args?.maxDeletes, 50, 1, 500);
+      const dryRun = Boolean(args?.dryRun);
+      if (!dryRun && !Boolean(args?.approve)) {
+        throw new Error("ibmi.journal.receivers.retention requires approve=true unless dryRun=true.");
+      }
+
+      const plan = await planJournalReceiverRetention(conn, {
+        journalLibrary,
+        journal,
+        retentionDays
+      });
+      const candidates = plan.candidates.slice(0, maxDeletes);
+      if (dryRun || candidates.length === 0) {
+        return json({
+          ok: true,
+          dryRun,
+          retentionDays,
+          maxDeletes,
+          totalCandidates: plan.candidates.length,
+          candidates
+        });
+      }
+
+      enforceWritable(ctx, conn, "qsys.write", args);
+      const deleted: Array<{ receiverLibrary: string; receiver: string; ok: boolean; error?: string }> = [];
+      for (const candidate of candidates) {
+        const command = `DLTJRNRCV JRNRCV(${candidate.receiverLibrary}/${candidate.receiver}) DLTOPT(*IGNINQMSG)`;
+        const result = await runClCommand(conn, command, "ile", undefined, 45000);
+        deleted.push({
+          receiverLibrary: candidate.receiverLibrary,
+          receiver: candidate.receiver,
+          ok: result.code === 0,
+          error: result.code === 0 ? undefined : String(result.stderr || "")
+        });
+      }
+
+      return json({
+        ok: deleted.every(item => item.ok),
+        dryRun: false,
+        retentionDays,
+        maxDeletes,
+        totalCandidates: plan.candidates.length,
+        deleted
+      });
+    }
+    case "ibmi.compliance.report.generate": {
+      const conn = await ctx.ensureActive(args?.connectionName);
+      const preset = String(args?.preset || "phase6_baseline");
+      const sinceTimestamp = args?.sinceTimestamp ? String(args.sinceTimestamp) : undefined;
+      const auditLimit = clampNumber(args?.auditLimit, 1000, 1, 10000);
+      const qaudLimit = clampNumber(args?.qaudLimit, 1000, 1, 10000);
+      const includeRaw = Boolean(args?.includeRaw);
+      const report = await buildComplianceReport(conn, {
+        preset,
+        sinceTimestamp,
+        auditLimit,
+        qaudLimit,
+        includeRaw
+      });
+
+      if (!args?.outputPath) {
+        return json(report);
+      }
+
+      const outputPath = path.resolve(String(args.outputPath));
+      await fs.mkdir(path.dirname(outputPath), { recursive: true });
+      await fs.writeFile(outputPath, JSON.stringify(report, null, 2), "utf8");
+
+      let signaturePath: string | undefined;
+      let digestPath: string | undefined;
+      let signature: string | undefined;
+      if (Boolean(args?.sign)) {
+        const signingKey = String(args?.signingKey || process.env.MCP_FOR_I_EVIDENCE_SIGNING_KEY || "");
+        if (!signingKey) {
+          throw new Error("sign=true requires signingKey or MCP_FOR_I_EVIDENCE_SIGNING_KEY.");
+        }
+        const payload = JSON.stringify(report);
+        signature = signEvidencePayload(payload, signingKey);
+        signaturePath = `${outputPath}.sig`;
+        digestPath = `${outputPath}.sha256`;
+        await fs.writeFile(signaturePath, `${signature}\n`, "utf8");
+        await fs.writeFile(digestPath, `${sha256Hex(payload)}\n`, "utf8");
+      }
+
+      return json({
+        ok: true,
+        preset,
+        outputPath,
+        signed: Boolean(args?.sign),
+        signaturePath,
+        digestPath,
+        signature
+      });
+    }
+    case "ibmi.tn5250.connect": {
+      const name = getConnectionName(ctx, args);
+      await ctx.ensureActive(name);
+      const session = ensureTn5250Session(name);
+      appendTn5250Message(session, `Session ready for ${name}.`);
+      return json(session.screen);
+    }
+    case "ibmi.tn5250.readScreen": {
+      const session = requireTn5250Session(ctx, args);
+      return json(session.screen);
+    }
+    case "ibmi.tn5250.setField": {
+      const session = requireTn5250Session(ctx, args);
+      const field = findTn5250Field(session, args.fieldId);
+      if (!field) throw new Error(`TN5250 field not found: ${args.fieldId}`);
+      if (field.protected) throw new Error(`TN5250 field is protected: ${field.id}`);
+      const value = String(args.value || "");
+      field.value = value.length > field.length ? value.substring(0, field.length) : value;
+      touchTn5250Session(session);
+      return json(session.screen);
+    }
+    case "ibmi.tn5250.sendKeys": {
+      const session = requireTn5250Session(ctx, args);
+      const conn = await ctx.ensureActive(session.connectionName);
+      const keys = parseTn5250Keys(args.keys);
+      const timeoutMs = clampNumber(args?.timeoutMs, 45000, 1000, 300000);
+      const commandField = findTn5250Field(session, "command");
+
+      session.screen.lastKeys = keys;
+      session.screen.status = "busy";
+      touchTn5250Session(session);
+
+      for (const key of keys) {
+        if (key === "ENTER" || key === "RETURN") {
+          const command = String(commandField?.value || "").trim();
+          if (!command) {
+            appendTn5250Message(session, "No command entered.");
+            continue;
+          }
+
+          enforcePolicyOperation(ctx, "cl.run", {
+            ...args,
+            command,
+            connectionName: session.connectionName
+          });
+
+          const cmdResult = await runClCommand(conn, command, "ile", undefined, timeoutMs);
+          const recent = await readRecentJoblogMessages(conn, 5);
+          const messages = recent.map((row: any) => {
+            const id = String(row.MESSAGE_ID || "");
+            const text = String(row.MESSAGE_TEXT || "");
+            return id ? `[${id}] ${text}` : text;
+          });
+
+          session.screen.commandHistory.unshift({
+            at: new Date().toISOString(),
+            command,
+            ok: cmdResult.code === 0,
+            code: cmdResult.code,
+            stderr: cmdResult.stderr ? String(cmdResult.stderr) : undefined,
+            messages: messages.slice(0, 5)
+          });
+          if (session.screen.commandHistory.length > TN5250_MAX_HISTORY) {
+            session.screen.commandHistory = session.screen.commandHistory.slice(0, TN5250_MAX_HISTORY);
+          }
+
+          appendTn5250Message(session, `${cmdResult.code === 0 ? "OK" : "ERROR"}: ${command}`);
+          for (const line of messages.slice(0, 3)) {
+            appendTn5250Message(session, line);
+          }
+          if (commandField) commandField.value = "";
+          continue;
+        }
+
+        if (key === "CLEAR" || key === "F3" || key === "F12") {
+          resetTn5250Screen(session, `Cleared via ${key}.`);
+          continue;
+        }
+
+        if (key === "TAB") {
+          rotateTn5250Cursor(session);
+          continue;
+        }
+
+        appendTn5250Message(session, `Unsupported key: ${key}`);
+      }
+
+      session.screen.status = "ready";
+      touchTn5250Session(session);
+      return json(session.screen);
+    }
+    case "ibmi.tn5250.waitFor": {
+      const session = requireTn5250Session(ctx, args);
+      const timeoutMs = clampNumber(args?.timeoutMs, 5000, 250, 120000);
+      const pattern = args?.text ? String(args.text) : "";
+      if (!pattern) {
+        return json({ matched: true, timeoutMs, screen: session.screen });
+      }
+      const matched = await waitForTn5250Text(session, pattern, timeoutMs);
+      return json({ matched, text: pattern, timeoutMs, screen: session.screen });
+    }
+    case "ibmi.tn5250.snapshot": {
+      const session = requireTn5250Session(ctx, args);
+      return json({
+        capturedAt: new Date().toISOString(),
+        connectionName: session.connectionName,
+        plainText: renderTn5250Screen(session.screen),
+        screen: session.screen
+      });
+    }
     case "ibmi.tn5250.disconnect": {
-      throw new Error("TN5250 engine is not implemented yet in this build.");
+      const name = resolveTn5250SessionName(ctx, args);
+      if (!name) throw new Error("connectionName is required (no active session)");
+      const existed = tn5250Sessions.delete(name);
+      return json({ disconnected: existed, connectionName: name });
     }
   }
 
@@ -1412,6 +2609,540 @@ async function resolveAction(ctx: McpContext, args: any): Promise<Action | undef
   if (!args.actionName) return undefined;
   const actions = await listActions(ctx);
   return actions.find(a => a.name === args.actionName);
+}
+
+type ClCommandResult = {
+  code: number;
+  signal?: string | null;
+  stdout: string;
+  stderr: string;
+  command?: string;
+  [key: string]: unknown;
+};
+
+async function runClCommand(conn: any, command: string, environment: string, cwd: string | undefined, timeoutMs: number): Promise<ClCommandResult> {
+  if (environment === "pase") {
+    return await withTimeout(
+      conn.sendCommand({ command, directory: cwd }),
+      timeoutMs,
+      `CL command timed out after ${timeoutMs}ms`
+    ) as ClCommandResult;
+  }
+  if (environment === "qsh") {
+    return await withTimeout(
+      conn.sendQsh({ command, directory: cwd }),
+      timeoutMs,
+      `CL command timed out after ${timeoutMs}ms`
+    ) as ClCommandResult;
+  }
+
+  try {
+    await withTimeout(
+      conn.runSQL(`CALL QSYS2.QCMDEXC(${Tools.sqlString(command)})`),
+      timeoutMs,
+      `CL command timed out after ${timeoutMs}ms`
+    );
+    return { code: 0, signal: null, stdout: "", stderr: "", command };
+  } catch (err: any) {
+    return { code: 1, signal: null, stdout: "", stderr: err?.message || String(err), command };
+  }
+}
+
+async function readRecentJoblogMessages(conn: any, limit: number) {
+  try {
+    const capped = clampNumber(limit, 5, 1, 20);
+    return await conn.runSQL(
+      `select message_id, message_text, severity, message_timestamp from table(qsys2.joblog_info('*')) order by message_timestamp desc fetch first ${capped} rows only`
+    );
+  } catch {
+    return [];
+  }
+}
+
+type JournalQueryOptions = {
+  journalLibrary: string;
+  journal: string;
+  objectLibrary?: string;
+  objectName?: string;
+  journalCode?: string;
+  entryType?: string;
+  userName?: string;
+  jobName?: string;
+  programName?: string;
+  limit: number;
+  sinceSequence?: number;
+  sinceTimestamp?: string;
+};
+
+async function queryJournalEntries(conn: any, options: JournalQueryOptions) {
+  let rows: Array<Record<string, unknown>>;
+  try {
+    rows = await queryJournalEntriesViaDisplayJournal(conn, options);
+  } catch {
+    rows = await queryJournalEntriesViaOutfile(conn, options);
+  }
+
+  let normalized = rows.map(normalizeJournalEntry);
+  if (options.objectLibrary) {
+    normalized = normalized.filter(row => (row.objectLibrary || "") === options.objectLibrary);
+  }
+  if (options.objectName) {
+    normalized = normalized.filter(row => (row.objectName || "") === options.objectName);
+  }
+  if (options.journalCode) {
+    normalized = normalized.filter(row => (row.journalCode || "") === options.journalCode);
+  }
+  if (options.entryType) {
+    normalized = normalized.filter(row => (row.entryType || "") === options.entryType);
+  }
+  if (options.userName) {
+    normalized = normalized.filter(row => (row.userName || "") === options.userName);
+  }
+  if (options.jobName) {
+    normalized = normalized.filter(row => (row.jobName || "").includes(options.jobName!));
+  }
+  if (options.programName) {
+    normalized = normalized.filter(row => (row.programName || "") === options.programName);
+  }
+  if (typeof options.sinceSequence === "number") {
+    normalized = normalized.filter(row => typeof row.sequence === "number" && row.sequence >= options.sinceSequence!);
+  }
+  if (options.sinceTimestamp) {
+    const cutoff = Date.parse(options.sinceTimestamp);
+    if (Number.isFinite(cutoff)) {
+      normalized = normalized.filter(row => {
+        if (!row.timestamp) return false;
+        const value = Date.parse(row.timestamp);
+        return Number.isFinite(value) && value >= cutoff;
+      });
+    }
+  }
+
+  normalized.sort((a, b) => {
+    const aSeq = typeof a.sequence === "number" ? a.sequence : -1;
+    const bSeq = typeof b.sequence === "number" ? b.sequence : -1;
+    if (aSeq !== bSeq) return bSeq - aSeq;
+    const aTs = a.timestamp ? Date.parse(a.timestamp) : -1;
+    const bTs = b.timestamp ? Date.parse(b.timestamp) : -1;
+    return bTs - aTs;
+  });
+
+  return normalized.slice(0, options.limit);
+}
+
+type JobQueryOptions = {
+  subsystem?: string;
+  userName?: string;
+  status?: string;
+  limit: number;
+};
+
+async function queryJobs(conn: any, options: JobQueryOptions) {
+  const base = await conn.runSQL(`select * from table(qsys2.active_job_info()) fetch first ${Math.min(options.limit * 5, 5000)} rows only`);
+  let rows = base.map((row: any) => normalizeActiveJobRow(row));
+  if (options.subsystem) {
+    const subsystem = String(options.subsystem).trim().toUpperCase();
+    rows = rows.filter((row: any) => (row.subsystem || "") === subsystem);
+  }
+  if (options.userName) {
+    const userName = String(options.userName).trim().toUpperCase();
+    rows = rows.filter((row: any) => (row.userName || "") === userName);
+  }
+  if (options.status) {
+    const status = String(options.status).trim().toUpperCase();
+    rows = rows.filter((row: any) => (row.status || "").includes(status));
+  }
+  return rows.slice(0, options.limit);
+}
+
+async function querySubsystemSummary(conn: any, limit: number) {
+  const jobs = await queryJobs(conn, { limit: 5000 });
+  const counts = new Map<string, number>();
+  for (const job of jobs) {
+    const subsystem = String(job.subsystem || "").trim().toUpperCase() || "UNKNOWN";
+    counts.set(subsystem, (counts.get(subsystem) || 0) + 1);
+  }
+  const rows = Array.from(counts.entries())
+    .map(([subsystem, activeJobs]) => ({ subsystem, activeJobs }))
+    .sort((a, b) => a.subsystem.localeCompare(b.subsystem));
+  return rows.slice(0, limit);
+}
+
+function normalizeActiveJobRow(row: Record<string, unknown>) {
+  return {
+    source: "job",
+    jobName: toNullableString(pickFirst(row, ["JOB_NAME", "QUALIFIED_JOB_NAME", "JOB"])),
+    subsystem: toNullableString(pickFirst(row, ["SUBSYSTEM", "SUBSYSTEM_NAME"])),
+    status: toNullableString(pickFirst(row, ["JOB_STATUS", "STATUS"])),
+    function: toNullableString(pickFirst(row, ["FUNCTION", "CURRENT_FUNCTION"])),
+    userName: toNullableString(pickFirst(row, ["AUTHORIZATION_NAME", "USER_NAME", "CURRENT_USER"])),
+    type: toNullableString(pickFirst(row, ["JOB_TYPE", "TYPE"])),
+    cpuSeconds: toNullableNumber(pickFirst(row, ["CPU_TIME", "TOTAL_CPU_TIME", "ELAPSED_TOTAL_SECONDS"]))
+  };
+}
+
+type MessageQueueOptions = {
+  library: string;
+  messageQueue: string;
+  limit: number;
+};
+
+async function queryMessageQueueEntries(conn: any, options: MessageQueueOptions) {
+  let rows: Array<Record<string, unknown>>;
+  try {
+    rows = await conn.runSQL(
+      `select * from table(qsys2.message_queue_info(message_queue_name => ${Tools.sqlString(options.messageQueue)}, message_queue_library => ${Tools.sqlString(options.library)})) fetch first ${options.limit} rows only`
+    );
+  } catch {
+    rows = await conn.runSQL(
+      `select * from qsys2.message_queue_info where upper(message_queue_name)=${Tools.sqlString(options.messageQueue)} and upper(message_queue_library)=${Tools.sqlString(options.library)} fetch first ${options.limit} rows only`
+    );
+  }
+  return rows.map(normalizeMessageQueueEntry);
+}
+
+function normalizeMessageQueueEntry(row: Record<string, unknown>) {
+  return {
+    source: "msgq",
+    messageKey: toNullableString(pickFirst(row, ["MESSAGE_KEY", "MSGKEY"])),
+    messageId: toNullableString(pickFirst(row, ["MESSAGE_ID", "MSGID"])),
+    messageType: toNullableString(pickFirst(row, ["MESSAGE_TYPE", "MSGTYPE"])),
+    severity: toNullableNumber(pickFirst(row, ["SEVERITY", "MSGSEV"])),
+    text: toNullableString(pickFirst(row, ["MESSAGE_TEXT", "MSGTEXT"])),
+    senderUser: toNullableString(pickFirst(row, ["FROM_USER", "FROM_USER_PROFILE", "SENDER_USER_PROFILE"])),
+    sentAt: toNullableString(pickFirst(row, ["MESSAGE_TIMESTAMP", "SENT_TIMESTAMP"]))
+  };
+}
+
+type LockQueryOptions = {
+  objectLibrary?: string;
+  objectName?: string;
+  objectType?: string;
+  member?: string;
+  limit: number;
+};
+
+async function queryLockEntries(conn: any, options: LockQueryOptions) {
+  let rows: Array<Record<string, unknown>>;
+  try {
+    rows = await conn.runSQL(`select * from table(qsys2.object_lock_info()) fetch first ${Math.min(options.limit * 5, 5000)} rows only`);
+  } catch {
+    rows = await conn.runSQL(`select * from qsys2.object_lock_info fetch first ${Math.min(options.limit * 5, 5000)} rows only`);
+  }
+  let normalized = rows.map(normalizeLockEntry);
+  if (options.objectLibrary) normalized = normalized.filter(row => (row.objectLibrary || "") === String(options.objectLibrary).toUpperCase());
+  if (options.objectName) normalized = normalized.filter(row => (row.objectName || "") === String(options.objectName).toUpperCase());
+  if (options.objectType) normalized = normalized.filter(row => (row.objectType || "") === String(options.objectType).toUpperCase());
+  if (options.member) normalized = normalized.filter(row => (row.member || "") === String(options.member).toUpperCase());
+  return normalized.slice(0, options.limit);
+}
+
+function normalizeLockEntry(row: Record<string, unknown>) {
+  return {
+    source: "lock",
+    objectLibrary: toNullableString(pickFirst(row, ["OBJECT_SCHEMA", "OBJECT_LIBRARY", "OBJLIB"])),
+    objectName: toNullableString(pickFirst(row, ["OBJECT_NAME", "OBJNAME"])),
+    objectType: toNullableString(pickFirst(row, ["OBJECT_TYPE", "OBJTYPE"])),
+    member: toNullableString(pickFirst(row, ["MEMBER_NAME", "MEMBER"])),
+    lockState: toNullableString(pickFirst(row, ["LOCK_STATE", "LOCK_STATUS", "STATUS"])),
+    lockScope: toNullableString(pickFirst(row, ["LOCK_SCOPE", "SCOPE"])),
+    lockHolderJob: toNullableString(pickFirst(row, ["JOB_NAME", "LOCK_JOB_NAME"])),
+    lockHolderUser: toNullableString(pickFirst(row, ["USER_NAME", "AUTHORIZATION_NAME"]))
+  };
+}
+
+type ObjectAuthorityOptions = {
+  library: string;
+  object: string;
+  objectType: string;
+  limit: number;
+};
+
+async function queryObjectAuthorities(conn: any, options: ObjectAuthorityOptions) {
+  const rows = await conn.runSQL(
+    `select * from qsys2.object_privileges where upper(object_schema)=${Tools.sqlString(options.library)} and upper(object_name)=${Tools.sqlString(options.object)} fetch first ${options.limit} rows only`
+  );
+  let normalized = rows.map(normalizeObjectAuthorityRow);
+  if (options.objectType) {
+    normalized = normalized.filter((row: any) => !row.objectType || row.objectType === options.objectType);
+  }
+  return normalized;
+}
+
+function normalizeObjectAuthorityRow(row: Record<string, unknown>) {
+  return {
+    source: "authority",
+    objectLibrary: toNullableString(pickFirst(row, ["OBJECT_SCHEMA", "OBJECT_LIBRARY"])),
+    objectName: toNullableString(pickFirst(row, ["OBJECT_NAME"])),
+    objectType: toNullableString(pickFirst(row, ["OBJECT_TYPE"])),
+    grantee: toNullableString(pickFirst(row, ["GRANTEE", "AUTHORIZATION_NAME"])),
+    grantor: toNullableString(pickFirst(row, ["GRANTOR"])),
+    authority: toNullableString(pickFirst(row, ["OBJECT_AUTHORITY", "DATA_AUTHORITY", "PRIVILEGE_TYPE"])),
+    inherited: toNullableString(pickFirst(row, ["IS_GRANTABLE", "INHERITED"])),
+    raw: row
+  };
+}
+
+type DataQueueReceiveOptions = {
+  library: string;
+  queue: string;
+  waitSeconds: number;
+  remove: boolean;
+};
+
+async function queryDataQueueEntries(conn: any, options: DataQueueReceiveOptions) {
+  let rows: Array<Record<string, unknown>>;
+  try {
+    rows = await conn.runSQL(
+      `select * from table(qsys2.receive_data_queue(data_queue_library => ${Tools.sqlString(options.library)}, data_queue_name => ${Tools.sqlString(options.queue)}, wait_time => ${options.waitSeconds}, remove_message => ${Tools.sqlString(options.remove ? "YES" : "NO")})) fetch first 1 rows only`
+    );
+  } catch {
+    rows = await conn.runSQL(
+      `select * from table(qsys2.data_queue_entries(data_queue_library => ${Tools.sqlString(options.library)}, data_queue_name => ${Tools.sqlString(options.queue)})) fetch first 1 rows only`
+    );
+  }
+  return rows.map(normalizeDataQueueEntry);
+}
+
+function normalizeDataQueueEntry(row: Record<string, unknown>) {
+  return {
+    source: "dataqueue",
+    message: toNullableString(pickFirst(row, ["MESSAGE_DATA", "DATA_QUEUE_ENTRY", "DATA"])),
+    sender: toNullableString(pickFirst(row, ["SENDER_JOB_NAME", "SENDER_USER_PROFILE"])),
+    sentAt: toNullableString(pickFirst(row, ["ENQUEUE_TIMESTAMP", "TIMESTAMP"])),
+    key: toNullableString(pickFirst(row, ["KEY_DATA", "KEY"]))
+  };
+}
+
+type DataAreaReadOptions = {
+  library: string;
+  dataArea: string;
+};
+
+async function queryDataAreaInfo(conn: any, options: DataAreaReadOptions) {
+  let rows: Array<Record<string, unknown>>;
+  try {
+    rows = await conn.runSQL(
+      `select * from table(qsys2.data_area_info(data_area_name => ${Tools.sqlString(options.dataArea)}, data_area_library => ${Tools.sqlString(options.library)}))`
+    );
+  } catch {
+    rows = await conn.runSQL(
+      `select * from qsys2.data_area_info where upper(data_area_name)=${Tools.sqlString(options.dataArea)} and upper(data_area_library)=${Tools.sqlString(options.library)}`
+    );
+  }
+  return rows.map(normalizeDataAreaInfoRow);
+}
+
+function normalizeDataAreaInfoRow(row: Record<string, unknown>) {
+  return {
+    source: "dataarea",
+    library: toNullableString(pickFirst(row, ["DATA_AREA_LIBRARY", "OBJECT_SCHEMA"])),
+    dataArea: toNullableString(pickFirst(row, ["DATA_AREA_NAME", "OBJECT_NAME"])),
+    type: toNullableString(pickFirst(row, ["DATA_AREA_TYPE", "OBJECT_TYPE"])),
+    length: toNullableNumber(pickFirst(row, ["LENGTH", "DATA_AREA_LENGTH"])),
+    value: toNullableString(pickFirst(row, ["CHARACTER_VALUE", "VALUE", "DECIMAL_VALUE"])),
+    updatedAt: toNullableString(pickFirst(row, ["LAST_CHANGED_TIMESTAMP", "CHANGE_TIMESTAMP"]))
+  };
+}
+
+function buildSpoolCommand(commandName: string, args: any) {
+  const jobName = requireJobName(args.jobName);
+  const spooledFileName = requireIbmObjectName(args.spooledFileName, "spooledFileName");
+  const spooledFileNumber = clampNumber(args.spooledFileNumber, 1, 1, 999999999);
+  return `${commandName} FILE(${spooledFileName}) JOB(${quoteClString(jobName)}) SPLNBR(${spooledFileNumber})`;
+}
+
+async function queryJournalEntriesViaDisplayJournal(conn: any, options: JournalQueryOptions) {
+  const sampleSize = Math.min(options.limit * 5, 5000);
+  const rows = await conn.runSQL(
+    `select * from table(qsys2.display_journal(journal_name => ${Tools.sqlString(options.journal)}, journal_library => ${Tools.sqlString(options.journalLibrary)})) fetch first ${sampleSize} rows only`
+  );
+  return rows as Array<Record<string, unknown>>;
+}
+
+async function queryJournalEntriesViaOutfile(conn: any, options: JournalQueryOptions) {
+  const outfile = `MCPJ${String(Math.floor(Math.random() * 90000) + 10000)}`;
+  const fileFilter = options.objectLibrary && options.objectName
+    ? ` FILE((${options.objectLibrary}/${options.objectName}))`
+    : "";
+  const command = `DSPJRN JRN(${options.journalLibrary}/${options.journal}) OUTPUT(*OUTFILE) OUTFILE(QTEMP/${outfile})${fileFilter}`;
+  const result = await runClCommand(conn, command, "ile", undefined, 45000);
+  if (result.code !== 0) {
+    throw new Error(result.stderr || "Unable to query journal entries");
+  }
+  const rows = await conn.runSQL(`select * from QTEMP.${outfile}`);
+  return rows as Array<Record<string, unknown>>;
+}
+
+function normalizeJournalEntry(row: Record<string, unknown>) {
+  const sequence = toNullableNumber(pickFirst(row, ["SEQUENCE_NUMBER", "JOURNAL_SEQUENCE_NUMBER", "JOSEQN", "JRN_SEQUENCE"]));
+  const timestamp = toNullableString(pickFirst(row, ["ENTRY_TIMESTAMP", "TIMESTAMP", "JOTSTP", "JOURNAL_TIMESTAMP"]));
+  const journalCode = toNullableString(pickFirst(row, ["JOURNAL_CODE", "JOCODE", "JRN_CODE"]));
+  const entryType = toNullableString(pickFirst(row, ["JOURNAL_ENTRY_TYPE", "JOENTT", "ENTRY_TYPE"]));
+  const objectLibrary = toNullableString(pickFirst(row, ["OBJECT_LIBRARY", "JOLIB", "OBJLIB"]));
+  const objectName = toNullableString(pickFirst(row, ["OBJECT_NAME", "JOOBJ", "OBJNAME"]));
+  const objectType = toNullableString(pickFirst(row, ["OBJECT_TYPE", "JOOBJT", "OBJTYPE"]));
+  const jobName = toNullableString(pickFirst(row, ["JOB_NAME", "JOJOB", "JOB"]));
+  const userName = toNullableString(pickFirst(row, ["USER_NAME", "JOUSER", "USER"]));
+  const programName = toNullableString(pickFirst(row, ["PROGRAM_NAME", "JOPGM", "PROGRAM"]));
+  return {
+    source: "journal",
+    sequence,
+    timestamp,
+    journalCode,
+    entryType,
+    objectLibrary,
+    objectName,
+    objectType,
+    jobName,
+    userName,
+    programName
+  };
+}
+
+function pickFirst(row: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    if (typeof row[key] !== "undefined" && row[key] !== null) return row[key];
+  }
+  return undefined;
+}
+
+function toNullableNumber(value: unknown) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function toNullableString(value: unknown) {
+  if (typeof value === "undefined" || value === null) return null;
+  const text = String(value).trim();
+  return text.length > 0 ? text : null;
+}
+
+function ensureTn5250Session(connectionName: string): Tn5250Session {
+  const existing = tn5250Sessions.get(connectionName);
+  if (existing) {
+    touchTn5250Session(existing);
+    return existing;
+  }
+
+  const now = new Date().toISOString();
+  const session: Tn5250Session = {
+    connectionName,
+    createdAt: Date.now(),
+    screen: {
+      sessionId: `tn5250:${connectionName}`,
+      connectionName,
+      title: "MCP TN5250 Command Session",
+      status: "ready",
+      textLines: [
+        `Connected to ${connectionName}.`,
+        "Set field 'command' (or fieldId '1') and send Enter.",
+        "Supported keys: Enter, Tab, F3, F12, Clear."
+      ],
+      fields: [
+        {
+          id: "command",
+          label: "Command",
+          value: "",
+          row: 20,
+          col: 2,
+          length: 512,
+          protected: false
+        }
+      ],
+      cursorFieldId: "command",
+      lastKeys: [],
+      commandHistory: [],
+      updatedAt: now
+    }
+  };
+  tn5250Sessions.set(connectionName, session);
+  return session;
+}
+
+function requireTn5250Session(ctx: McpContext, args: any): Tn5250Session {
+  const name = resolveTn5250SessionName(ctx, args);
+  if (!name) throw new Error("connectionName is required (no active session)");
+  const session = tn5250Sessions.get(name);
+  if (!session) {
+    throw new Error(`TN5250 session for ${name} not found. Call ibmi.tn5250.connect first.`);
+  }
+  return session;
+}
+
+function resolveTn5250SessionName(ctx: McpContext, args: any) {
+  return args?.connectionName || ctx.activeName;
+}
+
+function findTn5250Field(session: Tn5250Session, fieldId: string): Tn5250Field | undefined {
+  const normalized = String(fieldId || "").trim().toLowerCase();
+  if (!normalized) return undefined;
+  const aliases = normalized === "1" ? ["command", "1"] : [normalized];
+  return session.screen.fields.find(field => {
+    const id = field.id.toLowerCase();
+    return aliases.includes(id);
+  });
+}
+
+function parseTn5250Keys(value: string) {
+  const raw = String(value || "").trim();
+  if (!raw) throw new Error("keys is required");
+  return raw
+    .split(/[,\s+]+/)
+    .map(part => part.trim().toUpperCase())
+    .filter(Boolean);
+}
+
+function touchTn5250Session(session: Tn5250Session) {
+  session.screen.updatedAt = new Date().toISOString();
+  tn5250Sessions.set(session.connectionName, session);
+}
+
+function appendTn5250Message(session: Tn5250Session, message: string) {
+  session.screen.textLines.unshift(message);
+  if (session.screen.textLines.length > TN5250_MAX_LINES) {
+    session.screen.textLines = session.screen.textLines.slice(0, TN5250_MAX_LINES);
+  }
+  touchTn5250Session(session);
+}
+
+function resetTn5250Screen(session: Tn5250Session, message: string) {
+  const commandField = findTn5250Field(session, "command");
+  if (commandField) commandField.value = "";
+  session.screen.textLines = [message, `Connected to ${session.connectionName}.`];
+  session.screen.cursorFieldId = "command";
+  session.screen.lastKeys = [];
+  touchTn5250Session(session);
+}
+
+function rotateTn5250Cursor(session: Tn5250Session) {
+  const fields = session.screen.fields;
+  if (fields.length === 0) return;
+  const idx = fields.findIndex(field => field.id === session.screen.cursorFieldId);
+  const next = idx >= 0 ? (idx + 1) % fields.length : 0;
+  session.screen.cursorFieldId = fields[next].id;
+  touchTn5250Session(session);
+}
+
+async function waitForTn5250Text(session: Tn5250Session, text: string, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  const needle = String(text).toLowerCase();
+  while (Date.now() <= deadline) {
+    const haystack = renderTn5250Screen(session.screen).toLowerCase();
+    if (haystack.includes(needle)) return true;
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+  return false;
+}
+
+function renderTn5250Screen(screen: Tn5250Screen) {
+  const lines: string[] = [];
+  lines.push(`${screen.title} (${screen.status})`);
+  lines.push(...screen.textLines);
+  for (const field of screen.fields) {
+    lines.push(`${field.label}[${field.id}]=${field.value}`);
+  }
+  return lines.join("\n");
 }
 
 function rejectCredentialArgs(args: any, toolName: string) {
@@ -1463,6 +3194,37 @@ function requireQsysName(conn: any, value: unknown, label: string) {
   if (!raw) throw new Error(`${label} is required`);
   if (!conn.validQsysName(raw)) throw new Error(`Invalid ${label}: ${raw}`);
   return raw;
+}
+
+function requireJobName(value: unknown) {
+  const jobName = String(value || "").trim().toUpperCase();
+  if (!jobName) throw new Error("jobName is required");
+  if (!/^[A-Z0-9#@$*._-]+\/[A-Z0-9#@$*._-]+\/[A-Z0-9#@$*._-]+$/.test(jobName)) {
+    throw new Error(`Invalid jobName: ${value}`);
+  }
+  return jobName;
+}
+
+function requireQualifiedObject(value: unknown, label: string) {
+  const raw = String(value || "").trim().toUpperCase();
+  if (!raw) throw new Error(`${label} is required`);
+  const parts = raw.split("/");
+  if (parts.length !== 2) {
+    throw new Error(`Invalid ${label}: expected LIB/OBJECT format`);
+  }
+  return {
+    library: requireIbmObjectName(parts[0], `${label} library`),
+    object: requireIbmObjectName(parts[1], `${label} object`)
+  };
+}
+
+function requireMessageKey(value: unknown) {
+  const messageKey = String(value || "").trim().toUpperCase();
+  if (!messageKey) throw new Error("messageKey is required");
+  if (!/^[0-9A-F]{4,32}$/.test(messageKey)) {
+    throw new Error(`Invalid messageKey: ${value}`);
+  }
+  return messageKey;
 }
 
 async function updateConnectionSettings(ctx: McpContext, name: string, update: Record<string, any>) {
@@ -1866,6 +3628,209 @@ function enforcePolicyOperation(ctx: McpContext, operation: string, args: any) {
   }
 }
 
+function isMissingColumnError(err: any, column: string) {
+  const message = String(err?.message || err || "").toUpperCase();
+  return message.includes("42703") && message.includes(column.toUpperCase());
+}
+
+function requireIfsPath(value: unknown, label: string) {
+  const pathValue = String(value || "").trim();
+  if (!pathValue.startsWith("/")) {
+    throw new Error(`Invalid ${label}: must be an absolute IFS path`);
+  }
+  if (pathValue.includes("\n") || pathValue.includes("\r")) {
+    throw new Error(`Invalid ${label}: multiline path is not allowed`);
+  }
+  return pathValue;
+}
+
+function requireIfsJournalObjectType(value: unknown) {
+  const objectType = String(value || "*STMF").trim().toUpperCase();
+  if (objectType !== "*STMF" && objectType !== "*DIR") {
+    throw new Error("objectType must be *STMF or *DIR");
+  }
+  return objectType;
+}
+
+function quoteClString(value: string) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function requireIbmObjectName(value: unknown, label: string) {
+  const name = String(value || "").trim().toUpperCase();
+  if (!/^[A-Z#@$][A-Z0-9#@$]{0,9}$/.test(name)) {
+    throw new Error(`Invalid ${label}: ${value}`);
+  }
+  return name;
+}
+
+function requireJournalCode(value: unknown) {
+  const code = String(value || "").trim().toUpperCase();
+  if (!/^[A-Z0-9]{1,4}$/.test(code)) {
+    throw new Error(`Invalid journalCode: ${value}`);
+  }
+  return code;
+}
+
+function requireJournalEntryType(value: unknown) {
+  const entryType = String(value || "").trim().toUpperCase();
+  if (!/^[A-Z0-9]{1,10}$/.test(entryType)) {
+    throw new Error(`Invalid entryType: ${value}`);
+  }
+  return entryType;
+}
+
+type JournalRetentionPlanOptions = {
+  journalLibrary: string;
+  journal: string;
+  retentionDays: number;
+};
+
+async function planJournalReceiverRetention(conn: any, options: JournalRetentionPlanOptions) {
+  const rows = await queryJournalReceiverInfo(conn, options.journalLibrary, options.journal);
+  const cutoff = Date.now() - options.retentionDays * 24 * 60 * 60 * 1000;
+  const candidates = rows
+    .filter((row: {
+      receiverLibrary: string | null;
+      receiver: string | null;
+      attachTimestamp: string | null;
+      detachTimestamp: string | null;
+    }) => {
+      if (!row.receiverLibrary || !row.receiver) return false;
+      if (!row.detachTimestamp) return false;
+      const detachMs = Date.parse(row.detachTimestamp);
+      return Number.isFinite(detachMs) && detachMs <= cutoff;
+    })
+    .map((row: {
+      receiverLibrary: string | null;
+      receiver: string | null;
+      attachTimestamp: string | null;
+      detachTimestamp: string | null;
+    }) => ({
+      receiverLibrary: row.receiverLibrary!,
+      receiver: row.receiver!,
+      attachTimestamp: row.attachTimestamp,
+      detachTimestamp: row.detachTimestamp
+    }));
+  return {
+    journalLibrary: options.journalLibrary,
+    journal: options.journal,
+    retentionDays: options.retentionDays,
+    cutoffTimestamp: new Date(cutoff).toISOString(),
+    scanned: rows.length,
+    candidates
+  };
+}
+
+async function queryJournalReceiverInfo(conn: any, journalLibrary: string, journal: string) {
+  try {
+    const rows = await conn.runSQL(
+      `select * from table(qsys2.journal_receiver_info(journal_name => ${Tools.sqlString(journal)}, journal_library => ${Tools.sqlString(journalLibrary)}))`
+    );
+    return rows.map(normalizeJournalReceiverInfoRow);
+  } catch {
+    const rows = await conn.runSQL(
+      `select * from qsys2.journal_receiver_info where upper(journal_name)=${Tools.sqlString(journal)} and upper(journal_library)=${Tools.sqlString(journalLibrary)}`
+    );
+    return rows.map(normalizeJournalReceiverInfoRow);
+  }
+}
+
+function normalizeJournalReceiverInfoRow(row: Record<string, unknown>) {
+  return {
+    receiverLibrary: toNullableString(pickFirst(row, ["JOURNAL_RECEIVER_LIBRARY", "RECEIVER_LIBRARY", "JRNRCV_LIBRARY"])),
+    receiver: toNullableString(pickFirst(row, ["JOURNAL_RECEIVER", "JOURNAL_RECEIVER_NAME", "RECEIVER_NAME", "JRNRCV_NAME"])),
+    attachTimestamp: toNullableString(pickFirst(row, ["ATTACH_TIMESTAMP", "ATTACHED_TIMESTAMP"])),
+    detachTimestamp: toNullableString(pickFirst(row, ["DETACH_TIMESTAMP", "DETACHED_TIMESTAMP"]))
+  };
+}
+
+type ComplianceReportOptions = {
+  preset: string;
+  sinceTimestamp?: string;
+  auditLimit: number;
+  qaudLimit: number;
+  includeRaw: boolean;
+};
+
+async function buildComplianceReport(conn: any, options: ComplianceReportOptions) {
+  const preset = normalizeCompliancePreset(options.preset);
+  const sinceTimestamp = options.sinceTimestamp || new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const audit = await listAuditRecords({
+    since: sinceTimestamp,
+    limit: options.auditLimit
+  });
+  const auditVerify = await verifyAuditChain();
+  const qaudRows = await queryJournalEntries(conn, {
+    journalLibrary: "QSYS",
+    journal: "QAUDJRN",
+    limit: options.qaudLimit,
+    sinceTimestamp
+  });
+
+  const report = {
+    source: "compliance",
+    preset,
+    generatedAt: new Date().toISOString(),
+    sinceTimestamp,
+    audit: {
+      verify: auditVerify,
+      total: audit.total,
+      returned: audit.records.length,
+      byStatus: summarizeByKey(audit.records, "status"),
+      byTool: summarizeByKey(audit.records, "tool")
+    },
+    qaudjrn: {
+      returned: qaudRows.length,
+      byCode: summarizeByKey(qaudRows, "journalCode"),
+      byEntryType: summarizeByKey(qaudRows, "entryType"),
+      byUser: summarizeByKey(qaudRows, "userName")
+    }
+  } as Record<string, unknown>;
+
+  if (options.includeRaw) {
+    report["raw"] = {
+      auditRecords: audit.records,
+      qaudjrnEvents: qaudRows
+    };
+  }
+  return report;
+}
+
+function normalizeCompliancePreset(value: string) {
+  const preset = String(value || "phase6_baseline").trim().toLowerCase();
+  if (preset === "phase6_baseline" || preset === "qaudjrn_daily" || preset === "journal_retention") {
+    return preset;
+  }
+  throw new Error(`Unsupported compliance preset: ${value}`);
+}
+
+function summarizeByKey(rows: any[], key: string) {
+  const summary: Record<string, number> = {};
+  for (const row of rows) {
+    const value = String(row?.[key] || "UNKNOWN").trim() || "UNKNOWN";
+    summary[value] = (summary[value] || 0) + 1;
+  }
+  return summary;
+}
+
+function summarizeQaudjrnEvents(events: Array<Record<string, unknown>>) {
+  return {
+    total: events.length,
+    byCode: summarizeByKey(events, "journalCode"),
+    byEntryType: summarizeByKey(events, "entryType"),
+    byUser: summarizeByKey(events, "userName")
+  };
+}
+
+function signEvidencePayload(payload: string, signingKey: string) {
+  return crypto.createHmac("sha256", signingKey).update(payload).digest("hex");
+}
+
+function sha256Hex(value: string) {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
 function requiresApproval(policy: ConnectionPolicy, operation: string) {
   if (policy.profile !== "guarded") return false;
   const requires = policy.requireApprovalFor || [];
@@ -1888,12 +3853,38 @@ const APPROVAL_HINT_TOOLS = new Set([
   "ibmi.qsys.members.delete",
   "ibmi.qsys.sourcefiles.create",
   "ibmi.qsys.libraries.create",
+  "ibmi.libl.set",
+  "ibmi.libl.add",
+  "ibmi.libl.remove",
+  "ibmi.libl.setCurrent",
+  "ibmi.journal.receiver.create",
+  "ibmi.journal.create",
+  "ibmi.journal.receiver.change",
+  "ibmi.journal.startPf",
+  "ibmi.journal.endPf",
+  "ibmi.journal.startIfs",
+  "ibmi.journal.endIfs",
+  "ibmi.journal.receivers.retention",
+  "ibmi.audit.purge",
   "ibmi.ifs.write",
   "ibmi.ifs.mkdir",
   "ibmi.ifs.delete",
   "ibmi.ifs.upload",
   "ibmi.actions.run",
   "ibmi.profiles.activate",
+  "ibmi.spool.hold",
+  "ibmi.spool.release",
+  "ibmi.spool.delete",
+  "ibmi.spool.move",
+  "ibmi.jobs.hold",
+  "ibmi.jobs.release",
+  "ibmi.jobs.end",
+  "ibmi.subsystems.start",
+  "ibmi.subsystems.end",
+  "ibmi.msgq.send",
+  "ibmi.msgq.reply",
+  "ibmi.dataqueue.send",
+  "ibmi.dataarea.write",
   "ibmi.deploy.uploadDirectory",
   "ibmi.deploy.uploadFiles",
   "ibmi.deploy.setCcsid",

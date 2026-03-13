@@ -1,14 +1,15 @@
 # MCP-for-i Overview
 
-MCP-for-i is a local MCP server that exposes IBM i operations as MCP tools. It mirrors the core capabilities of the Code for IBM i VS Code extension but is designed for agent-driven workflows (e.g., Codex CLI) over MCP stdio.
+MCP-for-i is a local MCP server and control plane that exposes IBM i operations as MCP tools for agent-driven workflows (Codex CLI/Desktop and other MCP clients).
 
-Key capabilities (Phase 1):
-- Connect/disconnect to IBM i
-- Keep multiple sessions warm with inactivity timeout
-- Browse libraries/objects/members
-- Read/write members and IFS files
-- Run compile actions (RPG/COBOL/C/CL/SQL)
-- Search members and IFS
-- Run guarded SQL and CL tools
+Current platform scope includes:
+- Secure onboarding and connection lifecycle management.
+- Guarded policy and approval-gated operations.
+- Session lifecycle controls with keepalive/reconnect behavior.
+- QSYS, IFS, search, deploy, SQL/CL, diagnostics, and TN5250 command-session tooling.
+- Audit-chain integrity features plus journaling and compliance-report tooling.
+- IBM i operations-control tooling for spool/job/subsystem/message-queue lifecycles, lock/authority visibility, and data queue/data area operations.
 
-The server runs locally and connects to IBM i via SSH + QSH/PASE + SQL (QZDFMDB2).
+For the complete up-to-date feature inventory, see:
+- `docs/capabilities.md`
+- `docs/tools.md`
