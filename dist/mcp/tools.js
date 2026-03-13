@@ -1892,15 +1892,7 @@ export async function handleTool(ctx, name, args) {
         case "ibmi.spool.list": {
             const conn = await ctx.ensureActive(args?.connectionName);
             const limit = clampNumber(args?.limit, 200, 1, 5000);
-            let rows;
-            try {
-                rows = await conn.runSQL(`select job_name, spooled_file_name, spooled_file_number, output_queue_name, total_pages, file_status from qsys2.output_queue_entries fetch first ${limit} rows only`);
-            }
-            catch (err) {
-                if (!isMissingColumnError(err, "FILE_STATUS"))
-                    throw err;
-                rows = await conn.runSQL(`select job_name, spooled_file_name, spooled_file_number, output_queue_name, total_pages, cast('' as varchar(10)) as file_status from qsys2.output_queue_entries fetch first ${limit} rows only`);
-            }
+            const rows = await querySpoolEntries(conn, limit);
             return json(rows.map(normalizeSpoolEntry));
         }
         case "ibmi.spool.read": {
@@ -1959,7 +1951,7 @@ export async function handleTool(ctx, name, args) {
             enforceWritable(ctx, conn, "qsys.write", args);
             const jobName = requireJobName(args.jobName);
             const hold = Boolean(args?.holdOnJobQueue) ? "*JOBQ" : "*NO";
-            const command = `HLDJOB JOB(${quoteClString(jobName)}) HOLD(${hold})`;
+            const command = `HLDJOB JOB(${jobName}) HOLD(${hold})`;
             const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
             return json({ ok: cmdResult.code === 0, command, ...cmdResult });
         }
@@ -1967,7 +1959,7 @@ export async function handleTool(ctx, name, args) {
             const conn = await ctx.ensureActive(args?.connectionName);
             enforceWritable(ctx, conn, "qsys.write", args);
             const jobName = requireJobName(args.jobName);
-            const command = `RLSJOB JOB(${quoteClString(jobName)})`;
+            const command = `RLSJOB JOB(${jobName})`;
             const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
             return json({ ok: cmdResult.code === 0, command, ...cmdResult });
         }
@@ -1980,7 +1972,7 @@ export async function handleTool(ctx, name, args) {
                 throw new Error("option must be *CNTRLD or *IMMED");
             }
             const delaySeconds = clampNumber(args?.delaySeconds, 30, 0, 99999);
-            const command = `ENDJOB JOB(${quoteClString(jobName)}) OPTION(${option}) DELAY(${delaySeconds})`;
+            const command = `ENDJOB JOB(${jobName}) OPTION(${option}) DELAY(${delaySeconds})`;
             const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
             return json({ ok: cmdResult.code === 0, command, ...cmdResult });
         }
@@ -2042,9 +2034,12 @@ export async function handleTool(ctx, name, args) {
             const message = String(args.message || "");
             if (!message.trim())
                 throw new Error("message is required");
-            const command = `SNDPGMMSG MSG(${quoteClString(message)}) TOMSGQ(${library}/${messageQueue}) MSGTYPE(${messageType})`;
+            const mappedMessageType = messageType === "*INQ" ? "*INQ" : "*INFO";
+            const command = mappedMessageType === "*INQ"
+                ? `SNDMSG MSG(${quoteClString(message)}) TOMSGQ(${library}/${messageQueue}) MSGTYPE(*INQ) RPYMSGQ(${library}/${messageQueue})`
+                : `SNDMSG MSG(${quoteClString(message)}) TOMSGQ(${library}/${messageQueue}) MSGTYPE(*INFO)`;
             const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-            return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+            return json({ ok: cmdResult.code === 0, command, requestedMessageType: messageType, mappedMessageType, ...cmdResult });
         }
         case "ibmi.msgq.reply": {
             const conn = await ctx.ensureActive(args?.connectionName);
@@ -2088,9 +2083,21 @@ export async function handleTool(ctx, name, args) {
             const message = String(args.message || "");
             if (!message)
                 throw new Error("message is required");
-            const command = `SNDDTAQ DTAQ(${library}/${queue}) MSG(${quoteClString(message)})`;
-            const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-            return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+            try {
+                await conn.runSQL(`call qsys2.send_data_queue(${Tools.sqlString(message)}, ${Tools.sqlString(queue)}, ${Tools.sqlString(library)})`);
+                return json({
+                    ok: true,
+                    method: "qsys2.send_data_queue",
+                    library,
+                    queue,
+                    messageLength: message.length
+                });
+            }
+            catch {
+                const command = `SNDDTAQ DTAQ(${library}/${queue}) DTA(${quoteClString(message)})`;
+                const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+                return json({ ok: cmdResult.code === 0, method: "cl.snddtaq", command, ...cmdResult });
+            }
         }
         case "ibmi.dataqueue.receive": {
             const conn = await ctx.ensureActive(args?.connectionName);
@@ -2624,21 +2631,51 @@ async function queryJournalEntries(conn, options) {
     return normalized.slice(0, options.limit);
 }
 async function queryJobs(conn, options) {
-    const base = await conn.runSQL(`select * from table(qsys2.active_job_info()) fetch first ${Math.min(options.limit * 5, 5000)} rows only`);
-    let rows = base.map((row) => normalizeActiveJobRow(row));
+    const scanLimit = Math.min(options.limit * 5, 5000);
+    let activeRows = [];
+    try {
+        activeRows = await conn.runSQL(`select * from table(qsys2.active_job_info()) fetch first ${scanLimit} rows only`);
+    }
+    catch {
+        // Continue with job_info fallback.
+    }
+    let rows = filterNormalizedJobs(activeRows.map((row) => normalizeActiveJobRow(row)), options);
+    if (rows.length >= options.limit)
+        return rows.slice(0, options.limit);
+    try {
+        const allRows = await conn.runSQL(`select * from table(qsys2.job_info('*ALL')) fetch first ${scanLimit} rows only`);
+        const fallback = filterNormalizedJobs(allRows.map((row) => normalizeActiveJobRow(row)), options);
+        const seen = new Set(rows.map((row) => String(row.jobName || "")));
+        for (const row of fallback) {
+            const key = String(row.jobName || "");
+            if (!key || seen.has(key))
+                continue;
+            rows.push(row);
+            seen.add(key);
+            if (rows.length >= options.limit)
+                break;
+        }
+    }
+    catch {
+        // Some systems may not provide job_info as a table function.
+    }
+    return rows.slice(0, options.limit);
+}
+function filterNormalizedJobs(rows, options) {
+    let filtered = rows;
     if (options.subsystem) {
         const subsystem = String(options.subsystem).trim().toUpperCase();
-        rows = rows.filter((row) => (row.subsystem || "") === subsystem);
+        filtered = filtered.filter((row) => (row.subsystem || "") === subsystem);
     }
     if (options.userName) {
         const userName = String(options.userName).trim().toUpperCase();
-        rows = rows.filter((row) => (row.userName || "") === userName);
+        filtered = filtered.filter((row) => (row.userName || "") === userName);
     }
     if (options.status) {
         const status = String(options.status).trim().toUpperCase();
-        rows = rows.filter((row) => (row.status || "").includes(status));
+        filtered = filtered.filter((row) => (row.status || "").includes(status));
     }
-    return rows.slice(0, options.limit);
+    return filtered;
 }
 async function querySubsystemSummary(conn, limit) {
     const jobs = await queryJobs(conn, { limit: 5000 });
@@ -2656,10 +2693,10 @@ function normalizeActiveJobRow(row) {
     return {
         source: "job",
         jobName: toNullableString(pickFirst(row, ["JOB_NAME", "QUALIFIED_JOB_NAME", "JOB"])),
-        subsystem: toNullableString(pickFirst(row, ["SUBSYSTEM", "SUBSYSTEM_NAME"])),
+        subsystem: toNullableString(pickFirst(row, ["SUBSYSTEM", "SUBSYSTEM_NAME", "JOB_SUBSYSTEM"])),
         status: toNullableString(pickFirst(row, ["JOB_STATUS", "STATUS"])),
         function: toNullableString(pickFirst(row, ["FUNCTION", "CURRENT_FUNCTION"])),
-        userName: toNullableString(pickFirst(row, ["AUTHORIZATION_NAME", "USER_NAME", "CURRENT_USER"])),
+        userName: toNullableString(pickFirst(row, ["AUTHORIZATION_NAME", "USER_NAME", "CURRENT_USER", "JOB_USER"])),
         type: toNullableString(pickFirst(row, ["JOB_TYPE", "TYPE"])),
         cpuSeconds: toNullableNumber(pickFirst(row, ["CPU_TIME", "TOTAL_CPU_TIME", "ELAPSED_TOTAL_SECONDS"]))
     };
@@ -2673,6 +2710,25 @@ async function queryMessageQueueEntries(conn, options) {
         rows = await conn.runSQL(`select * from qsys2.message_queue_info where upper(message_queue_name)=${Tools.sqlString(options.messageQueue)} and upper(message_queue_library)=${Tools.sqlString(options.library)} fetch first ${options.limit} rows only`);
     }
     return rows.map(normalizeMessageQueueEntry);
+}
+async function querySpoolEntries(conn, limit) {
+    const queries = [
+        `select job_name, spooled_file_name, spooled_file_number, output_queue_name, total_pages, file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
+        `select job_name, spooled_file_name, spooled_file_number, output_queue_name, total_pages, cast('' as varchar(10)) as file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
+        `select job_name, spooled_file_name, cast(0 as integer) as spooled_file_number, output_queue_name, total_pages, file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
+        `select job_name, spooled_file_name, cast(0 as integer) as spooled_file_number, output_queue_name, total_pages, cast('' as varchar(10)) as file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
+        `select * from qsys2.output_queue_entries fetch first ${limit} rows only`
+    ];
+    let lastError;
+    for (const sql of queries) {
+        try {
+            return await conn.runSQL(sql);
+        }
+        catch (err) {
+            lastError = err;
+        }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError || "Unable to read spool entries"));
 }
 function normalizeMessageQueueEntry(row) {
     return {
@@ -2689,10 +2745,10 @@ function normalizeMessageQueueEntry(row) {
 async function queryLockEntries(conn, options) {
     let rows;
     try {
-        rows = await conn.runSQL(`select * from table(qsys2.object_lock_info()) fetch first ${Math.min(options.limit * 5, 5000)} rows only`);
+        rows = await conn.runSQL(`select * from table(qsys2.object_lock_info()) fetch first ${Math.min(options.limit, 500)} rows only`);
     }
     catch {
-        rows = await conn.runSQL(`select * from qsys2.object_lock_info fetch first ${Math.min(options.limit * 5, 5000)} rows only`);
+        rows = await conn.runSQL(`select * from qsys2.object_lock_info fetch first ${Math.min(options.limit, 500)} rows only`);
     }
     let normalized = rows.map(normalizeLockEntry);
     if (options.objectLibrary)
@@ -2742,10 +2798,20 @@ function normalizeObjectAuthorityRow(row) {
 async function queryDataQueueEntries(conn, options) {
     let rows;
     try {
-        rows = await conn.runSQL(`select * from table(qsys2.receive_data_queue(data_queue_library => ${Tools.sqlString(options.library)}, data_queue_name => ${Tools.sqlString(options.queue)}, wait_time => ${options.waitSeconds}, remove_message => ${Tools.sqlString(options.remove ? "YES" : "NO")})) fetch first 1 rows only`);
+        rows = await conn.runSQL(`select * from table(qsys2.receive_data_queue(${Tools.sqlString(options.queue)}, ${Tools.sqlString(options.library)}, ${Tools.sqlString(options.remove ? "YES" : "NO")}, ${options.waitSeconds})) fetch first 1 rows only`);
     }
     catch {
-        rows = await conn.runSQL(`select * from table(qsys2.data_queue_entries(data_queue_library => ${Tools.sqlString(options.library)}, data_queue_name => ${Tools.sqlString(options.queue)})) fetch first 1 rows only`);
+        try {
+            rows = await conn.runSQL(`select * from table(qsys2.receive_data_queue(${Tools.sqlString(options.queue)}, ${Tools.sqlString(options.library)})) fetch first 1 rows only`);
+        }
+        catch {
+            try {
+                rows = await conn.runSQL(`select * from table(qsys2.data_queue_entries(${Tools.sqlString(options.queue)}, ${Tools.sqlString(options.library)})) fetch first 1 rows only`);
+            }
+            catch {
+                rows = await conn.runSQL(`select * from qsys2.data_queue_entries where upper(data_queue_name)=${Tools.sqlString(options.queue)} and upper(data_queue_library)=${Tools.sqlString(options.library)} fetch first 1 rows only`);
+            }
+        }
     }
     return rows.map(normalizeDataQueueEntry);
 }
@@ -2783,7 +2849,7 @@ function buildSpoolCommand(commandName, args) {
     const jobName = requireJobName(args.jobName);
     const spooledFileName = requireIbmObjectName(args.spooledFileName, "spooledFileName");
     const spooledFileNumber = clampNumber(args.spooledFileNumber, 1, 1, 999999999);
-    return `${commandName} FILE(${spooledFileName}) JOB(${quoteClString(jobName)}) SPLNBR(${spooledFileNumber})`;
+    return `${commandName} FILE(${spooledFileName}) JOB(${jobName}) SPLNBR(${spooledFileNumber})`;
 }
 async function queryJournalEntriesViaDisplayJournal(conn, options) {
     const sampleSize = Math.min(options.limit * 5, 5000);
@@ -3038,13 +3104,19 @@ function requireQualifiedObject(value, label) {
     };
 }
 function requireMessageKey(value) {
-    const messageKey = String(value || "").trim().toUpperCase();
-    if (!messageKey)
+    const raw = String(value || "").trim();
+    if (!raw)
         throw new Error("messageKey is required");
-    if (!/^[0-9A-F]{4,32}$/.test(messageKey)) {
-        throw new Error(`Invalid messageKey: ${value}`);
+    const directHex = raw.toUpperCase();
+    if (/^[0-9A-F]{4,64}$/.test(directHex)) {
+        return `X'${directHex}'`;
     }
-    return messageKey;
+    const prefixed = raw.toUpperCase();
+    const match = prefixed.match(/^X'([0-9A-F]{4,64})'$/);
+    if (match) {
+        return `X'${match[1]}'`;
+    }
+    throw new Error(`Invalid messageKey: ${value}`);
 }
 async function updateConnectionSettings(ctx, name, update) {
     const conn = await ctx.store.getConnection(name);
@@ -3284,12 +3356,12 @@ function normalizeSpoolEntry(row) {
     return {
         ...row,
         source: "spool",
-        jobName: String(row.JOB_NAME || ""),
-        spooledFileName: String(row.SPOOLED_FILE_NAME || ""),
-        spooledFileNumber: Number(row.SPOOLED_FILE_NUMBER || 0),
-        outputQueue: String(row.OUTPUT_QUEUE_NAME || ""),
-        totalPages: Number.isFinite(Number(row.TOTAL_PAGES)) ? Number(row.TOTAL_PAGES) : null,
-        status: String(row.FILE_STATUS || "")
+        jobName: toNullableString(pickFirst(row, ["JOB_NAME", "JOB"])) || "",
+        spooledFileName: toNullableString(pickFirst(row, ["SPOOLED_FILE_NAME", "SPOOLED_FILE", "SPLF_NAME"])) || "",
+        spooledFileNumber: toNullableNumber(pickFirst(row, ["SPOOLED_FILE_NUMBER", "SPLF_NUMBER", "FILE_NUMBER"])),
+        outputQueue: toNullableString(pickFirst(row, ["OUTPUT_QUEUE_NAME", "OUTQ_NAME", "OUTPUT_QUEUE"])) || "",
+        totalPages: toNullableNumber(pickFirst(row, ["TOTAL_PAGES", "PAGES"])),
+        status: toNullableString(pickFirst(row, ["FILE_STATUS", "STATUS"])) || ""
     };
 }
 function normalizeSpoolLine(row) {
