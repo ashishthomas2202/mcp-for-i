@@ -156,3 +156,4 @@ npm run release:patch -- --no-push
 - Main repo: [ashishthomas2202/mcp-for-i](https://github.com/ashishthomas2202/mcp-for-i)
 - Skills repo: [ashishthomas2202/mcp-for-i-skills](https://github.com/ashishthomas2202/mcp-for-i-skills)
 - Docs: `docs/`
+- Full capability guide: `docs/capabilities.md`
