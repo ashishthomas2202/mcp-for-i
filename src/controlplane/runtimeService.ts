@@ -4,6 +4,7 @@ import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import { getPlatformDescriptor } from "./platform.js";
+import { ControlPlaneError } from "./errors.js";
 import {
   disableBackgroundService,
   enableBackgroundService,
@@ -64,6 +65,7 @@ export class RuntimeService {
     enableService: makeJob("enableService"),
     disableService: makeJob("disableService")
   };
+  private readonly pending = new Map<keyof RuntimeState, Promise<void>>();
 
   constructor(private readonly rootDir: string) {}
 
@@ -72,6 +74,7 @@ export class RuntimeService {
   }
 
   async getVersions(options?: UpdateSkillsOptions): Promise<RuntimeVersions> {
+    const source = resolveSkillsSource(options);
     const mode = await this.detectExecutionModeQuiet();
     const checkedAt = new Date().toISOString();
     const mcpInstalled = await this.readLocalPackageVersion(this.rootDir);
@@ -80,8 +83,7 @@ export class RuntimeService {
       ? (mcpInstalled === mcpLatest ? "latest" : "update-available")
       : "unknown";
 
-    const configuredRepo = sanitizeRepoUrl(options?.repoUrl) || process.env.MCP_FOR_I_SKILLS_REPO || DEFAULT_SKILLS_REPO;
-    const configuredBranch = sanitizeBranch(options?.branch) || process.env.MCP_FOR_I_SKILLS_BRANCH || "main";
+    const { repoUrl: configuredRepo, branch: configuredBranch } = source;
     const skillsDir = path.join(this.rootDir, "skills");
     const skillsGit = path.join(skillsDir, ".git");
 
@@ -145,16 +147,16 @@ export class RuntimeService {
   }
 
   async updateSkills(options?: UpdateSkillsOptions) {
+    // Validate before starting the job so bad input is a 400, not a failed job.
+    const { repoUrl, branch } = resolveSkillsSource(options);
     return this.runJob("updateSkills", async push => {
-      const repoUrl = sanitizeRepoUrl(options?.repoUrl) || process.env.MCP_FOR_I_SKILLS_REPO || DEFAULT_SKILLS_REPO;
-      const branch = sanitizeBranch(options?.branch) || process.env.MCP_FOR_I_SKILLS_BRANCH || "main";
       const skillsDir = path.join(this.rootDir, "skills");
       const hasSkills = await pathExists(skillsDir);
 
       push(`Using skills repository: ${repoUrl} (${branch})`);
 
       if (!hasSkills) {
-        await this.runCommand("git", ["clone", "--depth", "1", "--branch", branch, repoUrl, skillsDir], this.rootDir, push);
+        await this.runCommand("git", ["clone", "--depth", "1", "--branch", branch, "--", repoUrl, skillsDir], this.rootDir, push);
         return;
       }
 
@@ -163,7 +165,7 @@ export class RuntimeService {
         const currentRemote = await this.getGitRemoteUrl(skillsDir, push);
         if (currentRemote && currentRemote !== repoUrl) {
           push(`Switching skills remote from ${currentRemote} to ${repoUrl}`);
-          await this.runCommand("git", ["remote", "set-url", "origin", repoUrl], skillsDir, push);
+          await this.runCommand("git", ["remote", "set-url", "--", "origin", repoUrl], skillsDir, push);
         }
         await this.runCommand("git", ["fetch", "origin", branch], skillsDir, push);
         await this.runCommand("git", ["checkout", branch], skillsDir, push);
@@ -175,7 +177,7 @@ export class RuntimeService {
       push(`Existing skills directory is not a git repository. Backing it up to ${backupDir}`);
       await fs.rename(skillsDir, backupDir);
       try {
-        await this.runCommand("git", ["clone", "--depth", "1", "--branch", branch, repoUrl, skillsDir], this.rootDir, push);
+        await this.runCommand("git", ["clone", "--depth", "1", "--branch", branch, "--", repoUrl, skillsDir], this.rootDir, push);
       } catch (error) {
         push("Clone failed. Restoring previous skills directory.");
         await safeRename(backupDir, skillsDir);
@@ -213,6 +215,16 @@ export class RuntimeService {
     });
   }
 
+  /** Resolves when the given job has finished (immediately if it is not running). */
+  async waitForJob(kind: keyof RuntimeState): Promise<RuntimeJob> {
+    await this.pending.get(kind);
+    return this.state[kind];
+  }
+
+  /**
+   * Starts a job in the background and returns it right away with status
+   * "running". Progress is read through getStatus() (GET /api/runtime/status).
+   */
   private async runJob(kind: keyof RuntimeState, fn: (push: (line: string) => void) => Promise<void>) {
     const current = this.state[kind];
     if (current.status === "running") {
@@ -231,17 +243,21 @@ export class RuntimeService {
       }
     };
 
-    try {
-      await fn(push);
-      job.status = "success";
-    } catch (err: any) {
-      job.status = "failed";
-      job.error = err?.message || String(err);
-      push(`ERROR: ${job.error}`);
-    } finally {
-      job.finishedAt = new Date().toISOString();
-    }
-    return job;
+    const done = (async () => {
+      try {
+        await fn(push);
+        job.status = "success";
+      } catch (err: any) {
+        job.status = "failed";
+        job.error = err?.message || String(err);
+        push(`ERROR: ${job.error}`);
+      } finally {
+        job.finishedAt = new Date().toISOString();
+        this.pending.delete(kind);
+      }
+    })();
+    this.pending.set(kind, done);
+    return { ...job, output: [...job.output] };
   }
 
   private runCommand(command: string, args: string[], cwd: string, push: (line: string) => void) {
@@ -452,7 +468,7 @@ export class RuntimeService {
 
   private async getRemoteBranchCommitQuiet(repoUrl: string, branch: string, short = false) {
     try {
-      const out = await this.runCommandCaptureSilent("git", ["ls-remote", repoUrl, branch], this.rootDir);
+      const out = await this.runCommandCaptureSilent("git", ["ls-remote", "--", repoUrl, branch], this.rootDir);
       const firstLine = out.split(/\r?\n/).find(Boolean);
       if (!firstLine) return undefined;
       const [hash] = firstLine.trim().split(/\s+/);
@@ -532,18 +548,72 @@ async function resolveNpmLaunch(): Promise<{ mode: "node-cli" | "command"; path:
   return { mode: "command", path: process.platform === "win32" ? "npm.cmd" : "npm" };
 }
 
-function sanitizeRepoUrl(value?: string) {
-  if (!value) return undefined;
+/**
+ * Picks the skills repository and branch (request, then environment, then
+ * defaults) and validates them. Throws a 400 error for unsafe values.
+ */
+export function resolveSkillsSource(options?: UpdateSkillsOptions) {
+  const repoUrl = sanitizeRepoUrl(options?.repoUrl)
+    || sanitizeRepoUrl(process.env.MCP_FOR_I_SKILLS_REPO)
+    || DEFAULT_SKILLS_REPO;
+  const branch = sanitizeBranch(options?.branch)
+    || sanitizeBranch(process.env.MCP_FOR_I_SKILLS_BRANCH)
+    || "main";
+  return { repoUrl, branch };
+}
+
+/**
+ * Accepts only https://, ssh:// and scp-style (user@host:path) git URLs.
+ * Anything that git could read as an option (leading "-") or that uses another
+ * transport (ext::, file://, local paths) is rejected.
+ */
+export function sanitizeRepoUrl(value?: string) {
+  if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   if (!trimmed) return undefined;
+
+  const invalid = () => new ControlPlaneError(400, "repoUrl must be an https://, ssh:// or user@host:path git URL");
+  if (trimmed.length > 2048 || trimmed.startsWith("-") || /[\s\x00-\x1f\x7f]/.test(trimmed)) {
+    throw invalid();
+  }
+
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
+    let parsed: URL;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      throw invalid();
+    }
+    if (parsed.protocol !== "https:" && parsed.protocol !== "ssh:") throw invalid();
+    if (!parsed.hostname || parsed.hostname.startsWith("-") || parsed.username.startsWith("-")) throw invalid();
+    return trimmed;
+  }
+
+  // scp-like syntax: git@github.com:owner/repo.git
+  if (/^[A-Za-z0-9._-]+@[A-Za-z0-9][A-Za-z0-9.-]*:[A-Za-z0-9._~/-]+$/.test(trimmed) && !trimmed.includes("::")) {
+    return trimmed;
+  }
+  throw invalid();
+}
+
+/** Validates a branch name using the git check-ref-format rules. */
+export function sanitizeBranch(value?: string) {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (!isSafeBranchName(trimmed)) {
+    throw new ControlPlaneError(400, `Invalid branch name: ${JSON.stringify(trimmed.slice(0, 100))}`);
+  }
   return trimmed;
 }
 
-function sanitizeBranch(value?: string) {
-  if (!value) return undefined;
-  const trimmed = value.trim();
-  if (!trimmed) return undefined;
-  return trimmed;
+function isSafeBranchName(name: string) {
+  if (name.length > 255) return false;
+  if (name.startsWith("-") || name === "@" || name === "HEAD") return false;
+  if (/[\x00-\x20\x7f~^:?*[\\]/.test(name)) return false;
+  if (name.includes("..") || name.includes("@{") || name.includes("//")) return false;
+  if (name.startsWith("/") || name.endsWith("/") || name.endsWith(".")) return false;
+  return name.split("/").every(part => part.length > 0 && !part.startsWith(".") && !part.endsWith(".lock"));
 }
 
 async function safeRename(from: string, to: string) {
