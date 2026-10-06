@@ -4,6 +4,7 @@ import { CompileTools } from "../ibmi/CompileTools.js";
 import { Search } from "../ibmi/Search.js";
 import { ibmDocs } from "../ibmi/IbmDocs.js";
 import { MemberSnapshot } from "../ibmi/IBMiContent.js";
+import { detectSourceLanguage, inspectSource } from "../ibmi/sourceInspect.js";
 import { Action } from "../ibmi/types.js";
 import { Tools } from "../ibmi/Tools.js";
 import { ConnectionPolicy } from "../config/store.js";
@@ -3651,9 +3652,9 @@ function inspectMemberOperation(snapshot: MemberSnapshot, operation: any) {
     case "search":
       return { operation: "search", ...searchSnapshot(snapshot, operation) };
     case "outline":
-      return { operation: "outline", symbols: outlineSnapshot(snapshot) };
+      return { operation: "outline", language: sourceLanguageOf(snapshot), symbols: outlineSnapshot(snapshot) };
     case "dependencies":
-      return { operation: "dependencies", dependencies: dependenciesFromSnapshot(snapshot) };
+      return { operation: "dependencies", language: sourceLanguageOf(snapshot), dependencies: dependenciesFromSnapshot(snapshot) };
     default:
       throw new Error(`Unsupported inspection operation: ${operation.operation}`);
   }
@@ -3683,46 +3684,15 @@ function searchSnapshot(snapshot: MemberSnapshot, operation: any) {
 }
 
 function outlineSnapshot(snapshot: MemberSnapshot) {
-  const symbols: any[] = [];
-  const patterns = [
-    { kind: "procedure", regex: /\bdcl-proc\s+([A-Za-z0-9_#$@]+)/i },
-    { kind: "procedure", regex: /^\s*[Pp]\s+([A-Za-z0-9_#$@]+)\s+B\b/ },
-    { kind: "subroutine", regex: /\bbegsr\s+([A-Za-z0-9_#$@]+)/i },
-    { kind: "program", regex: /\bPROGRAM-ID\.?\s+([A-Za-z0-9_#$@-]+)/i },
-    { kind: "paragraph", regex: /^\s{0,8}([A-Za-z0-9][A-Za-z0-9-]+)\.\s*$/ },
-    { kind: "label", regex: /^\s*([A-Za-z0-9_#$@]+):\s*(?:\/\/.*)?$/ }
-  ];
-  snapshot.lines.forEach((line, index) => {
-    for (const pattern of patterns) {
-      const match = pattern.regex.exec(line);
-      if (match) {
-        symbols.push({ name: match[1], kind: pattern.kind, line: index + 1 });
-        break;
-      }
-    }
-  });
-  return symbols.slice(0, 1_000);
+  return inspectSource(snapshot.lines, snapshot.metadata?.extension).symbols;
 }
 
 function dependenciesFromSnapshot(snapshot: MemberSnapshot) {
-  const found = new Map<string, any>();
-  const patterns = [
-    { kind: "copy", regex: /\/(?:COPY|INCLUDE)\s+([^\s;]+)/ig },
-    { kind: "include", regex: /\bCOPY\s+['\"]?([^'\".\s]+)['\"]?\.?/ig },
-    { kind: "external-call", regex: /\b(?:CALLP?|CALLPRC)\s*\(?\s*['\"]?([A-Za-z0-9_#$@]+)/ig },
-    { kind: "file", regex: /^\s*[Ff]\s*([A-Za-z0-9_#$@]+)\s+/g }
-  ];
-  snapshot.lines.forEach((line, index) => {
-    for (const pattern of patterns) {
-      pattern.regex.lastIndex = 0;
-      for (let match = pattern.regex.exec(line); match; match = pattern.regex.exec(line)) {
-        const name = match[1].replace(/[),;]+$/, "").toUpperCase();
-        const key = `${pattern.kind}:${name}`;
-        if (!found.has(key)) found.set(key, { name, kind: pattern.kind, line: index + 1 });
-      }
-    }
-  });
-  return [...found.values()].slice(0, 1_000);
+  return inspectSource(snapshot.lines, snapshot.metadata?.extension).dependencies;
+}
+
+function sourceLanguageOf(snapshot: MemberSnapshot) {
+  return detectSourceLanguage(snapshot.metadata?.extension, snapshot.lines);
 }
 
 async function readSystemFacts(conn: any): Promise<{ release?: string; effectiveUser?: string; systemName?: string }> {
