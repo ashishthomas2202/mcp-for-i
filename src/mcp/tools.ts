@@ -1,4 +1,5 @@
 import { McpContext } from "./context.js";
+import { findToolModule, toolModules } from "./modules/index.js";
 import { LocalLanguageActions } from "../ibmi/LocalLanguageActions.js";
 import { CompileTools } from "../ibmi/CompileTools.js";
 import { Search } from "../ibmi/Search.js";
@@ -1410,7 +1411,7 @@ export function getTools() {
       inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
     }
   ];
-  return tools
+  return [...tools, ...toolModules.flatMap(module => module.tools)]
     .map(withGuardedApprovalHint)
     .map(withSourceConnectionName)
     .map(withStrictInputSchema);
@@ -1419,6 +1420,8 @@ export function getTools() {
 export async function handleTool(ctx: McpContext, name: string, args: any) {
   const connections = new ConnectionService(ctx.store);
   await enforceResourcePolicy(ctx, name, args);
+  const toolModule = findToolModule(name);
+  if (toolModule) return toolModule.handle(ctx, name, args);
   switch (name) {
     case "ibmi.connect": {
       if (!args?.name) throw new Error("name is required");
