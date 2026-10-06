@@ -412,8 +412,16 @@ export function getTools() {
     },
     {
       name: "ibmi.ifs.read",
-      description: "Read an IFS file.",
-      inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+      description: "Read an IFS file. Text is returned as-is; files that are not valid UTF-8 text are returned base64-encoded. Files larger than maxBytes are refused (use ibmi.ifs.download).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          maxBytes: { type: "number", description: "Maximum file size to read (default 1048576, max 16777216)." },
+          encoding: { type: "string", enum: ["auto", "utf8", "base64"], default: "auto" }
+        },
+        required: ["path"]
+      }
     },
     {
       name: "ibmi.ifs.write",
@@ -818,8 +826,18 @@ export function getTools() {
     },
     {
       name: "ibmi.spool.list",
-      description: "List spool file entries.",
-      inputSchema: { type: "object", properties: { connectionName: { type: "string" }, limit: { type: "number" } } }
+      description: "List spool file entries, newest first, optionally filtered by user, output queue or job.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          connectionName: { type: "string" },
+          limit: { type: "number" },
+          userName: { type: "string", description: "User profile that owns the spooled files." },
+          outputQueue: { type: "string", description: "Output queue name." },
+          outputQueueLibrary: { type: "string", description: "Output queue library." },
+          jobName: { type: "string", description: "Qualified job name (number/user/name) or a simple job name." }
+        }
+      }
     },
     {
       name: "ibmi.spool.read",
@@ -1086,14 +1104,15 @@ export function getTools() {
     },
     {
       name: "ibmi.dataqueue.receive",
-      description: "Receive (or peek) an entry from a data queue.",
+      description: "Peek at (default) or receive an entry from a data queue. remove=true takes the entry off the queue and needs a writable connection.",
       inputSchema: {
         type: "object",
         properties: {
           library: { type: "string" },
           queue: { type: "string" },
-          waitSeconds: { type: "number", default: 0 },
-          remove: { type: "boolean", default: true },
+          waitSeconds: { type: "number", default: 0, description: "Seconds to wait for an entry (0 to 60)." },
+          remove: { type: "boolean", default: false },
+          approve: { type: "boolean", description: "Set true to approve guarded-policy operations (remove=true)." },
           connectionName: { type: "string" }
         },
         required: ["library", "queue"]
@@ -1193,7 +1212,7 @@ export function getTools() {
     },
     {
       name: "ibmi.journal.entries.query",
-      description: "Read normalized entries from a journal.",
+      description: "Read normalized journal entries, newest first. Filters are applied on the IBM i before the row limit.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1201,6 +1220,7 @@ export function getTools() {
           journal: { type: "string" },
           objectLibrary: { type: "string" },
           objectName: { type: "string" },
+          objectType: { type: "string", description: "Object type for the object filter (default *FILE)." },
           journalCode: { type: "string" },
           entryType: { type: "string" },
           userName: { type: "string" },
@@ -1623,8 +1643,29 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.ifs.read": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      const data = await conn.content.downloadStreamfileRaw(args.path);
-      return result(Buffer.from(data).toString("utf8"));
+      const maxBytes = clampNumber(args?.maxBytes, IFS_READ_DEFAULT_MAX_BYTES, 1, IFS_READ_HARD_MAX_BYTES);
+      const encoding = String(args?.encoding || "auto").toLowerCase();
+      if (!["auto", "utf8", "base64"].includes(encoding)) throw new Error("encoding must be auto, utf8 or base64");
+      const knownSize = await statIfsFileSize(conn, String(args.path));
+      if (knownSize !== undefined && knownSize > maxBytes) {
+        return toolError(
+          `File is ${knownSize} bytes, which is more than maxBytes (${maxBytes}). Raise maxBytes or use ibmi.ifs.download.`,
+          { path: args.path, size: knownSize, maxBytes }
+        );
+      }
+      const data = Buffer.from(await conn.content.downloadStreamfileRaw(args.path));
+      if (data.length > maxBytes) {
+        return toolError(
+          `File is ${data.length} bytes, which is more than maxBytes (${maxBytes}). Raise maxBytes or use ibmi.ifs.download.`,
+          { path: args.path, size: data.length, maxBytes }
+        );
+      }
+      const text = encoding === "base64" ? undefined : decodeUtf8Text(data);
+      if (text !== undefined) return result(text);
+      if (encoding === "utf8") {
+        return toolError("File is not valid UTF-8 text; read it with encoding=base64.", { path: args.path, size: data.length });
+      }
+      return json({ path: args.path, size: data.length, encoding: "base64", content: data.toString("base64") });
     }
     case "ibmi.ifs.write": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -1637,7 +1678,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const conn = await ctx.ensureActive(args?.connectionName);
       const op = resolveIfsWriteOperation(args.path);
       enforceWritable(ctx, conn, op, args);
-      await conn.sendCommand({ command: `mkdir -p ${Tools.escapePath(args.path)}` });
+      requireCommandSuccess(await conn.sendCommand({ command: `mkdir -p ${Tools.escapePath(args.path)}` }), "mkdir");
       return result("OK");
     }
     case "ibmi.ifs.delete": {
@@ -1645,7 +1686,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       enforceWritable(ctx, conn, "ifs.delete", args);
       const deletePath = assertSafeIfsDeletePath(args.path);
       const flag = args.recursive ? "-rf" : "-f";
-      await conn.sendCommand({ command: `rm ${flag} ${Tools.escapePath(deletePath)}` });
+      requireCommandSuccess(await conn.sendCommand({ command: `rm ${flag} ${Tools.escapePath(deletePath)}` }), "rm");
       return result("OK");
     }
     case "ibmi.ifs.upload": {
@@ -1990,7 +2031,10 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const setccsid = conn.remoteFeatures.setccsid;
       if (!setccsid) throw new Error("setccsid not available on remote system");
       const ccsid = args.ccsid || "1208";
-      await conn.sendCommand({ command: `${setccsid} -R ${Tools.shellQuote(ccsid)} ${Tools.escapePath(args.remotePath)}` });
+      requireCommandSuccess(
+        await conn.sendCommand({ command: `${setccsid} -R ${Tools.shellQuote(ccsid)} ${Tools.escapePath(args.remotePath)}` }),
+        "setccsid"
+      );
       return result("OK");
     }
     case "ibmi.filters.list": {
@@ -2055,13 +2099,13 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const submitOptions = `JOBQ(QSYS/QUSRNOMAX) JOBD(QSYS/QSYSJOBD) OUTQ(QUSRSYS/QDBGSRV) USER(QDBGSRV)`;
       const cmd = `QSYS/SBMJOB JOB(QDBGSRV) SYSLIBL(*SYSVAL) CURLIB(*USRPRF) INLLIBL(*JOBD) ${submitOptions} CMD(QSH CMD('/QIBM/ProdData/IBMiDebugService/bin/startDebugService.sh'))`;
       const res = await conn.sendQsh({ command: `system \"${cmd}\"` });
-      return json(res);
+      return commandOutcome({ ok: res.code === 0, ...res });
     }
     case "ibmi.debug.stopService": {
       const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "qsys.write", args);
       const res = await conn.sendCommand({ command: `/QIBM/ProdData/IBMiDebugService/bin/stopDebugService.sh` });
-      return json(res);
+      return commandOutcome({ ok: res.code === 0, ...res });
     }
     case "ibmi.deploy.compare": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -2102,7 +2146,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
           const remoteDir = remoteFile.split("/").slice(0, -1).join("/");
           try {
             if (!createdDirs.has(remoteDir)) {
-              await conn.sendCommand({ command: `mkdir -p ${Tools.escapePath(remoteDir)}` });
+              requireCommandSuccess(await conn.sendCommand({ command: `mkdir -p ${Tools.escapePath(remoteDir)}` }), "mkdir");
               createdDirs.add(remoteDir);
             }
             await conn.client!.putFile(localFile, remoteFile);
@@ -2115,7 +2159,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         for (const rel of deletePlan) {
           const remoteFile = joinRemotePath(remotePath, rel);
           try {
-            await conn.sendCommand({ command: `rm -f ${Tools.escapePath(remoteFile)}` });
+            requireCommandSuccess(await conn.sendCommand({ command: `rm -f ${Tools.escapePath(remoteFile)}` }), "rm");
             deleted.push(rel);
           } catch (err: any) {
             errors.push({ operation: "delete", path: rel, message: err?.message || String(err) });
@@ -2123,7 +2167,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         }
       }
 
-      return json({
+      const syncResult = {
         ok: errors.length === 0,
         mode: { overwrite, deleteExtraRemote, dryRun },
         comparison,
@@ -2138,7 +2182,11 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
           deleted: dryRun ? [] : deleted
         },
         errors
-      });
+      };
+      if (errors.length > 0) {
+        return jsonError(`deploy.sync finished with ${errors.length} failed operation(s)`, syncResult);
+      }
+      return json(syncResult);
     }
     case "ibmi.sql.query": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -2163,8 +2211,11 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const readOnlyCheck = checkReadOnlySql(sql);
       if (!readOnlyCheck.readOnly) throw new Error(`ibmi.sql.query only supports read-only SQL: ${readOnlyCheck.reason}`);
       const startedAt = Date.now();
+      // Ask for one row more than maxRows so truncation can be reported without
+      // pulling the whole result set over the wire.
+      const capped = applySqlRowCap(sql, maxRows + 1);
       const rows = await withTimeout(
-        conn.runSQL(sql),
+        conn.runSQL(capped.sql),
         timeoutMs,
         `SQL query timed out after ${timeoutMs}ms`
       );
@@ -2178,6 +2229,9 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         cursor: cursorInfo.cursor,
         totalRows: limited.length,
         truncated: rows.length > limited.length,
+        ...(rows.length > limited.length
+          ? { truncationNote: `Result has more than ${maxRows} rows; only the first ${maxRows} are returned. Raise maxRows (up to 20000) or narrow the query.` }
+          : {}),
         ...(includeMetadata
           ? {
             metadata: {
@@ -2185,6 +2239,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
               columns: getRowColumns(firstPage),
               pageSize,
               maxRows,
+              rowCapAppliedInSql: capped.applied,
               timeoutMs,
               executionMs
             }
@@ -2264,7 +2319,13 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.spool.list": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const limit = clampNumber(args?.limit, 200, 1, 5000);
-      const rows = await querySpoolEntries(conn, limit);
+      const rows = await querySpoolEntries(conn, {
+        limit,
+        userName: args?.userName ? requireIbmObjectName(args.userName, "userName") : undefined,
+        outputQueue: args?.outputQueue ? requireIbmObjectName(args.outputQueue, "outputQueue") : undefined,
+        outputQueueLibrary: args?.outputQueueLibrary ? requireIbmObjectName(args.outputQueueLibrary, "outputQueueLibrary") : undefined,
+        jobName: args?.jobName ? requireSpoolJobFilter(args.jobName) : undefined
+      });
       return json(rows.map(normalizeSpoolEntry));
     }
     case "ibmi.spool.read": {
@@ -2273,29 +2334,33 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const jobName = Tools.sqlString(String(args.jobName));
       const fileName = Tools.sqlString(String(args.spooledFileName));
       const fileNbr = clampNumber(args.spooledFileNumber, 1, 1, 999999999);
-      const rows = await conn.runSQL(`select line_number, spooled_data from table(qsys2.display_spooled_file_data(${jobName}, ${fileName}, ${fileNbr})) fetch first ${limit} rows only`);
+      // DISPLAY_SPOOLED_FILE_DATA returns ORDINAL_POSITION and SPOOLED_DATA.
+      const rows = await conn.runSQL(
+        `select ordinal_position, spooled_data from table(qsys2.display_spooled_file_data(${jobName}, ${fileName}, ${fileNbr})) ` +
+        `order by ordinal_position fetch first ${limit} rows only`
+      );
       return json(rows.map(normalizeSpoolLine));
     }
     case "ibmi.spool.hold": {
       const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "qsys.write", args);
-      const command = buildSpoolCommand("HLDSPFL", args);
+      const command = buildSpoolCommand("HLDSPLF", args);
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.spool.release": {
       const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "qsys.write", args);
       const command = buildSpoolCommand("RLSSPLF", args);
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.spool.delete": {
       const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "qsys.write", args);
       const command = buildSpoolCommand("DLTSPLF", args);
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.spool.move": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -2305,7 +2370,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const outQueue = requireIbmObjectName(args.outQueue, "outQueue");
       const command = `${baseCommand} OUTQ(${outQueueLibrary}/${outQueue})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.jobs.list": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -2325,7 +2390,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const hold = Boolean(args?.holdOnJobQueue) ? "*JOBQ" : "*NO";
       const command = `HLDJOB JOB(${jobName}) HOLD(${hold})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.jobs.release": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -2333,7 +2398,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const jobName = requireJobName(args.jobName);
       const command = `RLSJOB JOB(${jobName})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.jobs.end": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -2346,7 +2411,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const delaySeconds = clampNumber(args?.delaySeconds, 30, 0, 99999);
       const command = `ENDJOB JOB(${jobName}) OPTION(${option}) DELAY(${delaySeconds})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.subsystems.list": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -2371,7 +2436,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const subsystemDescription = requireQualifiedObject(args.subsystemDescription, "subsystemDescription");
       const command = `STRSBS SBSD(${subsystemDescription.library}/${subsystemDescription.object})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.subsystems.end": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -2384,7 +2449,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const delaySeconds = clampNumber(args?.delaySeconds, 30, 0, 99999);
       const command = `ENDSBS SBS(${subsystem}) OPTION(${option}) DELAY(${delaySeconds})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.msgq.read": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -2405,12 +2470,15 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       }
       const message = String(args.message || "");
       if (!message.trim()) throw new Error("message is required");
-      const mappedMessageType = messageType === "*INQ" ? "*INQ" : "*INFO";
-      const command = mappedMessageType === "*INQ"
-        ? `SNDMSG MSG(${quoteClString(message)}) TOMSGQ(${library}/${messageQueue}) MSGTYPE(*INQ) RPYMSGQ(${library}/${messageQueue})`
-        : `SNDMSG MSG(${quoteClString(message)}) TOMSGQ(${library}/${messageQueue}) MSGTYPE(*INFO)`;
+      const command = buildSendMessageCommand(message, library, messageQueue, messageType);
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, requestedMessageType: messageType, mappedMessageType, ...cmdResult });
+      return commandOutcome({
+        ok: cmdResult.code === 0,
+        command,
+        requestedMessageType: messageType,
+        mappedMessageType: messageType,
+        ...cmdResult
+      });
     }
     case "ibmi.msgq.reply": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -2422,16 +2490,16 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       if (!reply.trim()) throw new Error("reply is required");
       const command = `SNDRPY MSGKEY(${messageKey}) MSGQ(${library}/${messageQueue}) RPY(${quoteClString(reply)})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.locks.list": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const limit = clampNumber(args?.limit, 200, 1, 5000);
       const rows = await queryLockEntries(conn, {
-        objectLibrary: args?.objectLibrary,
-        objectName: args?.objectName,
-        objectType: args?.objectType,
-        member: args?.member,
+        objectLibrary: args?.objectLibrary ? requireIbmObjectName(args.objectLibrary, "objectLibrary") : undefined,
+        objectName: args?.objectName ? requireIbmObjectName(args.objectName, "objectName") : undefined,
+        objectType: args?.objectType ? requireObjectTypeValue(args.objectType, "objectType") : undefined,
+        member: args?.member ? requireIbmObjectName(args.member, "member") : undefined,
         limit
       });
       return json(rows);
@@ -2452,8 +2520,12 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const queue = requireIbmObjectName(args.queue, "queue");
       const message = String(args.message || "");
       if (!message) throw new Error("message is required");
+      let primaryError: string;
       try {
-        await conn.runSQL(`call qsys2.send_data_queue(${Tools.sqlString(message)}, ${Tools.sqlString(queue)}, ${Tools.sqlString(library)})`);
+        await conn.runSQL(
+          `call qsys2.send_data_queue(message_data => ${Tools.sqlString(message)}, ` +
+          `data_queue => ${Tools.sqlString(queue)}, data_queue_library => ${Tools.sqlString(library)})`
+        );
         return json({
           ok: true,
           method: "qsys2.send_data_queue",
@@ -2461,18 +2533,29 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
           queue,
           messageLength: message.length
         });
-      } catch {
-        const command = `SNDDTAQ DTAQ(${library}/${queue}) DTA(${quoteClString(message)})`;
-        const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-        return json({ ok: cmdResult.code === 0, method: "cl.snddtaq", command, ...cmdResult });
+      } catch (err: any) {
+        primaryError = err?.message || String(err);
       }
+      // Older releases without QSYS2.SEND_DATA_QUEUE: call the QSNDDTAQ API.
+      // There is no SNDDTAQ CL command.
+      const command = buildQsnddtaqCall(library, queue, message);
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return commandOutcome({
+        ok: cmdResult.code === 0,
+        method: "api.qsnddtaq",
+        command,
+        primaryError,
+        ...cmdResult
+      });
     }
     case "ibmi.dataqueue.receive": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const library = requireIbmObjectName(args.library, "library");
       const queue = requireIbmObjectName(args.queue, "queue");
-      const waitSeconds = clampNumber(args?.waitSeconds, 0, 0, 999999);
-      const remove = Boolean(args?.remove ?? true);
+      const waitSeconds = clampNumber(args?.waitSeconds, 0, 0, DATA_QUEUE_MAX_WAIT_SECONDS);
+      // Peek by default. Removing an entry changes the queue, so it goes
+      // through the same write gate as the other write tools.
+      const remove = args?.remove === true;
       if (remove) enforceWritable(ctx, conn, "qsys.write", args);
       const rows = await queryDataQueueEntries(conn, { library, queue, waitSeconds, remove });
       return json(rows);
@@ -2489,12 +2572,16 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       enforceWritable(ctx, conn, "qsys.write", args);
       const library = requireIbmObjectName(args.library, "library");
       const dataArea = requireIbmObjectName(args.dataArea, "dataArea");
-      const value = String(args.value || "");
-      const startPosition = clampNumber(args?.startPosition, 1, 1, 2000);
-      const length = clampNumber(args?.length, Math.max(value.length, 1), 1, 2000);
-      const command = `CHGDTAARA DTAARA(${library}/${dataArea} (${startPosition} ${length})) VALUE(${quoteClString(value)})`;
+      const value = String(args.value ?? "");
+      let info: ReturnType<typeof normalizeDataAreaInfoRow> | undefined;
+      try {
+        info = (await queryDataAreaInfo(conn, { library, dataArea }))[0];
+      } catch {
+        info = undefined;
+      }
+      const command = buildChangeDataAreaCommand(library, dataArea, value, info, args);
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, dataAreaType: info?.type || null, ...cmdResult });
     }
     case "ibmi.audit.list": {
       const data = await listAuditRecords({
@@ -2547,6 +2634,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const journal = requireIbmObjectName(args.journal, "journal");
       const objectLibrary = args?.objectLibrary ? requireIbmObjectName(args.objectLibrary, "objectLibrary") : undefined;
       const objectName = args?.objectName ? requireIbmObjectName(args.objectName, "objectName") : undefined;
+      const objectType = args?.objectType ? requireObjectTypeValue(args.objectType, "objectType") : undefined;
       const journalCode = args?.journalCode ? requireJournalCode(args.journalCode) : undefined;
       const entryType = args?.entryType ? requireJournalEntryType(args.entryType) : undefined;
       const userName = args?.userName ? requireIbmObjectName(args.userName, "userName") : undefined;
@@ -2560,6 +2648,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         journal,
         objectLibrary,
         objectName,
+        objectType,
         journalCode,
         entryType,
         userName,
@@ -2607,7 +2696,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const threshold = clampNumber(args?.threshold, 1000000, 1, 1000000000);
       const command = `CRTJRNRCV JRNRCV(${lib}/${rcv}) THRESHOLD(${threshold})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({
+      return commandOutcome({
         ok: cmdResult.code === 0,
         command,
         ...cmdResult
@@ -2622,7 +2711,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const rcv = requireIbmObjectName(args.receiver, "receiver");
       const command = `CRTJRN JRN(${lib}/${jrn}) JRNRCV(${rcvLib}/${rcv})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({
+      return commandOutcome({
         ok: cmdResult.code === 0,
         command,
         ...cmdResult
@@ -2637,7 +2726,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const rcv = requireIbmObjectName(args.receiver, "receiver");
       const command = `CHGJRN JRN(${jrnLib}/${jrn}) JRNRCV(${rcvLib}/${rcv})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({
+      return commandOutcome({
         ok: cmdResult.code === 0,
         command,
         ...cmdResult
@@ -2656,7 +2745,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       }
       const command = `STRJRNPF FILE(${lib}/${file}) JRN(${jrnLib}/${jrn}) IMAGES(${images})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({
+      return commandOutcome({
         ok: cmdResult.code === 0,
         command,
         ...cmdResult
@@ -2669,7 +2758,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const file = requireIbmObjectName(args.file, "file");
       const command = `ENDJRNPF FILE(${lib}/${file})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({
+      return commandOutcome({
         ok: cmdResult.code === 0,
         command,
         ...cmdResult
@@ -2684,7 +2773,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const objectPath = requireIfsPath(args.path, "path");
       const command = `STRJRNOBJ OBJ((${quoteClString(objectPath)} ${objectType})) JRN(${journalLibrary}/${journal})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({
+      return commandOutcome({
         ok: cmdResult.code === 0,
         command,
         ...cmdResult
@@ -2697,7 +2786,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const objectPath = requireIfsPath(args.path, "path");
       const command = `ENDJRNOBJ OBJ((${quoteClString(objectPath)} ${objectType}))`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({
+      return commandOutcome({
         ok: cmdResult.code === 0,
         command,
         ...cmdResult
@@ -2709,7 +2798,9 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const journal = requireIbmObjectName(args.journal, "journal");
       const retentionDays = clampNumber(args?.retentionDays, 30, 1, 36500);
       const maxDeletes = clampNumber(args?.maxDeletes, 50, 1, 500);
-      const dryRun = Boolean(args?.dryRun);
+      // The schema documents dryRun as defaulting to true; only an explicit
+      // dryRun=false may delete receivers.
+      const dryRun = args?.dryRun === undefined || args?.dryRun === null ? true : Boolean(args.dryRun);
       if (!dryRun && !Boolean(args?.approve)) {
         throw new Error("ibmi.journal.receivers.retention requires approve=true unless dryRun=true.");
       }
@@ -2744,7 +2835,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         });
       }
 
-      return json({
+      return commandOutcome({
         ok: deleted.every(item => item.ok),
         dryRun: false,
         retentionDays,
@@ -2990,6 +3081,7 @@ type JournalQueryOptions = {
   journal: string;
   objectLibrary?: string;
   objectName?: string;
+  objectType?: string;
   journalCode?: string;
   entryType?: string;
   userName?: string;
@@ -3000,6 +3092,9 @@ type JournalQueryOptions = {
   sinceTimestamp?: string;
 };
 
+// Every filter is applied on the IBM i (table function parameters and WHERE
+// predicates) before FETCH FIRST, so the row cap never hides matching entries.
+// Rows come back newest first.
 async function queryJournalEntries(conn: any, options: JournalQueryOptions) {
   let rows: Array<Record<string, unknown>>;
   try {
@@ -3008,42 +3103,7 @@ async function queryJournalEntries(conn: any, options: JournalQueryOptions) {
     rows = await queryJournalEntriesViaOutfile(conn, options);
   }
 
-  let normalized = rows.map(normalizeJournalEntry);
-  if (options.objectLibrary) {
-    normalized = normalized.filter(row => (row.objectLibrary || "") === options.objectLibrary);
-  }
-  if (options.objectName) {
-    normalized = normalized.filter(row => (row.objectName || "") === options.objectName);
-  }
-  if (options.journalCode) {
-    normalized = normalized.filter(row => (row.journalCode || "") === options.journalCode);
-  }
-  if (options.entryType) {
-    normalized = normalized.filter(row => (row.entryType || "") === options.entryType);
-  }
-  if (options.userName) {
-    normalized = normalized.filter(row => (row.userName || "") === options.userName);
-  }
-  if (options.jobName) {
-    normalized = normalized.filter(row => (row.jobName || "").includes(options.jobName!));
-  }
-  if (options.programName) {
-    normalized = normalized.filter(row => (row.programName || "") === options.programName);
-  }
-  if (typeof options.sinceSequence === "number") {
-    normalized = normalized.filter(row => typeof row.sequence === "number" && row.sequence >= options.sinceSequence!);
-  }
-  if (options.sinceTimestamp) {
-    const cutoff = Date.parse(options.sinceTimestamp);
-    if (Number.isFinite(cutoff)) {
-      normalized = normalized.filter(row => {
-        if (!row.timestamp) return false;
-        const value = Date.parse(row.timestamp);
-        return Number.isFinite(value) && value >= cutoff;
-      });
-    }
-  }
-
+  const normalized = rows.map(normalizeJournalEntry);
   normalized.sort((a, b) => {
     const aSeq = typeof a.sequence === "number" ? a.sequence : -1;
     const bSeq = typeof b.sequence === "number" ? b.sequence : -1;
@@ -3054,6 +3114,27 @@ async function queryJournalEntries(conn: any, options: JournalQueryOptions) {
   });
 
   return normalized.slice(0, options.limit);
+}
+
+// Turns an ISO-8601 or IBM i style timestamp into a Db2 for i timestamp
+// expression in the system's local time. Values with an explicit zone (Z or
+// +hh:mm) are converted from UTC with CURRENT TIMEZONE; values without a zone
+// are taken as system local time.
+function sqlTimestampExpression(value: string) {
+  const raw = String(value || "").trim();
+  const local = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T-](\d{2})[:.](\d{2})(?:[:.](\d{2})(?:\.(\d{1,6}))?)?)?$/);
+  if (local) {
+    const [, y, mo, d, h = "00", mi = "00", s = "00", frac = "0"] = local;
+    return `timestamp('${y}-${mo}-${d}-${h}.${mi}.${s}.${frac.padEnd(6, "0")}')`;
+  }
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw)) {
+    throw new Error(`Invalid sinceTimestamp: ${value}`);
+  }
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) throw new Error(`Invalid sinceTimestamp: ${value}`);
+  const iso = new Date(parsed).toISOString();
+  const db2 = `${iso.slice(0, 10)}-${iso.slice(11, 13)}.${iso.slice(14, 16)}.${iso.slice(17, 19)}.${iso.slice(20, 23)}000`;
+  return `(timestamp('${db2}') + current timezone)`;
 }
 
 type JobQueryOptions = {
@@ -3156,31 +3237,61 @@ type MessageQueueOptions = {
   limit: number;
 };
 
+// Newest messages first. The table function form takes QUEUE_LIBRARY and
+// QUEUE_NAME; the view form is the fallback for releases without it.
 async function queryMessageQueueEntries(conn: any, options: MessageQueueOptions) {
   let rows: Array<Record<string, unknown>>;
   try {
     rows = await conn.runSQL(
-      `select * from table(qsys2.message_queue_info(message_queue_name => ${Tools.sqlString(options.messageQueue)}, message_queue_library => ${Tools.sqlString(options.library)})) fetch first ${options.limit} rows only`
+      `select * from table(qsys2.message_queue_info(queue_library => ${Tools.sqlString(options.library)}, queue_name => ${Tools.sqlString(options.messageQueue)})) ` +
+      `order by message_timestamp desc fetch first ${options.limit} rows only`
     );
   } catch {
     rows = await conn.runSQL(
-      `select * from qsys2.message_queue_info where upper(message_queue_name)=${Tools.sqlString(options.messageQueue)} and upper(message_queue_library)=${Tools.sqlString(options.library)} fetch first ${options.limit} rows only`
+      `select * from qsys2.message_queue_info where message_queue_name=${Tools.sqlString(options.messageQueue)} and message_queue_library=${Tools.sqlString(options.library)} ` +
+      `order by message_timestamp desc fetch first ${options.limit} rows only`
     );
   }
   return rows.map(normalizeMessageQueueEntry);
 }
 
-async function querySpoolEntries(conn: any, limit: number) {
+type SpoolQueryOptions = {
+  limit: number;
+  userName?: string;
+  outputQueue?: string;
+  outputQueueLibrary?: string;
+  jobName?: string;
+};
+
+// QSYS2.OUTPUT_QUEUE_ENTRIES columns: USER_NAME, OUTPUT_QUEUE_NAME,
+// OUTPUT_QUEUE_LIBRARY_NAME, JOB_NAME (qualified), CREATE_TIMESTAMP, ...
+function buildSpoolWhereClause(options: SpoolQueryOptions) {
+  const predicates: string[] = [];
+  if (options.userName) predicates.push(`user_name = ${Tools.sqlString(options.userName)}`);
+  if (options.outputQueue) predicates.push(`output_queue_name = ${Tools.sqlString(options.outputQueue)}`);
+  if (options.outputQueueLibrary) predicates.push(`output_queue_library_name = ${Tools.sqlString(options.outputQueueLibrary)}`);
+  if (options.jobName) {
+    predicates.push(options.jobName.includes("/")
+      ? `job_name = ${Tools.sqlString(options.jobName)}`
+      : `job_name like ${Tools.sqlString(`%/${options.jobName}`)}`);
+  }
+  return predicates.length > 0 ? ` where ${predicates.join(" and ")}` : "";
+}
+
+async function querySpoolEntries(conn: any, options: SpoolQueryOptions) {
+  const limit = options.limit;
+  const where = buildSpoolWhereClause(options);
   const queries = [
-    `select * from qsys2.output_queue_entries fetch first ${limit} rows only`,
-    `select * from table(qsys2.output_queue_entries()) fetch first ${limit} rows only`,
-    `select job_name, spooled_file_name, spooled_file_number, output_queue_name, total_pages, file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
-    `select job_name, spooled_file_name, spooled_file_number, output_queue_name, total_pages, cast('' as varchar(10)) as file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
-    `select job_name, spooled_file_name, cast(0 as integer) as spooled_file_number, output_queue_name, total_pages, file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
-    `select job_name, spooled_file_name, cast(0 as integer) as spooled_file_number, output_queue_name, total_pages, cast('' as varchar(10)) as file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
-    `select * from qsys2.spooled_file_info fetch first ${limit} rows only`,
-    `select * from table(qsys2.spooled_file_info()) fetch first ${limit} rows only`
+    `select * from qsys2.output_queue_entries${where} order by create_timestamp desc fetch first ${limit} rows only`,
+    `select * from qsys2.output_queue_entries${where} fetch first ${limit} rows only`
   ];
+  if (!where) {
+    queries.push(
+      `select * from table(qsys2.output_queue_entries()) fetch first ${limit} rows only`,
+      `select * from qsys2.spooled_file_info fetch first ${limit} rows only`,
+      `select * from table(qsys2.spooled_file_info()) fetch first ${limit} rows only`
+    );
+  }
 
   let lastError: unknown;
   for (const sql of queries) {
@@ -3214,18 +3325,33 @@ type LockQueryOptions = {
   limit: number;
 };
 
+// QSYS2.OBJECT_LOCK_INFO is a view; filters go into its WHERE clause so the row
+// cap applies to matching locks only.
 async function queryLockEntries(conn: any, options: LockQueryOptions) {
+  const base: string[] = [];
+  if (options.objectLibrary) base.push(`object_schema = ${Tools.sqlString(options.objectLibrary)}`);
+  if (options.objectName) base.push(`object_name = ${Tools.sqlString(options.objectName)}`);
+  if (options.objectType) base.push(`object_type = ${Tools.sqlString(options.objectType)}`);
+  const memberPredicate = options.member ? `system_table_member = ${Tools.sqlString(options.member)}` : undefined;
+  const whereOf = (predicates: string[]) => predicates.length > 0 ? ` where ${predicates.join(" and ")}` : "";
+
   let rows: Array<Record<string, unknown>>;
+  let filterMemberLocally = false;
   try {
-    rows = await conn.runSQL(`select * from table(qsys2.object_lock_info()) fetch first ${Math.min(options.limit, 500)} rows only`);
-  } catch {
-    rows = await conn.runSQL(`select * from qsys2.object_lock_info fetch first ${Math.min(options.limit, 500)} rows only`);
+    rows = await conn.runSQL(
+      `select * from qsys2.object_lock_info${whereOf(memberPredicate ? [...base, memberPredicate] : base)} fetch first ${options.limit} rows only`
+    );
+  } catch (err) {
+    if (!memberPredicate) throw err;
+    // Fallback when the member column is named differently on this release:
+    // keep the object filters in SQL and match the member locally.
+    rows = await conn.runSQL(`select * from qsys2.object_lock_info${whereOf(base)} fetch first 5000 rows only`);
+    filterMemberLocally = true;
   }
   let normalized = rows.map(normalizeLockEntry);
-  if (options.objectLibrary) normalized = normalized.filter(row => (row.objectLibrary || "") === String(options.objectLibrary).toUpperCase());
-  if (options.objectName) normalized = normalized.filter(row => (row.objectName || "") === String(options.objectName).toUpperCase());
-  if (options.objectType) normalized = normalized.filter(row => (row.objectType || "") === String(options.objectType).toUpperCase());
-  if (options.member) normalized = normalized.filter(row => (row.member || "") === String(options.member).toUpperCase());
+  if (filterMemberLocally && options.member) {
+    normalized = normalized.filter(row => (row.member || "") === options.member);
+  }
   return normalized.slice(0, options.limit);
 }
 
@@ -3235,7 +3361,7 @@ function normalizeLockEntry(row: Record<string, unknown>) {
     objectLibrary: toNullableString(pickFirst(row, ["OBJECT_SCHEMA", "OBJECT_LIBRARY", "OBJLIB"])),
     objectName: toNullableString(pickFirst(row, ["OBJECT_NAME", "OBJNAME"])),
     objectType: toNullableString(pickFirst(row, ["OBJECT_TYPE", "OBJTYPE"])),
-    member: toNullableString(pickFirst(row, ["MEMBER_NAME", "MEMBER"])),
+    member: toNullableString(pickFirst(row, ["SYSTEM_TABLE_MEMBER", "MEMBER_NAME", "MEMBER"])),
     lockState: toNullableString(pickFirst(row, ["LOCK_STATE", "LOCK_STATUS", "STATUS"])),
     lockScope: toNullableString(pickFirst(row, ["LOCK_SCOPE", "SCOPE"])),
     lockHolderJob: toNullableString(pickFirst(row, ["JOB_NAME", "LOCK_JOB_NAME"])),
@@ -3282,28 +3408,33 @@ type DataQueueReceiveOptions = {
   remove: boolean;
 };
 
+const DATA_QUEUE_MAX_WAIT_SECONDS = 60;
+
+// remove=false never falls back to anything that takes the entry off the
+// queue: it peeks with RECEIVE_DATA_QUEUE(REMOVE => 'NO') and then with the
+// read-only DATA_QUEUE_ENTRIES service.
 async function queryDataQueueEntries(conn: any, options: DataQueueReceiveOptions) {
+  const queue = Tools.sqlString(options.queue);
+  const library = Tools.sqlString(options.library);
+  const waitSeconds = Math.max(0, Math.min(DATA_QUEUE_MAX_WAIT_SECONDS, Math.floor(options.waitSeconds)));
   let rows: Array<Record<string, unknown>>;
+  if (options.remove) {
+    rows = await conn.runSQL(
+      `select * from table(qsys2.receive_data_queue(data_queue => ${queue}, data_queue_library => ${library}, ` +
+      `wait_time => ${waitSeconds}, remove => 'YES')) fetch first 1 rows only`
+    );
+    return rows.map(normalizeDataQueueEntry);
+  }
   try {
     rows = await conn.runSQL(
-      `select * from table(qsys2.receive_data_queue(${Tools.sqlString(options.queue)}, ${Tools.sqlString(options.library)}, ${Tools.sqlString(options.remove ? "YES" : "NO")}, ${options.waitSeconds})) fetch first 1 rows only`
+      `select * from table(qsys2.receive_data_queue(data_queue => ${queue}, data_queue_library => ${library}, ` +
+      `wait_time => ${waitSeconds}, remove => 'NO')) fetch first 1 rows only`
     );
   } catch {
-    try {
-      rows = await conn.runSQL(
-        `select * from table(qsys2.receive_data_queue(${Tools.sqlString(options.queue)}, ${Tools.sqlString(options.library)})) fetch first 1 rows only`
-      );
-    } catch {
-      try {
-        rows = await conn.runSQL(
-          `select * from table(qsys2.data_queue_entries(${Tools.sqlString(options.queue)}, ${Tools.sqlString(options.library)})) fetch first 1 rows only`
-        );
-      } catch {
-        rows = await conn.runSQL(
-          `select * from qsys2.data_queue_entries where upper(data_queue_name)=${Tools.sqlString(options.queue)} and upper(data_queue_library)=${Tools.sqlString(options.library)} fetch first 1 rows only`
-        );
-      }
-    }
+    rows = await conn.runSQL(
+      `select * from table(qsys2.data_queue_entries(data_queue => ${queue}, data_queue_library => ${library})) ` +
+      `order by ordinal_position fetch first 1 rows only`
+    );
   }
   return rows.map(normalizeDataQueueEntry);
 }
@@ -3344,6 +3475,7 @@ function normalizeDataAreaInfoRow(row: Record<string, unknown>) {
     dataArea: toNullableString(pickFirst(row, ["DATA_AREA_NAME", "OBJECT_NAME"])),
     type: toNullableString(pickFirst(row, ["DATA_AREA_TYPE", "OBJECT_TYPE"])),
     length: toNullableNumber(pickFirst(row, ["LENGTH", "DATA_AREA_LENGTH"])),
+    decimalPositions: toNullableNumber(pickFirst(row, ["DECIMAL_POSITIONS"])),
     value: toNullableString(pickFirst(row, ["CHARACTER_VALUE", "VALUE", "DECIMAL_VALUE"])),
     updatedAt: toNullableString(pickFirst(row, ["LAST_CHANGED_TIMESTAMP", "CHANGE_TIMESTAMP"]))
   };
@@ -3359,25 +3491,86 @@ function buildSpoolCommand(commandName: string, args: any) {
   return `${commandName} FILE(${spooledFileName}) JOB(${jobName}) SPLNBR(${spooledFileNumber})`;
 }
 
+function isQualifiedJobName(value: string) {
+  return /^[^/]+\/[^/]+\/[^/]+$/.test(value);
+}
+
 async function queryJournalEntriesViaDisplayJournal(conn: any, options: JournalQueryOptions) {
-  const sampleSize = Math.min(options.limit * 5, 5000);
+  if (options.objectLibrary && !options.objectName) {
+    // A library on its own is not a DISPLAY_JOURNAL filter; the outfile path
+    // filters it in SQL.
+    throw new Error("objectLibrary without objectName is handled by the DSPJRN outfile query");
+  }
+  const params = [
+    `journal_library => ${Tools.sqlString(options.journalLibrary)}`,
+    `journal_name => ${Tools.sqlString(options.journal)}`
+  ];
+  const where: string[] = [];
+  const since = options.sinceTimestamp ? sqlTimestampExpression(options.sinceTimestamp) : undefined;
+  if (typeof options.sinceSequence === "number" || since) {
+    // Search the whole receiver chain, not only the attached receiver, when a
+    // starting point is given.
+    params.push(`starting_receiver_name => '*CURCHAIN'`);
+  }
+  if (typeof options.sinceSequence === "number") {
+    params.push(`starting_sequence => ${Math.max(0, Math.floor(options.sinceSequence))}`);
+    where.push(`sequence_number >= ${Math.max(0, Math.floor(options.sinceSequence))}`);
+    if (since) where.push(`entry_timestamp >= ${since}`);
+  } else if (since) {
+    params.push(`starting_timestamp => ${since}`);
+  }
+  if (options.journalCode) params.push(`journal_codes => ${Tools.sqlString(options.journalCode)}`);
+  if (options.entryType) params.push(`journal_entry_types => ${Tools.sqlString(options.entryType)}`);
+  if (options.objectName) {
+    params.push(`object_library => ${Tools.sqlString(options.objectLibrary || "*LIBL")}`);
+    params.push(`object_name => ${Tools.sqlString(options.objectName)}`);
+    const objectType = options.objectType || "*FILE";
+    params.push(`object_objtype => ${Tools.sqlString(objectType)}`);
+    if (objectType === "*FILE") params.push(`object_member => '*ALL'`);
+  }
+  if (options.userName) params.push(`user => ${Tools.sqlString(options.userName)}`);
+  if (options.programName) params.push(`program => ${Tools.sqlString(options.programName)}`);
+  if (options.jobName) {
+    if (isQualifiedJobName(options.jobName)) params.push(`job => ${Tools.sqlString(options.jobName)}`);
+    else where.push(`job_name = ${Tools.sqlString(options.jobName)}`);
+  }
+  const whereClause = where.length > 0 ? ` where ${where.join(" and ")}` : "";
   const rows = await conn.runSQL(
-    `select * from table(qsys2.display_journal(journal_name => ${Tools.sqlString(options.journal)}, journal_library => ${Tools.sqlString(options.journalLibrary)})) fetch first ${sampleSize} rows only`
+    `select * from table(qsys2.display_journal(${params.join(", ")}))${whereClause} ` +
+    `order by sequence_number desc fetch first ${options.limit} rows only`
   );
   return rows as Array<Record<string, unknown>>;
 }
 
+// DSPJRN writes to QTEMP, which belongs to one job. The CALL QCMDEXC and the
+// SELECT are sent in the same QZDFMDB2 request so they run in the same job.
 async function queryJournalEntriesViaOutfile(conn: any, options: JournalQueryOptions) {
-  const outfile = `MCPJ${String(Math.floor(Math.random() * 90000) + 10000)}`;
-  const fileFilter = options.objectLibrary && options.objectName
-    ? ` FILE((${options.objectLibrary}/${options.objectName}))`
-    : "";
-  const command = `DSPJRN JRN(${options.journalLibrary}/${options.journal}) OUTPUT(*OUTFILE) OUTFILE(QTEMP/${outfile})${fileFilter}`;
-  const result = await runClCommand(conn, command, "ile", undefined, 45000);
-  if (result.code !== 0) {
-    throw new Error(result.stderr || "Unable to query journal entries");
+  const outfile = `MCPJ${String(Math.floor(Math.random() * 900000) + 100000)}`;
+  const rangeOption = typeof options.sinceSequence === "number" || options.sinceTimestamp ? " RCVRNG(*CURCHAIN)" : "";
+  const command = `DSPJRN JRN(${options.journalLibrary}/${options.journal})${rangeOption} ` +
+    `OUTPUT(*OUTFILE) OUTFILFMT(*TYPE5) OUTFILE(QTEMP/${outfile})`;
+  const where: string[] = [];
+  if (options.objectLibrary) where.push(`JOLIB = ${Tools.sqlString(options.objectLibrary)}`);
+  if (options.objectName) where.push(`JOOBJ = ${Tools.sqlString(options.objectName)}`);
+  if (options.journalCode) where.push(`JOCODE = ${Tools.sqlString(options.journalCode)}`);
+  if (options.entryType) where.push(`JOENTT = ${Tools.sqlString(options.entryType)}`);
+  if (options.userName) where.push(`JOUSPF = ${Tools.sqlString(options.userName)}`);
+  if (options.programName) where.push(`JOPGM = ${Tools.sqlString(options.programName)}`);
+  if (options.jobName) {
+    if (isQualifiedJobName(options.jobName)) {
+      const [number, user, name] = options.jobName.split("/");
+      where.push(`JONBR = ${Tools.sqlString(number)}`, `JOUSER = ${Tools.sqlString(user)}`, `JOJOB = ${Tools.sqlString(name)}`);
+    } else {
+      where.push(`JOJOB = ${Tools.sqlString(options.jobName)}`);
+    }
   }
-  const rows = await conn.runSQL(`select * from QTEMP.${outfile}`);
+  if (typeof options.sinceSequence === "number") where.push(`JOSEQN >= ${Math.max(0, Math.floor(options.sinceSequence))}`);
+  if (options.sinceTimestamp) where.push(`JOTSTP >= ${sqlTimestampExpression(options.sinceTimestamp)}`);
+  const whereClause = where.length > 0 ? ` where ${where.join(" and ")}` : "";
+  const rows = await conn.runSQL([
+    `CALL QSYS2.QCMDEXC(${Tools.sqlString(command)});`,
+    `select * from QTEMP.${outfile}${whereClause} order by JOSEQN desc fetch first ${options.limit} rows only;`
+  ].join("\n"));
   return rows as Array<Record<string, unknown>>;
 }
 
@@ -3390,7 +3583,7 @@ function normalizeJournalEntry(row: Record<string, unknown>) {
   const objectName = toNullableString(pickFirst(row, ["OBJECT_NAME", "JOOBJ", "OBJNAME"]));
   const objectType = toNullableString(pickFirst(row, ["OBJECT_TYPE", "JOOBJT", "OBJTYPE"]));
   const jobName = toNullableString(pickFirst(row, ["JOB_NAME", "JOJOB", "JOB"]));
-  const userName = toNullableString(pickFirst(row, ["USER_NAME", "JOUSER", "USER"]));
+  const userName = toNullableString(pickFirst(row, ["USER_NAME", "CURRENT_USER", "JOUSPF", "JOUSER", "USER"]));
   const programName = toNullableString(pickFirst(row, ["PROGRAM_NAME", "JOPGM", "PROGRAM"]));
   return {
     source: "journal",
@@ -3813,6 +4006,180 @@ function toolError(message: string, error?: Record<string, any>) {
   };
 }
 
+function jsonError(message: string, obj: any) {
+  return {
+    isError: true,
+    content: [{ type: "text", text: `${message}\n${JSON.stringify(obj, null, 2)}` }],
+    structuredContent: {
+      ok: false,
+      data: obj,
+      error: { message }
+    }
+  };
+}
+
+// Returns the payload as normal JSON when the command worked and as a tool
+// error (isError) when it did not, so agents can't mistake a failure for "OK".
+function commandOutcome(payload: { ok: boolean; command?: string; stderr?: unknown; [key: string]: unknown }) {
+  if (payload.ok) return json(payload);
+  const detail = String(payload.stderr || "").trim().split(/\r?\n/)[0] || "";
+  const label = payload.command ? `Command failed: ${payload.command}` : "Command failed";
+  return jsonError(detail ? `${label} (${detail})` : label, payload);
+}
+
+function requireCommandSuccess(res: any, label: string) {
+  if (!res || res.code !== 0) {
+    const detail = String(res?.stderr || res?.stdout || "").trim();
+    throw new Error(`${label} failed (exit ${res?.code ?? "unknown"})${detail ? `: ${detail}` : ""}`);
+  }
+  return res;
+}
+
+const IFS_READ_DEFAULT_MAX_BYTES = 1024 * 1024;
+const IFS_READ_HARD_MAX_BYTES = 16 * 1024 * 1024;
+
+// Size of an IFS stream file from `ls -ldL`, or undefined when it can't be
+// determined (the download is then checked after the fact).
+async function statIfsFileSize(conn: any, remotePath: string): Promise<number | undefined> {
+  try {
+    const res = await conn.sendCommand({ command: `ls -ldL ${Tools.escapePath(remotePath)}` });
+    if (!res || res.code !== 0) return undefined;
+    const parts = String(res.stdout || "").trim().split(/\s+/);
+    if (parts.length < 5 || parts[0].startsWith("d")) return undefined;
+    const size = Number(parts[4]);
+    return Number.isFinite(size) && size >= 0 ? size : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Decodes data as UTF-8 text, or returns undefined when it is binary (contains
+// NUL bytes or is not valid UTF-8).
+function decodeUtf8Text(data: Buffer): string | undefined {
+  if (data.includes(0)) return undefined;
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(data);
+  } catch {
+    return undefined;
+  }
+}
+
+const SQL_TRAILING_ROW_CLAUSE = new RegExp(
+  "(?:fetch\\s+(?:first|next)\\s+(?:\\S+\\s+)?rows?\\s+only" +
+  "|for\\s+(?:read|fetch)\\s+only" +
+  "|for\\s+update(?:\\s+of\\s+[\\w\\s,\"]+)?" +
+  "|optimize\\s+for\\s+\\S+\\s+rows?" +
+  "|with\\s+(?:nc|ur|cs|rs|rr)(?:\\s+keep\\s+(?:update|exclusive|share)\\s+locks)?" +
+  "|limit\\s+\\S+(?:\\s+offset\\s+\\S+)?" +
+  "|offset\\s+\\S+\\s+rows?" +
+  "|skip\\s+locked\\s+data|use\\s+currently\\s+committed|wait\\s+for\\s+outcome)$"
+);
+
+// Adds FETCH FIRST n ROWS ONLY to a SELECT/WITH query so the row cap is applied
+// on the IBM i. Queries that already end with a row-limiting, locking or
+// isolation clause are left unchanged (the client-side slice still applies).
+function applySqlRowCap(sql: string, rowLimit: number): { sql: string; applied: boolean } {
+  const body = sql.replace(/[\s;]+$/, "");
+  const normalized = body
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n")
+    .map(line => line.replace(/--.*$/, ""))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (!/^(?:select|with)\b/.test(normalized)) return { sql, applied: false };
+  if (SQL_TRAILING_ROW_CLAUSE.test(normalized)) return { sql, applied: false };
+  return { sql: `${body}\nfetch first ${Math.max(1, Math.floor(rowLimit))} rows only`, applied: true };
+}
+
+function requireSpoolJobFilter(value: unknown) {
+  const raw = String(value || "").trim().toUpperCase();
+  return raw.includes("/") ? requireJobName(raw) : requireIbmObjectName(raw, "jobName");
+}
+
+function requireObjectTypeValue(value: unknown, label: string) {
+  const objectType = String(value || "").trim().toUpperCase();
+  if (!/^\*[A-Z]{2,9}$/.test(objectType)) throw new Error(`Invalid ${label}: ${value}`);
+  return objectType;
+}
+
+// SNDMSG only sends *INFO and *INQ messages; *COMP and *DIAG need SNDPGMMSG.
+function buildSendMessageCommand(message: string, library: string, messageQueue: string, messageType: string) {
+  const queue = `${library}/${messageQueue}`;
+  switch (messageType) {
+    case "*INQ":
+      return `SNDMSG MSG(${quoteClString(message)}) TOMSGQ(${queue}) MSGTYPE(*INQ) RPYMSGQ(${queue})`;
+    case "*COMP":
+    case "*DIAG":
+      return `SNDPGMMSG MSG(${quoteClString(message)}) TOMSGQ(${queue}) MSGTYPE(${messageType})`;
+    default:
+      return `SNDMSG MSG(${quoteClString(message)}) TOMSGQ(${queue}) MSGTYPE(*INFO)`;
+  }
+}
+
+// CALL to the Send Data Queue (QSNDDTAQ) API with explicitly typed parameters:
+// queue name CHAR(10), library CHAR(10), data length DEC(5,0), data.
+function buildQsnddtaqCall(library: string, queue: string, message: string) {
+  if (/[^\x20-\x7E]/.test(message)) {
+    throw new Error("QSYS2.SEND_DATA_QUEUE is not available and the QSNDDTAQ fallback only supports printable single-byte text.");
+  }
+  if (message.length > 5000) {
+    throw new Error("QSYS2.SEND_DATA_QUEUE is not available and the QSNDDTAQ fallback is limited to 5000 characters.");
+  }
+  const length = message.length;
+  return `CALL PGM(QSYS/QSNDDTAQ) PARM((${quoteClString(queue)} (*CHAR 10)) (${quoteClString(library)} (*CHAR 10)) ` +
+    `(${length} (*DEC 5 0)) (${quoteClString(message)} (*CHAR ${length})))`;
+}
+
+// Formats CHGDTAARA for the data area's type: *DEC takes an unquoted number and
+// *LGL takes '0' or '1' (neither allows a substring); *CHAR keeps the
+// substring form so only the given positions change.
+function buildChangeDataAreaCommand(
+  library: string,
+  dataArea: string,
+  value: string,
+  info: { type?: string | null; length?: number | null; decimalPositions?: number | null } | undefined,
+  args: any
+) {
+  const target = `${library}/${dataArea}`;
+  const type = String(info?.type || "*CHAR").trim().toUpperCase();
+  const substringRequested = args?.startPosition !== undefined || args?.length !== undefined;
+  if (type === "*DEC") {
+    if (substringRequested) throw new Error("startPosition and length are only valid for *CHAR data areas");
+    const text = value.trim();
+    const match = text.match(/^([+-]?)(\d*)(?:\.(\d*))?$/);
+    if (!match || (match[2] === "" && !match[3])) throw new Error(`Value for *DEC data area must be numeric: ${value}`);
+    const intDigits = match[2].replace(/^0+(?=\d)/, "");
+    const fraction = match[3] || "";
+    const decimals = typeof info?.decimalPositions === "number" ? info.decimalPositions : undefined;
+    const totalDigits = typeof info?.length === "number" ? info.length : undefined;
+    if (decimals !== undefined && fraction.replace(/0+$/, "").length > decimals) {
+      throw new Error(`Value has more than ${decimals} decimal positions`);
+    }
+    if (totalDigits !== undefined && decimals !== undefined && intDigits.replace(/^0+/, "").length > totalDigits - decimals) {
+      throw new Error(`Value does not fit a *DEC ${totalDigits} ${decimals} data area`);
+    }
+    const formatted = `${match[1] === "-" ? "-" : ""}${intDigits || "0"}${fraction ? `.${fraction}` : ""}`;
+    return `CHGDTAARA DTAARA(${target}) VALUE(${formatted})`;
+  }
+  if (type === "*LGL") {
+    if (substringRequested) throw new Error("startPosition and length are only valid for *CHAR data areas");
+    const normalized = value.trim().toLowerCase();
+    const logical = ["1", "true", "*on", "on", "yes"].includes(normalized)
+      ? "1"
+      : ["0", "false", "*off", "off", "no"].includes(normalized) ? "0" : undefined;
+    if (!logical) throw new Error(`Value for *LGL data area must be 0 or 1: ${value}`);
+    return `CHGDTAARA DTAARA(${target}) VALUE('${logical}')`;
+  }
+  const startPosition = clampNumber(args?.startPosition, 1, 1, 2000);
+  const length = clampNumber(args?.length, Math.max(value.length, 1), 1, 2000);
+  if (typeof info?.length === "number" && info.length > 0 && startPosition + length - 1 > info.length) {
+    throw new Error(`Positions ${startPosition} to ${startPosition + length - 1} are outside the ${info.length}-character data area`);
+  }
+  return `CHGDTAARA DTAARA(${target} (${startPosition} ${length})) VALUE(${quoteClString(value)})`;
+}
+
 function getConnectionName(ctx: McpContext, args: any): string {
   const name = args?.connectionName || ctx.activeName;
   if (!name) throw new Error("connectionName is required (no active connection)");
@@ -3881,13 +4248,14 @@ async function applyLibraryList(conn: any, libraryList?: string[], currentLibrar
     const normalized = libraryList.map((l: string) => String(l).toUpperCase());
     const invalid = normalized.find((l: string) => !conn.validQsysName(l));
     if (invalid) throw new Error(`Invalid library name: ${invalid}`);
-    const libs = normalized.join(" ");
-    await conn.sendQsh({ command: `system \"CHGLIBL LIBL(${libs})\"` });
+    // '$' is escaped so names like $LIB are not expanded by qsh.
+    const libs = normalized.join(" ").replace(/\$/g, "\\$");
+    requireCommandSuccess(await conn.sendQsh({ command: `system \"CHGLIBL LIBL(${libs})\"` }), "CHGLIBL");
   }
   if (currentLibrary) {
     const lib = String(currentLibrary).toUpperCase();
     if (!conn.validQsysName(lib)) throw new Error(`Invalid current library: ${lib}`);
-    await conn.sendQsh({ command: `system \"CHGCURLIB ${lib}\"` });
+    requireCommandSuccess(await conn.sendQsh({ command: `system \"CHGCURLIB ${lib.replace(/\$/g, "\\$")}\"` }), "CHGCURLIB");
   }
 }
 
@@ -4144,17 +4512,21 @@ function normalizeSpoolEntry(row: Record<string, unknown>) {
     spooledFileName: toNullableString(pickFirst(row, ["SPOOLED_FILE_NAME", "SPOOLED_FILE", "SPLF_NAME"])) || "",
     spooledFileNumber: toNullableNumber(pickFirst(row, ["SPOOLED_FILE_NUMBER", "SPLF_NUMBER", "FILE_NUMBER"])),
     outputQueue: toNullableString(pickFirst(row, ["OUTPUT_QUEUE_NAME", "OUTQ_NAME", "OUTPUT_QUEUE"])) || "",
+    outputQueueLibrary: toNullableString(pickFirst(row, ["OUTPUT_QUEUE_LIBRARY_NAME", "OUTPUT_QUEUE_LIBRARY"])) || "",
+    userName: toNullableString(pickFirst(row, ["USER_NAME", "JOB_USER"])) || "",
+    createdAt: toNullableString(pickFirst(row, ["CREATE_TIMESTAMP", "CREATION_TIMESTAMP"])),
     totalPages: toNullableNumber(pickFirst(row, ["TOTAL_PAGES", "PAGES"])),
     status: toNullableString(pickFirst(row, ["FILE_STATUS", "STATUS"])) || ""
   };
 }
 
 function normalizeSpoolLine(row: Record<string, unknown>) {
+  const position = pickFirst(row, ["ORDINAL_POSITION", "LINE_NUMBER"]);
   return {
     ...row,
     source: "spool",
-    lineNumber: Number.isFinite(Number(row.LINE_NUMBER)) ? Number(row.LINE_NUMBER) : null,
-    text: String(row.SPOOLED_DATA || "")
+    lineNumber: Number.isFinite(Number(position)) && position !== null && position !== "" ? Number(position) : null,
+    text: String(row.SPOOLED_DATA ?? "")
   };
 }
 
