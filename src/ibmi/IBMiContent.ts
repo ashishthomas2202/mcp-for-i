@@ -183,10 +183,21 @@ export class IBMiContent {
   }
 
   async getLibraries(filter = "*"): Promise<IBMiObject[]> {
-    const libFilter = filter === "*" ? "*ALL" : filter;
-    const rows = await this.ibmi.runSQL(
-      `select OBJNAME, OBJTEXT from table(QSYS2.OBJECT_STATISTICS(${Tools.sqlString(libFilter)}, 'LIB', '*ALLSIMPLE'))`
-    );
+    const normalized = String(filter || "*").trim().toUpperCase() || "*";
+    let sql: string;
+    if (normalized === "*" || normalized === "*ALL") {
+      sql = `select OBJNAME, OBJTEXT from table(QSYS2.OBJECT_STATISTICS('*ALL', 'LIB', '*ALLSIMPLE'))`;
+    } else if (normalized.includes("*")) {
+      // Generic filter such as DEV*: libraries are *LIB objects in QSYS, so list
+      // those and match the name with LIKE.
+      if (!/^[A-Z0-9#@$_.*]{1,11}$/.test(normalized)) throw new Error(`Invalid library filter: ${filter}`);
+      const pattern = normalized.replace(/[!%_]/g, c => `!${c}`).replace(/\*/g, "%");
+      sql = `select OBJNAME, OBJTEXT from table(QSYS2.OBJECT_STATISTICS('QSYS', '*LIB', '*ALLSIMPLE')) ` +
+        `where OBJNAME like ${Tools.sqlString(pattern)} escape '!' order by OBJNAME`;
+    } else {
+      sql = `select OBJNAME, OBJTEXT from table(QSYS2.OBJECT_STATISTICS(${Tools.sqlString(normalized)}, 'LIB', '*ALLSIMPLE'))`;
+    }
+    const rows = await this.ibmi.runSQL(sql);
     return rows.map(r => ({
       library: String(r.OBJNAME),
       name: String(r.OBJNAME),
@@ -682,14 +693,18 @@ export class IBMiContent {
   async createLibrary(library: string) {
     this.assertWritable();
     const lib = this.requireQsysName(library, "library");
-    return this.ibmi.sendQsh({ command: `system \"CRTLIB LIB(${lib})\"` });
+    return this.runClViaQsh(`CRTLIB LIB(${lib})`, "CRTLIB");
   }
 
   async createSourceFile(library: string, file: string, rcdlen = 112) {
     this.assertWritable();
     const lib = this.requireQsysName(library, "library");
     const src = this.requireQsysName(file, "sourceFile");
-    return this.ibmi.sendQsh({ command: `system \"CRTSRCPF FILE(${lib}/${src}) RCDLEN(${rcdlen})\"` });
+    const length = Number(rcdlen);
+    if (!Number.isInteger(length) || length < 13 || length > 32766) {
+      throw new Error(`Invalid rcdlen: ${rcdlen}`);
+    }
+    return this.runClViaQsh(`CRTSRCPF FILE(${lib}/${src}) RCDLEN(${length})`, "CRTSRCPF");
   }
 
   async createMember(library: string, file: string, member: string, srctype?: string) {
@@ -698,9 +713,11 @@ export class IBMiContent {
     const src = this.requireQsysName(file, "sourceFile");
     const mbr = this.requireQsysName(member, "member");
     const type = this.normalizeSourceType(srctype);
-    const result = await this.ibmi.sendQsh({ command: `system \"ADDPFM FILE(${lib}/${src}) MBR(${mbr}) SRCTYPE(${type})\"` });
-    this.invalidateMemberSnapshot(lib, src, mbr);
-    return result;
+    try {
+      return await this.runClViaQsh(`ADDPFM FILE(${lib}/${src}) MBR(${mbr}) SRCTYPE(${type})`, "ADDPFM");
+    } finally {
+      this.invalidateMemberSnapshot(lib, src, mbr);
+    }
   }
 
   async renameMember(library: string, file: string, member: string, newMember: string) {
@@ -709,10 +726,12 @@ export class IBMiContent {
     const src = this.requireQsysName(file, "sourceFile");
     const mbr = this.requireQsysName(member, "member");
     const newMbr = this.requireQsysName(newMember, "newMember");
-    const result = await this.ibmi.sendQsh({ command: `system \"RNMM FILE(${lib}/${src}) MBR(${mbr}) NEWMBR(${newMbr})\"` });
-    this.invalidateMemberSnapshot(lib, src, mbr);
-    this.invalidateMemberSnapshot(lib, src, newMbr);
-    return result;
+    try {
+      return await this.runClViaQsh(`RNMM FILE(${lib}/${src}) MBR(${mbr}) NEWMBR(${newMbr})`, "RNMM");
+    } finally {
+      this.invalidateMemberSnapshot(lib, src, mbr);
+      this.invalidateMemberSnapshot(lib, src, newMbr);
+    }
   }
 
   async deleteMember(library: string, file: string, member: string) {
@@ -720,8 +739,23 @@ export class IBMiContent {
     const lib = this.requireQsysName(library, "library");
     const src = this.requireQsysName(file, "sourceFile");
     const mbr = this.requireQsysName(member, "member");
-    const result = await this.ibmi.sendQsh({ command: `system \"RMVM FILE(${lib}/${src}) MBR(${mbr})\"` });
-    this.invalidateMemberSnapshot(lib, src, mbr);
+    try {
+      return await this.runClViaQsh(`RMVM FILE(${lib}/${src}) MBR(${mbr})`, "RMVM");
+    } finally {
+      this.invalidateMemberSnapshot(lib, src, mbr);
+    }
+  }
+
+  // Runs a CL command through qsh's `system` utility and throws when it fails.
+  // `system` exits non-zero when the command ends with an escape message.
+  // '$' is escaped because names such as $ABC would otherwise be expanded by
+  // the shell inside the double-quoted argument.
+  private async runClViaQsh(command: string, label: string) {
+    const result = await this.ibmi.sendQsh({ command: `system \"${IBMiClient.escapeForShell(command)}\"` });
+    if (!result || result.code !== 0) {
+      const detail = String(result?.stderr || result?.stdout || "").trim();
+      throw new Error(`${label} failed (exit ${result?.code ?? "unknown"})${detail ? `: ${detail}` : ""}`);
+    }
     return result;
   }
 

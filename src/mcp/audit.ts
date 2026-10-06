@@ -357,8 +357,11 @@ function normalizeExportFormat(format: string | undefined): AuditExportFormat {
   throw new Error(`Unsupported export format: ${format}`);
 }
 
-function csvEscape(value: string) {
-  if (value.includes(",") || value.includes("\"") || value.includes("\n")) {
+export function csvEscape(input: string) {
+  let value = String(input ?? "");
+  // Spreadsheet apps run cells that start with these characters as formulas.
+  if (/^[=+\-@\t\r]/.test(value)) value = `'${value}`;
+  if (value.includes(",") || value.includes("\"") || value.includes("\n") || value.includes("\r")) {
     return `"${value.replace(/"/g, "\"\"")}"`;
   }
   return value;
