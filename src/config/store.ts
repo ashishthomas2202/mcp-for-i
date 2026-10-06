@@ -1,8 +1,11 @@
 import fs from "fs/promises";
+import { constants as fsConstants } from "fs";
 import path from "path";
 import os from "os";
 import { Action, ConnectionConfig, ConnectionData } from "../ibmi/types.js";
 import { setPassword } from "../security/credentialStore.js";
+import { readFileWithRetry, sleep, writeFileAtomic } from "../util/atomicWrite.js";
+import { withFileLock } from "../util/fileLock.js";
 
 export type PolicyProfile = "read-only" | "guarded" | "power-user";
 
@@ -79,79 +82,111 @@ const defaultSettings: Settings = {
   sessionReconnectAttempts: 2
 };
 
+export class ConfigCorruptError extends Error {
+  constructor(
+    readonly configPath: string,
+    readonly backupPath: string | undefined,
+    readonly detail: string
+  ) {
+    super(
+      `Config file ${configPath} could not be parsed (${detail}). ` +
+        (backupPath ? `A copy was saved to ${backupPath}. ` : "") +
+        "The file was left unchanged; fix or remove it and try again."
+    );
+    this.name = "ConfigCorruptError";
+  }
+}
+
+type DiskRead = { exists: true; raw: string; parsed: unknown } | { exists: false };
+
+// configPath -> { raw content already backed up, backup path }
+const backedUpCorruptContent = new Map<string, { raw: string; backupPath: string }>();
+const plaintextWarnings = new Set<string>();
+
+export type ConfigStoreOptions = {
+  /** Overrides the config directory (defaults to getConfigDir()). */
+  configDir?: string;
+};
+
 export class ConfigStore {
   private configDir: string;
   private configPath: string;
+  private lockPath: string;
   private data: ConfigFile | null = null;
-  private saveQueue: Promise<void> = Promise.resolve();
 
-  constructor() {
-    this.configDir = getConfigDir();
+  constructor(options: ConfigStoreOptions = {}) {
+    this.configDir = options.configDir || getConfigDir();
     this.configPath = path.join(this.configDir, "config.json");
+    this.lockPath = `${this.configPath}.lock`;
   }
 
+  getConfigPath() {
+    return this.configPath;
+  }
+
+  /**
+   * Reads the config from disk. Defaults are created only when the file does not
+   * exist. A file that exists but cannot be read or parsed is never overwritten:
+   * a backup copy is made and ConfigCorruptError is thrown.
+   */
   async load(): Promise<ConfigFile> {
-    await ensureDir(this.configDir);
-    let loadedFromDisk = true;
-    try {
-      const raw = await fs.readFile(this.configPath, "utf8");
-      this.data = JSON.parse(raw) as ConfigFile;
-    } catch {
-      loadedFromDisk = false;
-      this.data = { connections: [], settings: defaultSettings, actions: [] };
+    const disk = await this.readFromDisk();
+    if (disk.exists) {
+      const migrated = await migrateConfigFile(disk.parsed);
+      if (!migrated.changed) {
+        this.data = migrated.config;
+        return this.data;
+      }
     }
-
-    const migrated = await migrateConfigFile(this.data);
-    this.data = migrated.config;
-
-    if (!loadedFromDisk || migrated.changed) {
-      await this.save();
-    }
-
-    return this.data;
+    // Missing file or a migration is needed: redo the read under the lock so a
+    // concurrent writer's changes are not overwritten.
+    await this.mutate(() => undefined);
+    return this.data!;
   }
 
+  /**
+   * Writes the in-memory config as-is (last writer wins). Prefer the specific
+   * update methods or mutate(), which re-read the file under the lock first.
+   */
   async save() {
     if (!this.data) await this.load();
-    const payload = JSON.stringify(this.data, null, 2);
-    await this.enqueueSave(async () => {
-      const tempPath = `${this.configPath}.${process.pid}.${Date.now()}.tmp`;
-      await writeFileWithRetry(tempPath, payload);
-      try {
-        await fs.rename(tempPath, this.configPath);
-      } catch {
-        await writeFileWithRetry(this.configPath, payload);
-        await fs.rm(tempPath, { force: true });
-      }
-    });
+    const payload = serializeConfig(this.data!);
+    await withFileLock(this.lockPath, () => this.writePayload(payload));
   }
 
   async listConnections() {
     const cfg = await this.load();
-    return cfg.connections;
+    return cfg.connections.map(publicConnection);
   }
 
   async getConnection(name: string) {
     const cfg = await this.load();
-    return cfg.connections.find(c => c.name === name);
+    const found = cfg.connections.find(c => c.name === name);
+    return found ? publicConnection(found) : undefined;
   }
 
   async upsertConnection(connection: StoredConnection) {
-    const cfg = await this.load();
-    const sanitized = await sanitizeConnection(connection);
-    const idx = cfg.connections.findIndex(c => c.name === sanitized.name);
-    if (idx >= 0) {
-      cfg.connections[idx] = { ...cfg.connections[idx], ...sanitized };
-    } else {
-      cfg.connections.push(sanitized);
-    }
-    await this.save();
+    const { sanitized, password, persisted } = await sanitizeConnection(connection);
+    await this.mutate(cfg => {
+      const idx = cfg.connections.findIndex(c => c.name === sanitized.name);
+      if (idx >= 0) {
+        const merged = { ...cfg.connections[idx], ...sanitized } as StoredConnection & { password?: string };
+        // A legacy plaintext password stays only while it is still the password in
+        // use and the keychain could not take it.
+        if (password !== undefined && (persisted || merged.password !== password)) {
+          delete merged.password;
+        }
+        cfg.connections[idx] = merged;
+      } else {
+        cfg.connections.push(sanitized);
+      }
+    });
   }
 
   async deleteConnection(name: string) {
-    const cfg = await this.load();
-    cfg.connections = cfg.connections.filter(c => c.name !== name);
-    await this.save();
+    await this.mutate(cfg => {
+      cfg.connections = cfg.connections.filter(c => c.name !== name);
+    });
   }
 
   async getSettings() {
@@ -160,9 +195,9 @@ export class ConfigStore {
   }
 
   async updateSettings(update: Partial<Settings>) {
-    const cfg = await this.load();
-    cfg.settings = { ...cfg.settings, ...update };
-    await this.save();
+    await this.mutate(cfg => {
+      cfg.settings = { ...cfg.settings, ...update };
+    });
   }
 
   async listActions() {
@@ -171,16 +206,16 @@ export class ConfigStore {
   }
 
   async upsertAction(action: Action) {
-    const cfg = await this.load();
-    const idx = cfg.actions.findIndex(a => a.name === action.name);
-    if (idx >= 0) cfg.actions[idx] = action; else cfg.actions.push(action);
-    await this.save();
+    await this.mutate(cfg => {
+      const idx = cfg.actions.findIndex(a => a.name === action.name);
+      if (idx >= 0) cfg.actions[idx] = action; else cfg.actions.push(action);
+    });
   }
 
   async deleteAction(name: string) {
-    const cfg = await this.load();
-    cfg.actions = cfg.actions.filter(a => a.name !== name);
-    await this.save();
+    await this.mutate(cfg => {
+      cfg.actions = cfg.actions.filter(a => a.name !== name);
+    });
   }
 
   async listProfiles(connectionName: string) {
@@ -189,35 +224,110 @@ export class ConfigStore {
   }
 
   async saveProfile(connectionName: string, profile: ConnectionProfile) {
-    const conn = await this.getConnection(connectionName);
-    if (!conn) throw new Error(`Connection ${connectionName} not found`);
-    const profiles = conn.profiles || [];
-    const idx = profiles.findIndex(p => p.name === profile.name);
-    if (idx >= 0) profiles[idx] = profile; else profiles.push(profile);
-    conn.profiles = profiles;
-    await this.upsertConnection(conn);
+    await this.mutateConnection(connectionName, conn => {
+      const profiles = conn.profiles || [];
+      const idx = profiles.findIndex(p => p.name === profile.name);
+      if (idx >= 0) profiles[idx] = profile; else profiles.push(profile);
+      conn.profiles = profiles;
+    });
   }
 
   async deleteProfile(connectionName: string, profileName: string) {
-    const conn = await this.getConnection(connectionName);
-    if (!conn) throw new Error(`Connection ${connectionName} not found`);
-    conn.profiles = (conn.profiles || []).filter(p => p.name !== profileName);
-    if (conn.currentProfile === profileName) {
-      conn.currentProfile = undefined;
-    }
-    await this.upsertConnection(conn);
+    await this.mutateConnection(connectionName, conn => {
+      conn.profiles = (conn.profiles || []).filter(p => p.name !== profileName);
+      if (conn.currentProfile === profileName) {
+        conn.currentProfile = undefined;
+      }
+    });
   }
 
   async setCurrentProfile(connectionName: string, profileName?: string) {
-    const conn = await this.getConnection(connectionName);
-    if (!conn) throw new Error(`Connection ${connectionName} not found`);
-    conn.currentProfile = profileName;
-    await this.upsertConnection(conn);
+    await this.mutateConnection(connectionName, conn => {
+      conn.currentProfile = profileName;
+    });
   }
 
-  private enqueueSave(operation: () => Promise<void>) {
-    this.saveQueue = this.saveQueue.then(operation, operation);
-    return this.saveQueue;
+  /**
+   * Read-modify-write under the cross-process lock: the file is re-read (and
+   * migrated) while the lock is held, `fn` changes it, and the result is written
+   * atomically. Concurrent callers in this and other processes are serialized,
+   * so no update is lost. `fn` must not call other ConfigStore update methods.
+   */
+  async mutate<T>(fn: (cfg: ConfigFile) => T | Promise<T>): Promise<T> {
+    return withFileLock(this.lockPath, async () => {
+      const disk = await this.readFromDisk();
+      const migrated = await migrateConfigFile(disk.exists ? disk.parsed : undefined);
+      const cfg = migrated.config;
+      const result = await fn(cfg);
+      const payload = serializeConfig(cfg);
+      if (!disk.exists || payload !== disk.raw) {
+        await this.writePayload(payload);
+      }
+      this.data = cfg;
+      return result;
+    });
+  }
+
+  private async mutateConnection(connectionName: string, fn: (conn: StoredConnection) => void) {
+    await this.mutate(cfg => {
+      const conn = cfg.connections.find(c => c.name === connectionName);
+      if (!conn) throw new Error(`Connection ${connectionName} not found`);
+      fn(conn);
+    });
+  }
+
+  private async readFromDisk(): Promise<DiskRead> {
+    let raw: string;
+    try {
+      raw = await readFileWithRetry(this.configPath);
+    } catch (err: any) {
+      if (err?.code === "ENOENT") return { exists: false };
+      throw new Error(
+        `Config file ${this.configPath} could not be read (${err?.code || err?.message || String(err)}); it was left unchanged.`
+      );
+    }
+    if (raw.trim().length === 0) {
+      // An empty file holds nothing that could be lost; treat it like a missing one.
+      return { exists: false };
+    }
+    try {
+      return { exists: true, raw, parsed: JSON.parse(stripBom(raw)) };
+    } catch {
+      // A writer that does not use atomic renames (an older version) may be mid-write.
+      await sleep(50);
+    }
+    try {
+      raw = await readFileWithRetry(this.configPath);
+    } catch (err: any) {
+      if (err?.code === "ENOENT") return { exists: false };
+      throw err;
+    }
+    try {
+      return { exists: true, raw, parsed: JSON.parse(stripBom(raw)) };
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      const backupPath = await this.backupCorruptFile(raw);
+      throw new ConfigCorruptError(this.configPath, backupPath, detail);
+    }
+  }
+
+  private async backupCorruptFile(raw: string) {
+    const previous = backedUpCorruptContent.get(this.configPath);
+    if (previous && previous.raw === raw) return previous.backupPath;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupPath = `${this.configPath}.corrupt-${stamp}`;
+    try {
+      await fs.copyFile(this.configPath, backupPath, fsConstants.COPYFILE_EXCL);
+      backedUpCorruptContent.set(this.configPath, { raw, backupPath });
+      return backupPath;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async writePayload(payload: string) {
+    await fs.mkdir(this.configDir, { recursive: true });
+    await writeFileAtomic(this.configPath, payload, { mode: 0o600 });
   }
 }
 
@@ -230,6 +340,19 @@ export function getConfigDir() {
     return path.join(os.homedir(), "Library", "Application Support", "mcp-for-i");
   }
   return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "mcp-for-i");
+}
+
+function serializeConfig(cfg: ConfigFile) {
+  return JSON.stringify(cfg, null, 2);
+}
+
+function stripBom(raw: string) {
+  return raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+}
+
+function publicConnection(connection: StoredConnection): StoredConnection {
+  const { password: _password, ...rest } = connection as StoredConnection & { password?: unknown };
+  return rest;
 }
 
 async function migrateConfigFile(input: unknown): Promise<{ config: ConfigFile; changed: boolean }> {
@@ -290,9 +413,22 @@ async function normalizeConnections(value: unknown): Promise<{ connections: Stor
     seenNames.add(uniqueName);
 
     const password = toNonEmptyString(entry.password);
+    let keepPlaintext = false;
     if (password) {
-      await setPassword(uniqueName, password);
-      changed = true;
+      // The plaintext is dropped only once the keychain confirms it holds the password.
+      let persistent = false;
+      let reason: string | undefined;
+      try {
+        persistent = (await setPassword(uniqueName, password, { keepExistingSessionValue: true })).persistent;
+      } catch (err) {
+        reason = err instanceof Error ? err.message : String(err);
+      }
+      if (persistent) {
+        changed = true;
+      } else {
+        keepPlaintext = true;
+        warnPlaintextKept(uniqueName, reason);
+      }
     }
 
     const host = toNonEmptyString(entry.host) || "";
@@ -322,6 +458,7 @@ async function normalizeConnections(value: unknown): Promise<{ connections: Stor
     if (keepaliveInterval !== undefined) normalized.keepaliveInterval = keepaliveInterval;
     if (readyTimeout !== undefined) normalized.readyTimeout = readyTimeout;
     if (sshDebug !== undefined) normalized.sshDebug = sshDebug;
+    if (keepPlaintext) (normalized as StoredConnection & { password?: string }).password = password;
 
     if (JSON.stringify(normalized) !== JSON.stringify(entry)) {
       changed = true;
@@ -330,6 +467,16 @@ async function normalizeConnections(value: unknown): Promise<{ connections: Stor
   }
 
   return { connections, changed };
+}
+
+function warnPlaintextKept(connectionName: string, reason?: string) {
+  if (plaintextWarnings.has(connectionName)) return;
+  plaintextWarnings.add(connectionName);
+  process.stderr.write(
+    `[mcp-for-i] warning: no persistent keychain is available, so the plaintext password for connection ` +
+      `"${connectionName}" was left in config.json${reason ? ` (${reason})` : ""}. ` +
+      "It will be moved to the keychain once one is available.\n"
+  );
 }
 
 function normalizeSettings(value: unknown): { value: Settings; changed: boolean } {
@@ -368,18 +515,20 @@ function normalizePolicy(value: unknown): ConnectionPolicy | undefined {
   return policy;
 }
 
-async function sanitizeConnection(connection: StoredConnection): Promise<StoredConnection> {
+async function sanitizeConnection(connection: StoredConnection) {
   const raw = connection as StoredConnection & { password?: unknown; storePassword?: unknown };
   const password = toNonEmptyString(raw.password);
+  let persisted = false;
   if (password) {
-    await setPassword(connection.name, password);
+    persisted = (await setPassword(connection.name, password)).persistent;
   }
 
   const { password: _password, storePassword: _storePassword, ...rest } = raw;
   const normalizedPort = normalizePort(rest.port);
   return {
-    ...rest,
-    port: normalizedPort
+    sanitized: { ...rest, port: normalizedPort } as StoredConnection,
+    password,
+    persisted
   };
 }
 
@@ -416,25 +565,4 @@ function toNonEmptyString(value: unknown) {
 
 function isPlainObject(value: unknown): value is Record<string, any> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-async function ensureDir(dir: string) {
-  await fs.mkdir(dir, { recursive: true });
-}
-
-async function writeFileWithRetry(filePath: string, content: string, retries = 5, delayMs = 40) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      await fs.writeFile(filePath, content, "utf8");
-      return;
-    } catch (err: any) {
-      const transient = err?.code === "EBUSY" || err?.code === "EPERM";
-      if (!transient || attempt === retries) throw err;
-      await wait(delayMs * (attempt + 1));
-    }
-  }
-}
-
-async function wait(ms: number) {
-  await new Promise(resolve => setTimeout(resolve, ms));
 }

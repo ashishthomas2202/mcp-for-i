@@ -68,10 +68,36 @@ function describeError(err: unknown) {
   return err instanceof Error ? err.message : String(err);
 }
 
-export async function setPassword(connectionName: string, password: string) {
-  if (getCredentialStoreMode() === "session") {
-    sessionStore.set(connectionName, password);
-    return;
+export type SetPasswordResult = {
+  /** True when the password reached the OS keychain and survives this process. */
+  persistent: boolean;
+  store: "keychain" | "session";
+};
+
+export type SetPasswordOptions = {
+  /**
+   * When the password can only be kept in memory and this process already holds
+   * one for the connection, keep the existing value instead of overwriting it.
+   */
+  keepExistingSessionValue?: boolean;
+};
+
+export class KeychainUnavailableError extends Error {
+  constructor(operation: string, detail?: string) {
+    super(
+      `MCP_FOR_I_CREDENTIAL_STORE=keychain is set, but the OS keychain could not ${operation}` +
+        `${detail ? `: ${detail}` : ""}. ` +
+        "Passwords are not kept in memory in keychain mode. Fix the keychain (or unset MCP_FOR_I_CREDENTIAL_STORE) and try again."
+    );
+    this.name = "KeychainUnavailableError";
+  }
+}
+
+export async function setPassword(connectionName: string, password: string, options: SetPasswordOptions = {}): Promise<SetPasswordResult> {
+  const mode = getCredentialStoreMode();
+  if (mode === "session") {
+    setSessionValue(connectionName, password, options);
+    return { persistent: false, store: "session" };
   }
   const kt = await getKeytar();
   if (kt) {
@@ -79,16 +105,23 @@ export async function setPassword(connectionName: string, password: string) {
       await kt.setPassword(SERVICE, connectionName, password);
       lastKeychainError = undefined;
       sessionStore.delete(connectionName);
-      return;
+      return { persistent: true, store: "keychain" };
     } catch (err) {
       lastKeychainError = describeError(err);
     }
+  } else if (!lastKeychainError) {
+    lastKeychainError = "keytar module is not available";
   }
-  sessionStore.set(connectionName, password);
+  if (mode === "keychain") {
+    throw new KeychainUnavailableError("store the password", lastKeychainError);
+  }
+  setSessionValue(connectionName, password, options);
+  return { persistent: false, store: "session" };
 }
 
 export async function getPassword(connectionName: string) {
-  if (getCredentialStoreMode() === "session") {
+  const mode = getCredentialStoreMode();
+  if (mode === "session") {
     return sessionStore.get(connectionName);
   }
   const kt = await getKeytar();
@@ -97,15 +130,20 @@ export async function getPassword(connectionName: string) {
       const password = await kt.getPassword(SERVICE, connectionName);
       lastKeychainError = undefined;
       if (password) return password;
+      if (mode === "keychain") return undefined;
     } catch (err) {
       lastKeychainError = describeError(err);
+      if (mode === "keychain") throw new KeychainUnavailableError("read the password", lastKeychainError);
     }
+  } else if (mode === "keychain") {
+    throw new KeychainUnavailableError("read the password", "keytar module is not available");
   }
   return sessionStore.get(connectionName);
 }
 
 export async function deletePassword(connectionName: string) {
-  if (getCredentialStoreMode() === "session") {
+  const mode = getCredentialStoreMode();
+  if (mode === "session") {
     sessionStore.delete(connectionName);
     return;
   }
@@ -116,9 +154,31 @@ export async function deletePassword(connectionName: string) {
       lastKeychainError = undefined;
     } catch (err) {
       lastKeychainError = describeError(err);
+      if (mode === "keychain") {
+        sessionStore.delete(connectionName);
+        throw new KeychainUnavailableError("delete the password", lastKeychainError);
+      }
     }
+  } else if (mode === "keychain") {
+    sessionStore.delete(connectionName);
+    throw new KeychainUnavailableError("delete the password", "keytar module is not available");
   }
   sessionStore.delete(connectionName);
+}
+
+function setSessionValue(connectionName: string, password: string, options: SetPasswordOptions) {
+  if (options.keepExistingSessionValue && sessionStore.has(connectionName)) return;
+  sessionStore.set(connectionName, password);
+}
+
+/**
+ * Replaces the keytar module used by this store. Intended for tests only:
+ * pass an object with keytar's methods, `null` for "keytar not installed",
+ * or `undefined` to restore normal lazy loading.
+ */
+export function setKeytarModuleForTesting(mod: any | null | undefined) {
+  keytar = mod;
+  lastKeychainError = undefined;
 }
 
 export async function isKeychainAvailable() {
@@ -156,6 +216,8 @@ export async function getCredentialStoreStatus() {
     error: lastKeychainError,
     message: keychainAvailable
       ? `Passwords are stored in ${environment.nativeStore}.`
+      : requestedMode === "keychain"
+        ? `MCP_FOR_I_CREDENTIAL_STORE=keychain is set but ${environment.nativeStore} is not usable; saving or reading passwords will fail until it is fixed.`
       : requestedMode === "session"
         ? "Password storage is configured for session-only mode by MCP_FOR_I_CREDENTIAL_STORE=session."
       : isWsl
