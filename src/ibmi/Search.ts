@@ -50,7 +50,7 @@ export namespace Search {
       if (!isSafeMemberToken(members)) {
         throw new Error(`Invalid members filter: ${members}`);
       }
-      memberFilter = `${members}.MBR`;
+      memberFilter = memberGlobToken(members);
     } else if (Array.isArray(members)) {
       const normalizedMembers = members.map(member => typeof member === "string"
         ? { library: lib, file: src, name: member, extension: "" }
@@ -64,7 +64,7 @@ export namespace Search {
             throw new Error(`Invalid member name in filter: ${member.name}`);
           }
         });
-        memberFilter = normalizedMembers.map(member => `${member.name}.MBR`).join(` `);
+        memberFilter = normalizedMembers.map(member => memberGlobToken(member.name)).join(` `);
       }
     }
 
@@ -102,7 +102,9 @@ export namespace Search {
     throw new Error(result.stderr || "Search failed");
   }
 
-  export async function searchIFS(connection: IBMiClient, path: string, searchTerm: string): Promise<SearchResults | undefined> {
+  export type IfsSearchResults = SearchResults & { exitCode: number; warnings?: string[] };
+
+  export async function searchIFS(connection: IBMiClient, path: string, searchTerm: string): Promise<IfsSearchResults> {
     const grep = connection.remoteFeatures.grep;
     if (!grep) throw new Error("Grep must be installed on the remote system.");
 
@@ -111,16 +113,16 @@ export namespace Search {
       stdin: searchTerm
     });
 
-    if (grepRes.code === 0) {
-      return { term: searchTerm, hits: parseGrepOutput(grepRes.stdout) };
-    }
-    // grep returns exit code 1 when no matches are found
-    if (grepRes.code === 1 && !grepRes.stderr) {
-      return { term: searchTerm, hits: [] };
-    }
+    // grep exits 1 when nothing matched and 2 when any file or directory could
+    // not be read, even if other files matched. Keep whatever was printed and
+    // report the problems as warnings instead of discarding every hit.
+    return withIfsWarnings(
+      { term: searchTerm, hits: parseGrepOutput(grepRes.stdout || ""), exitCode: grepRes.code ?? 0 },
+      grepRes.stderr
+    );
   }
 
-  export async function findIFS(connection: IBMiClient, path: string, findTerm: string): Promise<SearchResults | undefined> {
+  export async function findIFS(connection: IBMiClient, path: string, findTerm: string): Promise<IfsSearchResults> {
     const find = connection.remoteFeatures.find;
     if (!find) throw new Error("Find must be installed on the remote system.");
 
@@ -128,19 +130,41 @@ export namespace Search {
       command: `${find} ${Tools.escapePath(path)} -type f -iname ${Tools.shellQuote(`*${findTerm}*`)} -print`
     });
 
-    if (findRes.code === 0) {
-      if (findRes.stdout) {
-        return { term: findTerm, hits: parseFindOutput(findRes.stdout) };
+    // find exits 1 when a single directory is unreadable; the paths it did
+    // print are still valid results.
+    return withIfsWarnings(
+      { term: findTerm, hits: parseFindOutput(findRes.stdout || ""), exitCode: findRes.code ?? 0 },
+      findRes.stderr
+    );
+  }
+
+  const MAX_IFS_WARNINGS = 50;
+
+  function withIfsWarnings(results: IfsSearchResults, stderr?: string): IfsSearchResults {
+    const lines = String(stderr || "")
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line => line.length > 0);
+    if (lines.length > 0) {
+      const warnings = lines.slice(0, MAX_IFS_WARNINGS);
+      if (lines.length > MAX_IFS_WARNINGS) {
+        warnings.push(`${lines.length - MAX_IFS_WARNINGS} more warning line(s) omitted`);
       }
-      return { term: findTerm, hits: [] };
+      results.warnings = warnings;
     }
+    return results;
   }
 
   function parseFindOutput(output: string, readonly?: boolean, pathTransformer?: (path: string) => string): SearchHit[] {
     const results: SearchHit[] = [];
-    for (const line of output.split('\n')) {
+    const seen = new Set<string>();
+    for (const rawLine of output.split('\n')) {
+      const line = rawLine.replace(/\r$/, "");
+      if (!line.trim()) continue;
       const path = pathTransformer?.(line) || line;
-      results.push(results.find(r => r.path === path) || { path, readonly, lines: [] });
+      if (seen.has(path)) continue;
+      seen.add(path);
+      results.push({ path, readonly, lines: [] });
     }
     return results;
   }
@@ -164,7 +188,16 @@ export namespace Search {
   }
 
   function isSafeMemberToken(name: string) {
-    return /^[A-Za-z0-9_*#]+$/.test(name);
+    // IBM i names may contain $, # and @ (and . or _ after the first
+    // character); '*' is kept for generic filters such as ABC*.
+    return /^[A-Za-z0-9_.*#@$]{1,11}$/.test(name);
+  }
+
+  // Builds the shell word for a member glob. A leading '#' would start a shell
+  // comment and '$' would expand a variable, so both are escaped; '*' stays
+  // unescaped so generic names still expand.
+  function memberGlobToken(name: string) {
+    return `${name.replace(/[#$]/g, c => `\\${c}`)}.MBR`;
   }
 
 }
