@@ -92,7 +92,9 @@ export class McpContext {
 
   async ensureActive(name?: string): Promise<IBMiClient> {
     const sessionName = name || this.activeName;
-    if (!sessionName) throw new Error("Not connected");
+    if (!sessionName) {
+      throw new Error("No active connection. Call ibmi.connect or pass connectionName.");
+    }
 
     if (!this.sessions.has(sessionName)) {
       await this.connectByName(sessionName);
@@ -101,6 +103,23 @@ export class McpContext {
     await this.ensureSessionHealthy(sessionName);
     this.touchSession(sessionName);
     return this.sessions.get(sessionName)!.client;
+  }
+
+  /**
+   * Policy for a connection, read from the stored connection when no session
+   * is open yet, so checks that run before connecting still see it.
+   */
+  async resolvePolicy(name?: string): Promise<ConnectionPolicy> {
+    const sessionName = name || this.activeName;
+    if (!sessionName) return defaultPolicy();
+    const session = this.sessions.get(sessionName);
+    if (session) return session.policy;
+    try {
+      const stored = await this.store.getConnection(sessionName);
+      return normalizePolicy(stored?.policy);
+    } catch {
+      return defaultPolicy();
+    }
   }
 
   getPolicy(name?: string): ConnectionPolicy {
@@ -171,7 +190,9 @@ export class McpContext {
       }
       this.sessions.delete(name);
       if (this.activeName === name) {
-        this.activeName = this.sessions.keys().next().value;
+        // Never fall back to another open session: later calls without
+        // connectionName must not silently target a different system.
+        this.activeName = undefined;
       }
       await this.persistSessionState(true);
       return;

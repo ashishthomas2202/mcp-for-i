@@ -7,7 +7,7 @@ Config file is stored under the user config directory:
 
 ## Settings
 Default settings (editable in the config file):
-- `readOnlyMode`: boolean
+- `readOnlyMode`: boolean. When true, every tool that changes the system is refused, including `ibmi.sql.execute`, `ibmi.cl.run` and `ibmi.tn5250.sendKeys`.
 - `tempLibrary`: string
 - `tempDir`: string
 - `autoClearTempData`: boolean
@@ -17,8 +17,29 @@ Default settings (editable in the config file):
 - `libraryList`: string[]
 - `currentLibrary`: string
 - `customVariables`: list of `{ name, value }`
+- `allowedLocalRoots`: string[] (global settings only; see "Local file access" below)
 
 `tempLibrary` remains accepted for configuration compatibility. Source member reads and source-date writes now use job-local `QTEMP` objects and do not require a persistent `ILEDITOR` library.
+
+## Local file access
+
+Tools that read or write files on your PC (`ibmi.ifs.upload`, `ibmi.ifs.download`, `ibmi.deploy.*`, `ibmi.audit.export` and `ibmi.compliance.report.generate`) only accept local paths inside the allowed local roots. Paths are resolved first: `..` and `~` are expanded and symlinks are followed, so a link that points outside a root is refused.
+
+Allowed roots, first match wins:
+1. `MCP_FOR_I_ALLOWED_LOCAL_ROOTS`: a list of directories separated by the OS path delimiter (`;` on Windows, `:` elsewhere).
+2. `allowedLocalRoots` in the global `settings` of `config.json`.
+3. Default: the server's working directory and your home directory. A working directory that is a drive or filesystem root is ignored.
+
+These locations are always refused, even inside an allowed root: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.config/gcloud`, `~/.config/gh`, any `credentials` file under `~/.config`, `~/.netrc`, `~/.git-credentials`, `~/.pgpass`, `~/.npmrc`, `~/.pypirc`, the mcp-for-i config directory, and on Windows `%APPDATA%` plus everything in `%LOCALAPPDATA%` except its `Temp` folder (macOS: `~/Library/Keychains`).
+
+Example:
+```json
+{
+  "settings": {
+    "allowedLocalRoots": ["C:/work/ibmi-projects", "D:/exports"]
+  }
+}
+```
 
 ## IBM Documentation
 
@@ -38,6 +59,22 @@ Connections can also define policy, for example:
 - `read-only`
 - `guarded` (default; approvals required for risky operations)
 - `power-user`
+
+Policy lists (all optional, matched case-insensitively):
+- `denyCommands` / `allowCommands`: CL command names. A library qualifier is ignored on both sides, so `DLTLIB` also blocks `QSYS/DLTLIB` and `*LIBL/DLTLIB`. A trailing `*` makes a generic entry (`DLT*`). When `allowCommands` is not empty, only listed commands may run, and QSH/PASE commands are refused because they cannot be verified. The lists apply to `ibmi.cl.run`, `ibmi.tn5250.sendKeys`, the expanded command of `ibmi.actions.run`, and CL embedded in SQL (lines starting with `@` and `QCMDEXC` calls; a `QCMDEXC` call whose command is not a string literal is refused while a command list is set).
+- `denyLibraries` / `allowLibraries`: library names, with optional trailing `*`. They apply to every tool argument that names a library (`library`, `journalLibrary`, `libraryList`, qualified `LIB/OBJ` values, `/QSYS.LIB/<lib>.LIB/...` paths). With `allowLibraries` set, special values such as `*LIBL` and generic names are refused because they cannot be checked.
+- `denyPaths` / `allowPaths`: absolute IFS paths. An entry covers the path and everything below it; `*` matches within one path segment. With `allowPaths` set, relative paths are refused. Remote symlinks are not resolved.
+- Deny entries always win over allow entries.
+
+Example:
+```json
+"policy": {
+  "profile": "guarded",
+  "denyCommands": ["DLTLIB", "CLRLIB", "PWRDWNSYS"],
+  "allowLibraries": ["DEV*", "QGPL", "QTEMP"],
+  "allowPaths": ["/home/devuser", "/tmp"]
+}
+```
 
 Example:
 ```json

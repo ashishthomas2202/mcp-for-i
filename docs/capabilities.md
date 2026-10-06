@@ -176,7 +176,9 @@ Version context: `0.1.13` development codebase.
 - `ibmi.journal.endIfs`
 - `ibmi.journal.receivers.retention`
 
-### TN5250 Command Session
+### TN5250 Command Session (CL console)
+These tools are a simulated CL command console: the command field runs through QCMDEXC. They are not real 5250 emulation and cannot display or drive green-screen programs. ENTER is subject to read-only mode and the command policy.
+
 - `ibmi.tn5250.connect`
 - `ibmi.tn5250.readScreen`
 - `ibmi.tn5250.setField`

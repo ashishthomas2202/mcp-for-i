@@ -2,6 +2,7 @@ import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
 import { getConfigDir } from "../config/store.js";
+import { redactSecrets } from "../security/redact.js";
 
 export type AuditStatus = "ok" | "error";
 
@@ -62,7 +63,7 @@ export async function appendAuditRecord(input: AppendAuditInput): Promise<AuditR
   appendQueue = appendQueue.then(async () => {
     const prevHash = await readHeadHash(paths.headPath);
     const nowIso = new Date().toISOString();
-    const redactedArgs = redactSensitive(input.args);
+    const redactedArgs = redactSecrets(input.args);
     const argsHash = sha256Hex(stableStringify(redactedArgs));
     const base = {
       version: 1 as const,
