@@ -69,3 +69,8 @@ Example:
   ]
 }
 ```
+
+## Control plane
+
+- `MCP_FOR_I_CONTROL_HOST` (default `127.0.0.1`) and `MCP_FOR_I_CONTROL_PORT` (default `3980`) set where the control plane listens. The background-service launchers record the port configured when `mcp-for-i control enable` ran; the Bash launcher also honours `MCP_FOR_I_CONTROL_PORT` at start-up.
+- The API token lives in `controlplane.token` in the same directory as `config.json`. See [security](security.md#control-plane).

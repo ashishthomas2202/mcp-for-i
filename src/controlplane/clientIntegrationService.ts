@@ -1,4 +1,5 @@
-import fs from "fs/promises";
+import fs from "fs";
+import fsp from "fs/promises";
 import os from "os";
 import path from "path";
 import { spawn } from "child_process";
@@ -264,7 +265,7 @@ export class ClientIntegrationService {
   private async isCodeConfigured() {
     const userConfigPath = getVsCodeUserMcpPath();
     try {
-      const raw = await fs.readFile(userConfigPath, "utf8");
+      const raw = await fsp.readFile(userConfigPath, "utf8");
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed?.servers)) {
         return parsed.servers.some((entry: any) => entry?.name === SERVER_NAME);
@@ -301,10 +302,101 @@ async function commandExists(command: string) {
   return result.ok;
 }
 
-async function runCommand(command: string, args: string[]) {
+type SpawnSpec = {
+  file: string;
+  args: string[];
+  windowsVerbatimArguments: boolean;
+};
+
+/**
+ * Finds a command on PATH the way cmd.exe does (PATHEXT order). Returns the
+ * full path, or undefined when nothing matches.
+ */
+export function resolveWindowsCommand(command: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const pathExt = (env.PATHEXT || ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map(ext => ext.trim().toLowerCase())
+    .filter(Boolean);
+  const hasExt = pathExt.includes(path.extname(command).toLowerCase());
+  const candidates = hasExt ? [command] : pathExt.map(ext => command + ext);
+
+  const isPath = command.includes("/") || command.includes("\\");
+  const dirs = isPath
+    ? [""]
+    : String(env.PATH || env.Path || "").split(";").map(dir => dir.trim().replace(/^"(.*)"$/, "$1")).filter(Boolean);
+
+  for (const dir of dirs) {
+    for (const candidate of candidates) {
+      const full = dir ? path.join(dir, candidate) : candidate;
+      try {
+        if (fs.statSync(full).isFile()) return full;
+      } catch {
+        // not here
+      }
+    }
+  }
+  return undefined;
+}
+
+const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
+
+/** Quotes one argument for cmd.exe, following the MSVCRT argv rules. */
+export function escapeCmdArgument(value: string, doubleEscapeMeta: boolean) {
+  let arg = String(value);
+  // Double the backslashes that precede a quote, then escape the quote.
+  arg = arg.replace(/(\\*)"/g, '$1$1\\"');
+  // Double trailing backslashes so they do not escape the closing quote.
+  arg = arg.replace(/(\\*)$/, "$1$1");
+  arg = `"${arg}"`;
+  arg = arg.replace(CMD_META, "^$1");
+  // .cmd shims re-parse their arguments (%*), so they need a second pass.
+  if (doubleEscapeMeta) arg = arg.replace(CMD_META, "^$1");
+  return arg;
+}
+
+/**
+ * Builds how to start a command. On Windows, npm-installed CLIs (codex,
+ * claude, code) are .cmd shims that only start through cmd.exe, so they are
+ * resolved via PATHEXT and launched with every argument escaped. The
+ * arguments are fixed by this module, never taken from a request.
+ */
+export function buildSpawnSpec(
+  command: string,
+  args: string[],
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env
+): SpawnSpec | undefined {
+  if (platform !== "win32") {
+    return { file: command, args, windowsVerbatimArguments: false };
+  }
+  const resolved = resolveWindowsCommand(command, env);
+  if (!resolved) return undefined;
+  if (!/\.(cmd|bat)$/i.test(resolved)) {
+    return { file: resolved, args, windowsVerbatimArguments: false };
+  }
+  const commandLine = [
+    resolved.replace(CMD_META, "^$1"),
+    ...args.map(arg => escapeCmdArgument(arg, true))
+  ].join(" ");
+  return {
+    file: env.ComSpec || env.COMSPEC || "cmd.exe",
+    args: ["/d", "/s", "/c", `"${commandLine}"`],
+    windowsVerbatimArguments: true
+  };
+}
+
+export async function runCommand(command: string, args: string[], env: NodeJS.ProcessEnv = process.env) {
   return new Promise<{ ok: boolean; stdout: string; stderr: string }>(resolve => {
-    const child = spawn(command, args, {
+    const spec = buildSpawnSpec(command, args, process.platform, env);
+    if (!spec) {
+      resolve({ ok: false, stdout: "", stderr: `${command} was not found on PATH` });
+      return;
+    }
+    const child = spawn(spec.file, spec.args, {
+      env,
       windowsHide: true,
+      windowsVerbatimArguments: spec.windowsVerbatimArguments,
+      timeout: 120000,
       stdio: ["ignore", "pipe", "pipe"]
     });
     const stdout: string[] = [];

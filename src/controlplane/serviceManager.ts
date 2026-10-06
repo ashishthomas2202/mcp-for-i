@@ -4,7 +4,7 @@ import path from "path";
 import { spawn } from "child_process";
 import { getConfigDir } from "../config/store.js";
 import { getPlatformDescriptor } from "./platform.js";
-import { isControlPlaneRunning } from "./serverShared.js";
+import { getControlPlanePort, isControlPlaneRunning } from "./serverShared.js";
 
 const SERVICE_ID = "mcp-for-i-controlplane";
 const MAC_LABEL = "com.mcpfori.controlplane";
@@ -143,6 +143,7 @@ async function enableWindowsStartup(scriptPath: string, nodePath: string) {
   const startupScript = [
     "@echo off",
     "setlocal",
+    `set "MCP_FOR_I_CONTROL_PORT=${getControlPlanePort()}"`,
     `start \"\" /MIN ${command}`,
     "exit /b 0"
   ].join("\r\n");
@@ -210,6 +211,7 @@ Restart=on-failure
 RestartSec=3
 WorkingDirectory=${systemdQuote(path.dirname(scriptPath))}
 Environment=MCP_FOR_I_CONTROL_HOST=127.0.0.1
+Environment=MCP_FOR_I_CONTROL_PORT=${getControlPlanePort()}
 
 [Install]
 WantedBy=default.target
@@ -249,14 +251,27 @@ async function disableBashRcHook() {
 }
 
 async function writeBashLauncher(launcherPath: string, scriptPath: string, nodePath: string) {
-  const configDir = getConfigDir();
-  const logFile = path.join(configDir, "controlplane.log");
-  const pythonHealthUrl = JSON.stringify("http://127.0.0.1:3980/api/health");
+  const logFile = path.join(getConfigDir(), "controlplane.log");
+  const script = buildBashLauncherScript({ scriptPath, nodePath, logFile, port: getControlPlanePort() });
+  await fs.writeFile(launcherPath, script, { encoding: "utf8", mode: 0o755 });
+}
 
-  const script = `#!/usr/bin/env bash
+/**
+ * Builds the Bash launcher. The port defaults to the one configured when the
+ * service was enabled and can be overridden with MCP_FOR_I_CONTROL_PORT.
+ */
+export function buildBashLauncherScript(opts: { scriptPath: string; nodePath: string; logFile: string; port: number }) {
+  const { scriptPath, nodePath, logFile } = opts;
+  const port = Number.isInteger(opts.port) && opts.port > 0 && opts.port <= 65535 ? opts.port : 3980;
+
+  return `#!/usr/bin/env bash
 set -euo pipefail
 
-URL="http://127.0.0.1:3980/api/health"
+PORT="\${MCP_FOR_I_CONTROL_PORT:-${port}}"
+case "$PORT" in
+  ""|*[!0-9]*) PORT=${port} ;;
+esac
+URL="http://127.0.0.1:\${PORT}/api/health"
 LOG_FILE=${shellQuote(logFile)}
 LOCK_DIR="\${XDG_RUNTIME_DIR:-/tmp}/${SERVICE_ID}.lock"
 
@@ -274,10 +289,10 @@ health_check() {
   fi
 
   if command -v python3 >/dev/null 2>&1; then
-    python3 - <<'PY' >/dev/null 2>&1
-import sys, urllib.request
+    HEALTH_URL="$URL" python3 - <<'PY' >/dev/null 2>&1
+import os, sys, urllib.request
 try:
-    with urllib.request.urlopen(${pythonHealthUrl}, timeout=1) as response:
+    with urllib.request.urlopen(os.environ["HEALTH_URL"], timeout=1) as response:
         sys.exit(0 if response.status == 200 else 1)
 except Exception:
     sys.exit(1)
@@ -302,10 +317,8 @@ if health_check; then
   exit 0
 fi
 
-nohup ${shellQuote(nodePath)} ${shellQuote(scriptPath)} serve >>"$LOG_FILE" 2>&1 </dev/null &
+MCP_FOR_I_CONTROL_PORT="$PORT" nohup ${shellQuote(nodePath)} ${shellQuote(scriptPath)} serve >>"$LOG_FILE" 2>&1 </dev/null &
 `;
-
-  await fs.writeFile(launcherPath, script, { encoding: "utf8", mode: 0o755 });
 }
 
 function createBashRcBlock(launcherPath: string, wslOnly: boolean) {

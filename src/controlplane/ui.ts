@@ -1,9 +1,12 @@
-export function renderControlPlaneHtml() {
+export function renderControlPlaneHtml(token = "") {
+  // The token is hex, but escape it anyway since it lands inside an attribute.
+  const tokenAttr = escapeAttribute(token);
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="mcp-for-i-token" content="${tokenAttr}" />
   <title>MCP for i · Control Plane</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Cpath d='M16 9.5v1.2M16 14v8.5' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E" />
   <script>
@@ -840,6 +843,8 @@ export function renderControlPlaneHtml() {
     const POLICY_CHIP = { "read-only": ["ok", "Read-only"], "guarded": ["info", "Guarded"], "power-user": ["warn", "Power user"] };
     const state = { online: false, busy: false, jobs: {}, connections: [], editingName: "", service: null, settings: null };
     const $ = id => document.getElementById(id);
+    const TOKEN_HEADER = "X-MCP-For-I-Token";
+    const API_TOKEN = (document.querySelector("meta[name='mcp-for-i-token']") || {}).content || "";
     const NL = String.fromCharCode(10);
 
     function escapeHtml(s) {
@@ -939,7 +944,9 @@ export function renderControlPlaneHtml() {
       syncControls();
     }
     async function api(path, options = {}) {
-      const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
+      const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+      headers[TOKEN_HEADER] = API_TOKEN;
+      const res = await fetch(path, { ...options, headers });
       if (!res.ok) {
         const text = await res.text();
         throw new Error(text || ("HTTP " + res.status));
@@ -1287,7 +1294,7 @@ export function renderControlPlaneHtml() {
     /* Loaders */
     async function pingHealth() {
       try {
-        const res = await fetch("/api/health", { cache: "no-store" });
+        const res = await fetch("/api/health", { cache: "no-store", headers: { [TOKEN_HEADER]: API_TOKEN } });
         if (!res.ok) return false;
         const data = await res.json();
         renderCredentialStore(data?.credentialStore || null);
@@ -1450,15 +1457,23 @@ export function renderControlPlaneHtml() {
     }
 
     /* Jobs */
-    async function beginReconnectFlow(label) {
+    async function beginReconnectFlow(label, jobKey) {
       setServiceState("reconnecting", "Restarting", label + " running. Waiting for restart...");
-      const deadline = Date.now() + 120000;
+      const deadline = Date.now() + 600000;
       while (Date.now() < deadline) {
         await sleep(1800);
         if (await pingHealth()) {
+          // Jobs run in the background: wait until this one is no longer running.
+          // After a restart the new process reports it as idle.
+          let job = null;
+          if (jobKey) {
+            try { job = ((await api("/api/runtime/status")).jobs || {})[jobKey] || null; } catch { continue; }
+            if (job && job.status === "running") continue;
+          }
           setServiceState("online", "Online", "Local control service");
           await refreshAll();
-          toast("ok", label + " finished", "The control plane is back online.");
+          if (job && job.status === "failed") toast("error", label + " failed", job.error || "");
+          else toast("ok", label + " finished", "The control plane is back online.");
           return;
         }
       }
@@ -1477,9 +1492,9 @@ export function renderControlPlaneHtml() {
       setBusy(true);
       if (btn) btn.classList.add("loading");
       try {
-        await api(path, { method: "POST", body: payload ? JSON.stringify(payload) : undefined });
+        const started = await api(path, { method: "POST", body: payload ? JSON.stringify(payload) : undefined });
         await loadRuntimeStatus();
-        if (options.expectRestart) await beginReconnectFlow(options.label || "Update");
+        if (options.expectRestart) await beginReconnectFlow(options.label || "Update", started && started.job ? started.job.id : "");
         else {
           await Promise.allSettled([loadServiceStatus(), loadVersions(), loadSessions()]);
           startJobPolling();
@@ -1607,4 +1622,12 @@ export function renderControlPlaneHtml() {
   </script>
 </body>
 </html>`;
+}
+
+function escapeAttribute(value: string) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
 }
