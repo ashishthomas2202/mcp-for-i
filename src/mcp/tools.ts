@@ -9,6 +9,8 @@ import { Tools } from "../ibmi/Tools.js";
 import { ConnectionPolicy } from "../config/store.js";
 import { ConnectionService } from "../controlplane/connectionService.js";
 import { log } from "./logger.js";
+import { assertSafeIfsDeletePath, checkClCommand, checkClCommands, checkResourcePolicy, checkShellCommand, checkSqlEmbeddedCl } from "./policy.js";
+import { configuredLocalRoots, LocalPathMode, resolveAllowedLocalPath } from "../security/localPaths.js";
 import { exportAuditRecords, listAuditRecords, purgeAuditRecords, verifyAuditChain } from "./audit.js";
 import fs from "fs/promises";
 import path from "path";
@@ -1365,17 +1367,17 @@ export function getTools() {
     },
     {
       name: "ibmi.tn5250.connect",
-      description: "Connect to a TN5250 command session.",
+      description: "Open the CL command console for a connection. This is a simulated CL command console (commands run through QCMDEXC), not real 5250 emulation: it cannot display or drive green-screen programs.",
       inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
     },
     {
       name: "ibmi.tn5250.readScreen",
-      description: "Read TN5250 screen model.",
+      description: "Read the CL command console's simulated screen (command field, messages and history). Not a real 5250 screen.",
       inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
     },
     {
       name: "ibmi.tn5250.setField",
-      description: "Set TN5250 field value.",
+      description: "Set a field on the CL command console, normally the 'command' field. Not a real 5250 field.",
       inputSchema: {
         type: "object",
         properties: { fieldId: { type: "string" }, value: { type: "string" }, connectionName: { type: "string" } },
@@ -1384,7 +1386,7 @@ export function getTools() {
     },
     {
       name: "ibmi.tn5250.sendKeys",
-      description: "Send TN5250 keys.",
+      description: "Send keys to the CL command console. ENTER runs the command field as a CL command through QCMDEXC (subject to read-only mode and command policy); CLEAR, F3 and F12 clear it. This is a simulated CL command console (commands run through QCMDEXC), not real 5250 emulation: it cannot display or drive green-screen programs.",
       inputSchema: {
         type: "object",
         properties: { keys: { type: "string" }, timeoutMs: { type: "number" }, connectionName: { type: "string" }, approve: { type: "boolean" } },
@@ -1393,17 +1395,17 @@ export function getTools() {
     },
     {
       name: "ibmi.tn5250.waitFor",
-      description: "Wait for TN5250 text condition.",
+      description: "Wait until text appears in the CL command console's message area. Not a real 5250 screen.",
       inputSchema: { type: "object", properties: { text: { type: "string" }, timeoutMs: { type: "number" }, connectionName: { type: "string" } } }
     },
     {
       name: "ibmi.tn5250.snapshot",
-      description: "Capture TN5250 snapshot.",
+      description: "Capture the CL command console state as text. Not a real 5250 screen.",
       inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
     },
     {
       name: "ibmi.tn5250.disconnect",
-      description: "Disconnect TN5250 session.",
+      description: "Close the CL command console for a connection.",
       inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
     }
   ];
@@ -1415,6 +1417,7 @@ export function getTools() {
 
 export async function handleTool(ctx: McpContext, name: string, args: any) {
   const connections = new ConnectionService(ctx.store);
+  await enforceResourcePolicy(ctx, name, args);
   switch (name) {
     case "ibmi.connect": {
       if (!args?.name) throw new Error("name is required");
@@ -1636,20 +1639,23 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.ifs.delete": {
       const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "ifs.delete", args);
+      const deletePath = assertSafeIfsDeletePath(args.path);
       const flag = args.recursive ? "-rf" : "-f";
-      await conn.sendCommand({ command: `rm ${flag} ${Tools.escapePath(args.path)}` });
+      await conn.sendCommand({ command: `rm ${flag} ${Tools.escapePath(deletePath)}` });
       return result("OK");
     }
     case "ibmi.ifs.upload": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const op = resolveIfsWriteOperation(args.remotePath);
       enforceWritable(ctx, conn, op, args);
-      await conn.client!.putFile(args.localPath, args.remotePath);
+      const localPath = await guardLocalPath(ctx, args.localPath, "read");
+      await conn.client!.putFile(localPath, args.remotePath);
       return result("OK");
     }
     case "ibmi.ifs.download": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      await conn.client!.getFile(args.localPath, args.remotePath);
+      const localPath = await guardLocalPath(ctx, args.localPath, "write");
+      await conn.client!.getFile(localPath, args.remotePath);
       return result("OK");
     }
     case "ibmi.search.members": {
@@ -1776,6 +1782,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       }
 
       if (targetType === "streamfile") {
+        CompileTools.validateStreamfilePath(targetPath);
         envVars["&FULLPATH"] = targetPath;
         const base = targetPath.split("/").pop() || targetPath;
         envVars["&BASENAME"] = base;
@@ -1807,6 +1814,8 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         command: action.command,
         environment: action.environment,
         env: envVars
+      }, {
+        commandConfirm: actionCommandGuard(ctx, action.environment, args)
       });
 
       return json(mapActionExecution(action, targetType, targetPath, resultCmd));
@@ -1952,14 +1961,19 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.deploy.uploadDirectory": {
       const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "deploy.sync", args);
-      await conn.client!.putDirectory(args.localPath, args.remotePath, { recursive: true, concurrency: 5 });
+      const localPath = await guardLocalPath(ctx, args.localPath, "read");
+      await conn.client!.putDirectory(localPath, args.remotePath, { recursive: true, concurrency: 5 });
       return result("OK");
     }
     case "ibmi.deploy.uploadFiles": {
       const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "deploy.sync", args);
       const remoteDir = String(args.remoteDirectory);
+      const localFiles: string[] = [];
       for (const file of args.localFiles || []) {
+        localFiles.push(await guardLocalPath(ctx, file, "read"));
+      }
+      for (const file of localFiles) {
         const base = String(file).split(/[\\/]/).pop();
         const remotePath = `${remoteDir}/${base}`;
         await conn.client!.putFile(String(file), remotePath);
@@ -2047,7 +2061,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.deploy.compare": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      const localPath = String(args.localPath);
+      const localPath = await guardLocalPath(ctx, args.localPath, "read");
       const remotePath = String(args.remotePath);
       const comparison = await compareDeployTrees(conn, localPath, remotePath);
       return json(comparison);
@@ -2055,7 +2069,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.deploy.sync": {
       const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "deploy.sync", args);
-      const localPath = String(args.localPath);
+      const localPath = await guardLocalPath(ctx, args.localPath, "read");
       const remotePath = String(args.remotePath);
       const overwrite = Boolean(args.overwrite);
       const dryRun = Boolean(args.dryRun);
@@ -2175,7 +2189,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.sql.execute": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforcePolicyOperation(ctx, "sql.write", args);
+      enforceWritable(ctx, conn, "sql.write", args);
       const sql = String(args.sql);
       const timeoutMs = clampNumber(args?.timeoutMs, 45000, 1000, 300000);
       const statementType = getSqlStatementType(sql);
@@ -2217,7 +2231,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.cl.run": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforcePolicyOperation(ctx, "cl.run", args);
+      enforceWritable(ctx, conn, "cl.run", args);
       const command = String(args.command || "");
       if (!command.trim()) throw new Error("command is required");
       const environment = String(args.environment || "ile");
@@ -2454,6 +2468,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const queue = requireIbmObjectName(args.queue, "queue");
       const waitSeconds = clampNumber(args?.waitSeconds, 0, 0, 999999);
       const remove = Boolean(args?.remove ?? true);
+      if (remove) enforceWritable(ctx, conn, "qsys.write", args);
       const rows = await queryDataQueueEntries(conn, { library, queue, waitSeconds, remove });
       return json(rows);
     }
@@ -2493,7 +2508,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.audit.export": {
       const exported = await exportAuditRecords({
-        outputPath: String(args.outputPath),
+        outputPath: await guardLocalPath(ctx, args.outputPath, "write"),
         format: args?.format,
         filter: {
           limit: args?.limit,
@@ -2752,7 +2767,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         return json(report);
       }
 
-      const outputPath = path.resolve(String(args.outputPath));
+      const outputPath = await guardLocalPath(ctx, args.outputPath, "write");
       await fs.mkdir(path.dirname(outputPath), { recursive: true });
       await fs.writeFile(outputPath, JSON.stringify(report, null, 2), "utf8");
 
@@ -2822,9 +2837,10 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
             continue;
           }
 
-          enforcePolicyOperation(ctx, "cl.run", {
+          enforceWritable(ctx, conn, "cl.run", {
             ...args,
             command,
+            environment: "ile",
             connectionName: session.connectionName
           });
 
@@ -4235,8 +4251,9 @@ function enforcePolicyOperation(ctx: McpContext, operation: string, args: any) {
   if (policy.profile === "read-only") {
     throw new Error(`Blocked by policy (${policy.profile}): ${operation}`);
   }
-  if (isDeniedByPolicy(policy, operation, args)) {
-    throw new Error(`Blocked by policy: ${operation}`);
+  const deniedReason = isDeniedByPolicy(policy, operation, args);
+  if (deniedReason) {
+    throw new Error(`Blocked by policy: ${operation} (${deniedReason})`);
   }
   if (requiresApproval(policy, operation) && !Boolean(args?.approve)) {
     throw new Error(`Operation '${operation}' requires approve=true under '${policy.profile}' policy.`);
@@ -4452,13 +4469,54 @@ function requiresApproval(policy: ConnectionPolicy, operation: string) {
   return requires.includes(operation);
 }
 
-function isDeniedByPolicy(policy: ConnectionPolicy, operation: string, args: any) {
-  const denyCommands = (policy.denyCommands || []).map(v => v.toLowerCase());
+/** Returns the reason an operation is denied by the command policy, if any. */
+function isDeniedByPolicy(policy: ConnectionPolicy, operation: string, args: any): string | undefined {
   if (operation === "cl.run" && args?.command) {
-    const command = String(args.command).toLowerCase();
-    if (denyCommands.some(prefix => command.startsWith(prefix))) return true;
+    const environment = String(args.environment || "ile");
+    return environment === "ile"
+      ? checkClCommand(policy, String(args.command))
+      : checkShellCommand(policy, String(args.command));
   }
-  return false;
+  if (typeof args?.sql === "string") {
+    return checkSqlEmbeddedCl(policy, args.sql);
+  }
+  return undefined;
+}
+
+/** Library, IFS path and embedded-CL policy checks that apply to every tool. */
+async function enforceResourcePolicy(ctx: McpContext, toolName: string, args: any) {
+  const resolver = ctx as Partial<McpContext>;
+  const policy = typeof resolver.resolvePolicy === "function"
+    ? await resolver.resolvePolicy(args?.connectionName)
+    : typeof resolver.getPolicy === "function" ? resolver.getPolicy(args?.connectionName) : undefined;
+  if (!policy) return;
+  const reason = checkResourcePolicy(policy, toolName, args);
+  if (reason) {
+    throw new Error(`Blocked by policy: ${toolName} (${reason})`);
+  }
+}
+
+/** Check the policy against an action's expanded command before it runs. */
+function actionCommandGuard(ctx: McpContext, environment: string | undefined, args: any) {
+  return async (expanded: string) => {
+    const policy = ctx.getPolicy(args?.connectionName);
+    const reason = (environment || "ile") === "ile"
+      ? checkClCommands(policy, expanded)
+      : checkShellCommand(policy, expanded);
+    if (reason) throw new Error(`Blocked by policy: actions.run (${reason})`);
+    return expanded;
+  };
+}
+
+/** Resolve a local path and refuse it outside the allowed local roots. */
+async function guardLocalPath(ctx: McpContext, value: unknown, mode: LocalPathMode) {
+  let settingsRoots: unknown;
+  try {
+    settingsRoots = ((await ctx.store.getSettings()) as any)?.allowedLocalRoots;
+  } catch {
+    settingsRoots = undefined;
+  }
+  return resolveAllowedLocalPath(value, mode, configuredLocalRoots(settingsRoots));
 }
 
 const APPROVAL_HINT_TOOLS = new Set([
@@ -4521,8 +4579,19 @@ function withGuardedApprovalHint(tool: any) {
   return { ...tool, inputSchema: schema };
 }
 
+/** Tools outside the qsys/search/source families that also accept connectionName. */
+const CONNECTION_NAME_TOOLS = new Set([
+  "ibmi.find.ifs",
+  "ibmi.actions.run",
+  "ibmi.libl.validate",
+  "ibmi.resolve.path",
+  "ibmi.debug.status",
+  "ibmi.journal.objects.list"
+]);
+
 function withSourceConnectionName(tool: any) {
-  if (!/^ibmi\.(?:qsys|search|source)\./.test(tool.name)) return tool;
+  const accepts = /^ibmi\.(?:qsys|search|source|ifs|deploy)\./.test(tool.name) || CONNECTION_NAME_TOOLS.has(tool.name);
+  if (!accepts) return tool;
   const schema = tool.inputSchema || { type: "object", properties: {} };
   if (!schema.properties) schema.properties = {};
   if (!schema.properties.connectionName) {
