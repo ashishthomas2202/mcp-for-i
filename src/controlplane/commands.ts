@@ -44,26 +44,32 @@ export async function runControlCommand(args: string[], options: RunOptions) {
   }
 }
 
+/**
+ * Runs the control plane in the foreground. Resolves only after the server has
+ * stopped listening, so a caller that exits when this returns keeps it alive.
+ */
 async function serve(stderr: NodeJS.WriteStream) {
+  let server: Awaited<ReturnType<typeof startControlPlaneServer>>;
   try {
-    const server = await startControlPlaneServer();
-    stderr.write(`mcp-for-i control plane running at http://${server.host}:${server.port}\n`);
-
-    const shutdown = async () => {
-      await server.close();
-      process.exit(0);
-    };
-
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
+    server = await startControlPlaneServer();
   } catch (err: any) {
     if (err?.code === "EADDRINUSE") {
       const url = getControlPlaneUrl();
       stderr.write(`mcp-for-i control plane already running at ${url}\n`);
-      process.exit(0);
+      return;
     }
     throw err;
   }
+
+  stderr.write(`mcp-for-i control plane running at ${getControlPlaneUrl()}\n`);
+
+  const shutdown = () => {
+    server.close().catch(() => undefined);
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+
+  await server.closed;
 }
 
 async function printStatus(stderr: NodeJS.WriteStream, scriptPath: string, nodePath: string) {
