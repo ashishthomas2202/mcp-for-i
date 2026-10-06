@@ -32,6 +32,13 @@
 - Existing `members.read` calls keep the legacy text response. Set `responseFormat: "structured"` or request ranges, context, metadata, or a version check to receive the structured snapshot envelope.
 - `members.write` supports optional optimistic-concurrency checks through `expectedVersion` and `expectedSha256`.
 - `members.read` uses a job-local alias for source-date reads and a complete `CPYTOSTMF` fallback if the SQL path is unavailable.
+- Both read paths normalize content the same way before hashing (LF line endings, trailing blanks trimmed from every line), so `sha256` and `version` do not change when a read falls back from SQL to `CPYTOSTMF`.
+- Cached snapshots are only served after a cheap re-check of the member's `LAST_SOURCE_UPDATE_TIMESTAMP` and row count, so edits made outside this server are seen immediately. Cache hits report `cacheStatus: "hit"` and `validatedAt`.
+- Full reads are capped by the `sourceReadMaxBytes` / `sourceReadMaxLines` settings (defaults 2,000,000 bytes and 50,000 lines). Larger members return a `SOURCE_TOO_LARGE` error with the size and version; read them with `startLine`/`endLine` or `ranges`, or locate code with `ibmi.search.members` / `ibmi.source.inspect`.
+- `startLine` without `endLine` reads to the end of the member. Ranges past the end return no lines and a warning. Range responses are limited to 2,000 lines; when cut, the response has `truncated: true` and `nextLine`.
+- `metadataOnly: true` does not download content. It returns `changeMarker` and catalog metadata, plus `sha256`/`version` only when a validated cached snapshot exists.
+- A version mismatch (`expectedVersion` / `expectedSha256`) on read, inspect or write is a tool error with `code: "VERSION_CONFLICT"`, `currentVersion` and `currentSha256`; nothing is modified.
+- A successful `members.write` reads the member back and returns `version`, `sha256`, `lineCount` and `previousVersion` (as JSON when a version check or `responseFormat: "structured"` is used; otherwise the text stays `OK` and the details are in `structuredContent`). The version check and the write are separate host operations, so a change made in the instant between them is not detected.
 
 ## IFS
 - `ibmi.ifs.list`
@@ -61,6 +68,8 @@
 - `ibmi.source.inspect`
 
 `ibmi.source.inspect` batches metadata, outline, search, range-read, and dependency extraction over one versioned source snapshot.
+
+Outline and dependency extraction follow the member source type: RPG (fully free, fixed and mixed: procedures, subroutines, prototypes, data structures, `dcl-f`/F-spec files, `EXTPGM`/`EXTPROC`, `CALL`/`CALLB`/`CALLP`, `/COPY`/`/INCLUDE` and embedded SQL tables), CL (`CALL`, `CALLPRC`, `DCLF`, `OVRDBF TOFILE`, `INCLUDE`, `RUNSQL`, `SBMJOB CMD(CALL ...)`, labels, subroutines), SQL (created objects; tables from `FROM`, `JOIN`, `INSERT`/`MERGE INTO`, `UPDATE`, `DELETE FROM`, `REFERENCES`; `CALL`), and DDS PF/LF/DSPF/PRTF (record formats, keys, fields; `REF`, `REFFLD`, `PFILE`, `JFILE`). Results include the detected `language`.
 
 ## Official IBM i Documentation
 

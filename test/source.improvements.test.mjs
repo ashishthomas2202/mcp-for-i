@@ -100,8 +100,13 @@ test("member write rejects a stale expected version before modifying source", as
     connectionName: "DEV", library: "MYLIB", sourceFile: "QRPGLESRC", member: "ORDER",
     content: "changed", expectedVersion: "stale"
   });
-  assert.equal(data(response).status, "version-conflict");
-  assert.equal(data(response).modified, false);
+  assert.equal(response.isError, true);
+  const error = response.structuredContent.error;
+  assert.equal(error.code, "VERSION_CONFLICT");
+  assert.equal(error.status, "version-conflict");
+  assert.equal(error.modified, false);
+  assert.equal(error.currentVersion, snapshot().version);
+  assert.equal(error.currentSha256, snapshot().sha256);
   assert.equal(writes, 0);
 });
 
@@ -246,12 +251,14 @@ test("search.members tool returns the bounded result with truncation details", a
 
 test("identical snapshot reads are coalesced and then served from the bounded cache", async () => {
   let sqlCalls = 0;
+  let metadataChecks = 0;
   const fakeClient = {
     getConfig: () => ({ enableSourceDates: true }),
     upperCaseName: value => String(value).toUpperCase(),
     validQsysName: value => /^[A-Z][A-Z0-9]{0,9}$/.test(value),
-    runSQL: async () => {
-      sqlCalls++;
+    runSQL: async sql => {
+      if (!/create alias/i.test(sql)) metadataChecks++;
+      else sqlCalls++;
       await Promise.resolve();
       return [{
         SRCDAT: 260909, SRCSEQ: 1, SRCDTA: "source", SYSTEM_TABLE_MEMBER: "ORDER",
@@ -266,6 +273,7 @@ test("identical snapshot reads are coalesced and then served from the bounded ca
   ]);
   const third = await content.getMemberSnapshot("MYLIB", "QRPGLESRC", "ORDER");
   assert.equal(sqlCalls, 1);
+  assert.equal(metadataChecks, 1, "a cache hit re-checks the change marker");
   assert.equal(first.sha256, second.sha256);
   assert.equal(second.cacheStatus, "coalesced");
   assert.equal(third.cacheStatus, "hit");

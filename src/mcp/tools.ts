@@ -60,6 +60,8 @@ const SETTINGS_SCHEMA: JsonSchema = {
     sourceFileCCSID: { type: "string" },
     sqlJobCcsid: { type: ["string", "number"] },
     enableSourceDates: { type: "boolean" },
+    sourceReadMaxBytes: { type: "number" },
+    sourceReadMaxLines: { type: "number" },
     homeDirectory: { type: "string" },
     libraryList: { type: "array", items: { type: "string" } },
     currentLibrary: { type: "string" },
@@ -327,7 +329,7 @@ export function getTools() {
     },
     {
       name: "ibmi.qsys.members.read",
-      description: "Read a member.",
+      description: "Read a member. Full reads larger than the sourceReadMaxBytes/sourceReadMaxLines settings fail with SOURCE_TOO_LARGE; use startLine/endLine, ranges, ibmi.search.members or ibmi.source.inspect instead. startLine without endLine reads to the end of the member.",
       inputSchema: {
         type: "object",
         properties: {
@@ -351,12 +353,13 @@ export function getTools() {
     },
     {
       name: "ibmi.qsys.members.write",
-      description: "Write a member.",
+      description: "Write a member. Pass expectedVersion or expectedSha256 from a structured read to reject the write (VERSION_CONFLICT error) if the member changed. With a version check or responseFormat \"structured\" the result carries the new version and sha256 for chaining edits.",
       inputSchema: {
         type: "object",
         properties: {
           connectionName: { type: "string" }, library: { type: "string" }, sourceFile: { type: "string" }, member: { type: "string" }, content: { type: "string" },
-          expectedVersion: { type: "string" }, expectedSha256: { type: "string" }
+          expectedVersion: { type: "string" }, expectedSha256: { type: "string" },
+          responseFormat: { type: "string", enum: ["text", "structured"] }
         },
         required: ["library", "sourceFile", "member", "content"]
       }
@@ -1560,25 +1563,50 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.qsys.members.read": {
       const conn = await ctx.ensureActive(args?.connectionName);
+      const limits = sourceReadLimits(conn);
       if (!hasStructuredMemberReadOptions(args)) {
         const content = await conn.content.downloadMemberContent(args.library, args.sourceFile, args.member);
+        const tooLarge = sourceTooLarge(content, undefined, limits, args);
+        if (tooLarge) return tooLarge;
         return result(content);
+      }
+      const wantsVersionCheck = Boolean(args.expectedVersion || args.expectedSha256);
+      if (args.metadataOnly && !wantsVersionCheck && !args.forceFresh && typeof conn.content.getMemberVersionInfo === "function") {
+        // Metadata-only reads never download content; a validated cached
+        // snapshot supplies sha256/version when one is available.
+        const info = await conn.content.getMemberVersionInfo(args.library, args.sourceFile, args.member);
+        if (info.snapshot) return json(formatMemberRead(info.snapshot, args, limits));
+        return json(memberMetadataEnvelope(args, info.metadata, info.observedAt));
+      }
+      if (isFullMemberRead(args) && typeof conn.content.getMemberMetadata === "function") {
+        const metadata = await conn.content.getMemberMetadata(args.library, args.sourceFile, args.member);
+        const rows = Number(metadata?.rowCount || 0);
+        if (limits.maxLines > 0 && rows > limits.maxLines) {
+          return sourceTooLargeError(args, { lineCount: rows, metadata }, limits);
+        }
       }
       const snapshot = await conn.content.getMemberSnapshot(args.library, args.sourceFile, args.member, Boolean(args.forceFresh));
       const conflict = memberVersionConflict(snapshot, args);
-      if (conflict) return json(conflict);
-      return json(formatMemberRead(snapshot, args));
+      if (conflict) return conflict;
+      return formatMemberReadResult(snapshot, args, limits);
     }
     case "ibmi.qsys.members.write": {
       const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "qsys.write", args);
-      if (args.expectedVersion || args.expectedSha256) {
-        const snapshot = await conn.content.getMemberSnapshot(args.library, args.sourceFile, args.member, true);
-        const conflict = memberVersionConflict(snapshot, args);
-        if (conflict) return json(conflict);
+      const versionChecked = Boolean(args.expectedVersion || args.expectedSha256);
+      let previous: MemberSnapshot | undefined;
+      if (versionChecked) {
+        // Re-read the member fresh immediately before writing. A change made
+        // between this check and the write itself can still slip through;
+        // the host offers no compare-and-swap for source members.
+        previous = await conn.content.getMemberSnapshot(args.library, args.sourceFile, args.member, true);
+        const conflict = memberVersionConflict(previous!, args);
+        if (conflict) return conflict;
       }
       await conn.content.uploadMemberContent(args.library, args.sourceFile, args.member, args.content);
-      return result("OK");
+      const written = await describeWrittenMember(conn, args, previous);
+      if (versionChecked || args.responseFormat === "structured") return json(written);
+      return { content: [{ type: "text", text: "OK" }], structuredContent: { ok: true, text: "OK", data: written } };
     }
     case "ibmi.qsys.members.create": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -1708,7 +1736,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       }
       const snapshot = await conn.content.getMemberSnapshot(args.library, sourceFile, args.member, Boolean(args.forceFresh));
       const conflict = memberVersionConflict(snapshot, args);
-      if (conflict) return json(conflict);
+      if (conflict) return conflict;
       return json({
         status: "found",
         identity: snapshot.identity,
@@ -1720,7 +1748,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         cacheStatus: snapshot.cacheStatus,
         warnings: snapshot.warnings,
         ...(resolution ? { resolution } : {}),
-        results: operations.map((operation: any) => inspectMemberOperation(snapshot, operation))
+        results: operations.map((operation: any) => inspectMemberOperation(snapshot, operation, sourceReadLimits(conn)))
       });
     }
     case "ibmi.docs.search": {
@@ -3544,19 +3572,139 @@ function memberVersionConflict(snapshot: MemberSnapshot, args: any) {
   const versionMismatch = args?.expectedVersion && args.expectedVersion !== snapshot.version;
   const hashMismatch = args?.expectedSha256 && String(args.expectedSha256).toLowerCase() !== snapshot.sha256.toLowerCase();
   if (!versionMismatch && !hashMismatch) return undefined;
+  const { identity } = snapshot;
+  return toolError(
+    `Version conflict: ${identity.library}/${identity.sourceFile}(${identity.member}) is now version ${snapshot.version}. ` +
+    "Nothing was modified. Re-read the member and retry with the current version.",
+    {
+      code: "VERSION_CONFLICT",
+      status: "version-conflict",
+      identity,
+      expectedVersion: args?.expectedVersion,
+      expectedSha256: args?.expectedSha256,
+      actualVersion: snapshot.version,
+      actualSha256: snapshot.sha256,
+      currentVersion: snapshot.version,
+      currentSha256: snapshot.sha256,
+      observedAt: snapshot.observedAt,
+      modified: false
+    }
+  );
+}
+
+const DEFAULT_SOURCE_READ_MAX_BYTES = 2_000_000;
+const DEFAULT_SOURCE_READ_MAX_LINES = 50_000;
+const MAX_RANGE_LINES = 2_000;
+
+type SourceReadLimits = { maxBytes: number; maxLines: number };
+
+function sourceReadLimits(conn: any): SourceReadLimits {
+  const config = typeof conn?.getConfig === "function" ? conn.getConfig() || {} : {};
+  const read = (value: any, fallback: number) => {
+    const parsed = Number(value);
+    if (value === undefined || value === null || value === "" || !Number.isFinite(parsed) || parsed < 0) return fallback;
+    return Math.floor(parsed);
+  };
   return {
-    status: "version-conflict",
-    identity: snapshot.identity,
-    expectedVersion: args?.expectedVersion,
-    expectedSha256: args?.expectedSha256,
-    actualVersion: snapshot.version,
-    actualSha256: snapshot.sha256,
-    observedAt: snapshot.observedAt,
-    modified: false
+    maxBytes: read(config.sourceReadMaxBytes, DEFAULT_SOURCE_READ_MAX_BYTES),
+    maxLines: read(config.sourceReadMaxLines, DEFAULT_SOURCE_READ_MAX_LINES)
   };
 }
 
-function formatMemberRead(snapshot: MemberSnapshot, args: any) {
+function isFullMemberRead(args: any) {
+  return !args?.metadataOnly &&
+    typeof args?.startLine === "undefined" &&
+    typeof args?.endLine === "undefined" &&
+    !(Array.isArray(args?.ranges) && args.ranges.length > 0);
+}
+
+function exceedsSourceLimits(content: string, lineCount: number | undefined, limits: SourceReadLimits) {
+  const bytes = Buffer.byteLength(content, "utf8");
+  const lines = typeof lineCount === "number" ? lineCount : (content === "" ? 0 : content.split("\n").length);
+  const tooLarge = (limits.maxBytes > 0 && bytes > limits.maxBytes) || (limits.maxLines > 0 && lines > limits.maxLines);
+  return tooLarge ? { bytes, lineCount: lines } : undefined;
+}
+
+function sourceTooLarge(content: string, lineCount: number | undefined, limits: SourceReadLimits, args: any) {
+  const size = exceedsSourceLimits(content, lineCount, limits);
+  return size ? sourceTooLargeError(args, size, limits) : undefined;
+}
+
+function sourceTooLargeError(args: any, size: Record<string, any>, limits: SourceReadLimits, extra: Record<string, any> = {}) {
+  const name = `${String(args?.library || "").toUpperCase()}/${String(args?.sourceFile || "").toUpperCase()}(${String(args?.member || "").toUpperCase()})`;
+  return toolError(
+    `${name} is too large for a full read (${size.lineCount ?? "?"} lines` +
+    `${typeof size.bytes === "number" ? `, ${size.bytes} bytes` : ""}; limits ${limits.maxLines} lines, ${limits.maxBytes} bytes). ` +
+    "Read it in pieces with startLine/endLine or ranges, locate code with ibmi.search.members or ibmi.source.inspect " +
+    "(search, outline), or use metadataOnly: true for its size and version.",
+    { code: "SOURCE_TOO_LARGE", ...size, maxLines: limits.maxLines, maxBytes: limits.maxBytes, ...extra }
+  );
+}
+
+function formatMemberReadResult(snapshot: MemberSnapshot, args: any, limits: SourceReadLimits) {
+  if (isFullMemberRead(args)) {
+    const size = exceedsSourceLimits(snapshot.content, snapshot.lines.length, limits);
+    if (size) {
+      return sourceTooLargeError(args, size, limits, {
+        identity: snapshot.identity,
+        metadata: snapshot.metadata,
+        version: snapshot.version,
+        sha256: snapshot.sha256,
+        observedAt: snapshot.observedAt
+      });
+    }
+  }
+  return json(formatMemberRead(snapshot, args, limits));
+}
+
+function memberMetadataEnvelope(args: any, metadata: any, observedAt: string) {
+  return {
+    status: "found",
+    identity: {
+      library: String(args.library).toUpperCase(),
+      sourceFile: String(args.sourceFile).toUpperCase(),
+      member: String(args.member).toUpperCase()
+    },
+    metadata,
+    ...(metadata?.lastChanged ? { changeMarker: metadata.lastChanged } : {}),
+    observedAt,
+    contentLoaded: false,
+    cacheStatus: "bypass",
+    warnings: [
+      "Content was not downloaded, so sha256 and version are omitted. Pass expectedVersion/expectedSha256 or read without metadataOnly to compute them."
+    ]
+  };
+}
+
+async function describeWrittenMember(conn: any, args: any, previous?: MemberSnapshot) {
+  const identity = {
+    library: String(args.library).toUpperCase(),
+    sourceFile: String(args.sourceFile).toUpperCase(),
+    member: String(args.member).toUpperCase()
+  };
+  const base: Record<string, any> = {
+    status: "written",
+    identity,
+    modified: true,
+    ...(previous ? { previousVersion: previous.version, previousSha256: previous.sha256 } : {})
+  };
+  try {
+    // Read back what the host stored (record length and CCSID conversion may
+    // differ from what was sent) so the caller can chain the next edit.
+    const snapshot: MemberSnapshot = await conn.content.getMemberSnapshot(args.library, args.sourceFile, args.member, true);
+    return {
+      ...base,
+      version: snapshot.version,
+      sha256: snapshot.sha256,
+      lineCount: snapshot.lines.length,
+      observedAt: snapshot.observedAt
+    };
+  } catch (error: any) {
+    return { ...base, warnings: [`Write succeeded, but reading back the new version failed: ${error?.message || String(error)}`] };
+  }
+}
+
+function formatMemberRead(snapshot: MemberSnapshot, args: any, limits?: SourceReadLimits) {
   const envelope: Record<string, any> = {
     status: "found",
     identity: snapshot.identity,
@@ -3564,20 +3712,34 @@ function formatMemberRead(snapshot: MemberSnapshot, args: any) {
     version: snapshot.version,
     sha256: snapshot.sha256,
     observedAt: snapshot.observedAt,
+    ...(snapshot.validatedAt ? { validatedAt: snapshot.validatedAt } : {}),
     complete: snapshot.complete,
     transport: snapshot.transport,
     cacheStatus: snapshot.cacheStatus,
+    lineCount: snapshot.lines.length,
     warnings: snapshot.warnings
   };
   if (args?.metadataOnly) return envelope;
 
-  const ranges = normalizeLineRanges(args, snapshot.lines.length);
-  if (ranges.length === 0) {
-    return { ...envelope, content: snapshot.content, lineCount: snapshot.lines.length };
+  const selection = normalizeLineRanges(args, snapshot.lines.length);
+  if (!selection.requested) {
+    const size = limits ? exceedsSourceLimits(snapshot.content, snapshot.lines.length, limits) : undefined;
+    if (size) {
+      // Composite inspect read_ranges without ranges: never flood the caller.
+      return {
+        ...envelope,
+        contentOmitted: true,
+        ...size,
+        warnings: [...snapshot.warnings, "Member exceeds the full-read size limit; request ranges instead."]
+      };
+    }
+    return { ...envelope, content: snapshot.content };
   }
   return {
     ...envelope,
-    ranges: ranges.map(range => ({
+    warnings: [...snapshot.warnings, ...selection.warnings],
+    ...(selection.truncated ? { truncated: true, nextLine: selection.nextLine } : {}),
+    ranges: selection.ranges.map(range => ({
       start: range.start,
       end: range.end,
       lines: snapshot.lines.slice(range.start - 1, range.end).map((content, index) => ({
@@ -3593,22 +3755,31 @@ function normalizeLineRanges(args: any, lineCount: number) {
   const after = clampInteger(args?.after, 0, 200, 0);
   const requested: Array<{ start: number; end: number }> = [];
   if (typeof args?.startLine !== "undefined" || typeof args?.endLine !== "undefined") {
-    requested.push({ start: Number(args.startLine || 1), end: Number(args.endLine || args.startLine || lineCount) });
+    const start = typeof args.startLine !== "undefined" ? Number(args.startLine) : 1;
+    // startLine without endLine reads to the end of the member.
+    const end = typeof args.endLine !== "undefined" ? Number(args.endLine) : Math.max(start, lineCount);
+    requested.push({ start, end });
   }
   if (Array.isArray(args?.ranges)) {
     for (const range of args.ranges.slice(0, 8)) requested.push({ start: Number(range.start), end: Number(range.end) });
   }
-  if (requested.length === 0) return [];
+  const warnings: string[] = [];
+  if (requested.length === 0) return { requested: false, ranges: [], warnings, truncated: false };
 
-  const normalized = requested.map(range => {
+  const normalized: Array<{ start: number; end: number }> = [];
+  for (const range of requested) {
     if (!Number.isFinite(range.start) || !Number.isFinite(range.end) || range.start < 1 || range.end < range.start) {
       throw new Error(`Invalid line range ${range.start}-${range.end}`);
     }
-    return {
-      start: Math.max(1, Math.floor(range.start) - before),
-      end: Math.min(lineCount, Math.floor(range.end) + after)
-    };
-  }).sort((a, b) => a.start - b.start || a.end - b.end);
+    const start = Math.max(1, Math.floor(range.start) - before);
+    const end = Math.min(lineCount, Math.floor(range.end) + after);
+    if (start > lineCount || end < start) {
+      warnings.push(`Lines ${range.start}-${range.end} are past the end of the member (${lineCount} lines).`);
+      continue;
+    }
+    normalized.push({ start, end });
+  }
+  normalized.sort((a, b) => a.start - b.start || a.end - b.end);
 
   const merged: Array<{ start: number; end: number }> = [];
   for (const range of normalized) {
@@ -3616,9 +3787,30 @@ function normalizeLineRanges(args: any, lineCount: number) {
     if (previous && range.start <= previous.end + 1) previous.end = Math.max(previous.end, range.end);
     else merged.push({ ...range });
   }
-  const total = merged.reduce((sum, range) => sum + range.end - range.start + 1, 0);
-  if (total > 2_000) throw new Error("Requested ranges exceed the 2,000-line response limit");
-  return merged;
+
+  // Cap the response instead of failing; nextLine says where to continue.
+  const limited: Array<{ start: number; end: number }> = [];
+  let remaining = MAX_RANGE_LINES;
+  let nextLine: number | undefined;
+  for (const range of merged) {
+    if (remaining <= 0) {
+      nextLine ??= range.start;
+      break;
+    }
+    const length = range.end - range.start + 1;
+    if (length > remaining) {
+      limited.push({ start: range.start, end: range.start + remaining - 1 });
+      nextLine = range.start + remaining;
+      remaining = 0;
+      continue;
+    }
+    limited.push(range);
+    remaining -= length;
+  }
+  if (nextLine !== undefined) {
+    warnings.push(`Response limited to ${MAX_RANGE_LINES} lines; continue from line ${nextLine}.`);
+  }
+  return { requested: true, ranges: limited, warnings, truncated: nextLine !== undefined, nextLine };
 }
 
 function normalizeSearchTerms(args: any) {
@@ -3638,12 +3830,12 @@ function rankMemberCandidates(candidates: any[], preferredFiles?: string[]) {
     (ranks.get(String(b.file).toUpperCase()) ?? Number.MAX_SAFE_INTEGER) || String(a.file).localeCompare(String(b.file)));
 }
 
-function inspectMemberOperation(snapshot: MemberSnapshot, operation: any) {
+function inspectMemberOperation(snapshot: MemberSnapshot, operation: any, limits?: SourceReadLimits) {
   switch (operation.operation) {
     case "metadata":
       return { operation: "metadata", metadata: snapshot.metadata };
     case "read_ranges":
-      return { operation: "read_ranges", ...formatMemberRead(snapshot, { ranges: operation.ranges, before: operation.before, after: operation.after }) };
+      return { operation: "read_ranges", ...formatMemberRead(snapshot, { ranges: operation.ranges, before: operation.before, after: operation.after }, limits) };
     case "search":
       return { operation: "search", ...searchSnapshot(snapshot, operation) };
     case "outline":

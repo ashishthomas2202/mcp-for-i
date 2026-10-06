@@ -66,6 +66,10 @@ export interface ConnectionConfig {
   sourceFileCCSID?: string;
   sqlJobCcsid?: string | number;
   enableSourceDates?: boolean;
+  /** Largest member (UTF-8 bytes) a full read returns; 0 disables the cap. */
+  sourceReadMaxBytes?: number;
+  /** Largest member (lines) a full read returns; 0 disables the cap. */
+  sourceReadMaxLines?: number;
   homeDirectory?: string;
   libraryList?: string[];
   currentLibrary?: string;

@@ -21,6 +21,8 @@ export type MemberSnapshot = {
   sha256: string;
   version: string;
   observedAt: string;
+  /** Set on cache hits: when the cached content was last confirmed current. */
+  validatedAt?: string;
   complete: true;
   transport: "sql-member" | "cpytostmf";
   warnings: string[];
@@ -37,9 +39,10 @@ export type MemberListPage = {
 
 export class IBMiContent {
   private readonly sourceDates = new SourceDateStore();
-  private readonly snapshotCache = new Map<string, { snapshot: MemberSnapshot; expiresAt: number }>();
+  private readonly snapshotCache = new Map<string, { snapshot: MemberSnapshot; identityKey: string; expiresAt: number }>();
   private readonly snapshotInflight = new Map<string, Promise<MemberSnapshot>>();
   private readonly snapshotLatestKey = new Map<string, string>();
+  private readonly snapshotGeneration = new Map<string, number>();
   private readonly snapshotCacheTtlMs = 120_000;
   private readonly snapshotCacheMax = 32;
 
@@ -410,41 +413,110 @@ export class IBMiContent {
     const mbr = this.requireQsysName(member, "member");
     const identityKey = `${lib}/${file}/${mbr}`;
     if (!forceFresh) {
-      const latestKey = this.snapshotLatestKey.get(identityKey);
-      const cached = latestKey ? this.snapshotCache.get(latestKey) : undefined;
-      if (cached && cached.expiresAt > Date.now()) {
-        this.snapshotCache.delete(latestKey!);
-        this.snapshotCache.set(latestKey!, cached);
-        return { ...cached.snapshot, cacheStatus: "hit" };
+      const cached = this.peekCachedSnapshot(identityKey);
+      if (cached) {
+        // Cache contract: a hit is only served after the cheap change marker
+        // still matches, so edits made outside this server are seen at once.
+        const current = await this.getMemberMetadata(lib, file, mbr);
+        if (!current) {
+          this.invalidateMemberSnapshot(lib, file, mbr);
+          throw new Error(`${mbr} in ${lib}/${file} not found`);
+        }
+        if (sameChangeMarker(cached.metadata, current)) {
+          return { ...cached, metadata: current, validatedAt: new Date().toISOString(), cacheStatus: "hit" };
+        }
+        this.invalidateMemberSnapshot(lib, file, mbr);
       }
       const inflight = this.snapshotInflight.get(identityKey);
       if (inflight) return { ...(await inflight), cacheStatus: "coalesced" };
     }
+    // An invalidation (write, rename, delete) while this load is in flight
+    // bumps the generation, and the possibly stale result is then not cached.
+    const generation = this.snapshotGeneration.get(identityKey) || 0;
     const loading = this.loadMemberSnapshot(lib, file, mbr);
     this.snapshotInflight.set(identityKey, loading);
     try {
       const snapshot = await loading;
-      const key = `${identityKey}/${snapshot.metadata.lastChanged || snapshot.version}`;
-      this.snapshotCache.set(key, { snapshot, expiresAt: Date.now() + this.snapshotCacheTtlMs });
-      this.snapshotLatestKey.set(identityKey, key);
-      while (this.snapshotCache.size > this.snapshotCacheMax) {
-        const oldest = this.snapshotCache.keys().next().value;
-        if (!oldest) break;
-        this.snapshotCache.delete(oldest);
+      if ((this.snapshotGeneration.get(identityKey) || 0) === generation) {
+        this.cacheSnapshot(identityKey, snapshot);
       }
       return snapshot;
     } finally {
-      this.snapshotInflight.delete(identityKey);
+      if (this.snapshotInflight.get(identityKey) === loading) this.snapshotInflight.delete(identityKey);
     }
   }
 
+  /**
+   * Cheap version information for metadata-only reads. Returns the member's
+   * catalog metadata and, when a cached snapshot is still valid for the
+   * current change marker, that snapshot. Never downloads member content.
+   */
+  async getMemberVersionInfo(library: string, sourceFile: string, member: string): Promise<{
+    metadata: MemberMetadata;
+    snapshot?: MemberSnapshot;
+    observedAt: string;
+  }> {
+    const lib = this.requireQsysName(library, "library");
+    const file = this.requireQsysName(sourceFile, "sourceFile");
+    const mbr = this.requireQsysName(member, "member");
+    const identityKey = `${lib}/${file}/${mbr}`;
+    const metadata = await this.getMemberMetadata(lib, file, mbr);
+    const observedAt = new Date().toISOString();
+    if (!metadata) {
+      this.invalidateMemberSnapshot(lib, file, mbr);
+      throw new Error(`${mbr} in ${lib}/${file} not found`);
+    }
+    const cached = this.peekCachedSnapshot(identityKey);
+    if (cached && sameChangeMarker(cached.metadata, metadata)) {
+      return { metadata, observedAt, snapshot: { ...cached, metadata, validatedAt: observedAt, cacheStatus: "hit" } };
+    }
+    return { metadata, observedAt };
+  }
+
   invalidateMemberSnapshot(library: string, sourceFile: string, member: string) {
-    const identityKey = `${String(library).toUpperCase()}/${String(sourceFile).toUpperCase()}/${String(member).toUpperCase()}`;
-    const prefix = `${identityKey}/`;
-    for (const key of this.snapshotCache.keys()) {
-      if (key.startsWith(prefix)) this.snapshotCache.delete(key);
+    const identityKey = `${String(library).trim().toUpperCase()}/${String(sourceFile).trim().toUpperCase()}/${String(member).trim().toUpperCase()}`;
+    this.snapshotGeneration.set(identityKey, (this.snapshotGeneration.get(identityKey) || 0) + 1);
+    for (const [key, entry] of this.snapshotCache) {
+      if (entry.identityKey === identityKey) this.snapshotCache.delete(key);
     }
     this.snapshotLatestKey.delete(identityKey);
+    // Later readers must not coalesce onto a load that started before the change.
+    this.snapshotInflight.delete(identityKey);
+  }
+
+  private peekCachedSnapshot(identityKey: string): MemberSnapshot | undefined {
+    const latestKey = this.snapshotLatestKey.get(identityKey);
+    if (!latestKey) return undefined;
+    const entry = this.snapshotCache.get(latestKey);
+    if (!entry || entry.expiresAt <= Date.now()) {
+      this.snapshotCache.delete(latestKey);
+      this.snapshotLatestKey.delete(identityKey);
+      return undefined;
+    }
+    // Refresh LRU order.
+    this.snapshotCache.delete(latestKey);
+    this.snapshotCache.set(latestKey, entry);
+    return entry.snapshot;
+  }
+
+  private cacheSnapshot(identityKey: string, snapshot: MemberSnapshot) {
+    // Without an authoritative change marker a hit could never be validated.
+    if (!snapshot.metadata.lastChanged) return;
+    for (const [key, entry] of this.snapshotCache) {
+      if (entry.identityKey === identityKey) this.snapshotCache.delete(key);
+    }
+    const key = `${identityKey}/${snapshot.metadata.lastChanged}`;
+    this.snapshotCache.set(key, { snapshot, identityKey, expiresAt: Date.now() + this.snapshotCacheTtlMs });
+    this.snapshotLatestKey.set(identityKey, key);
+    while (this.snapshotCache.size > this.snapshotCacheMax) {
+      const oldest = this.snapshotCache.keys().next().value;
+      if (!oldest) break;
+      const evicted = this.snapshotCache.get(oldest);
+      this.snapshotCache.delete(oldest);
+      if (evicted && this.snapshotLatestKey.get(evicted.identityKey) === oldest) {
+        this.snapshotLatestKey.delete(evicted.identityKey);
+      }
+    }
   }
 
   async downloadMemberContentWithDates(library: string, sourceFile: string, member: string): Promise<string | undefined> {
@@ -594,8 +666,11 @@ export class IBMiContent {
     }
     const sourceDates = rows.map(row => String(row.SRCDAT).padStart(6, "0"));
     const content = rows.map(row => String(row.SRCDTA ?? "")).join("\n");
-    this.sourceDates.setBase(`${lib}/${file}/${mbr}`, content, sourceDates, metadata.recordLength || 80);
-    return this.makeMemberSnapshot(lib, file, mbr, content, metadata, "sql-member", []);
+    const snapshot = this.makeMemberSnapshot(lib, file, mbr, content, metadata, "sql-member", []);
+    // The diff base must match what callers see and send back (trimmed lines),
+    // otherwise every padded line would look changed and lose its date.
+    this.sourceDates.setBase(`${lib}/${file}/${mbr}`, snapshot.content, sourceDates, metadata.recordLength || 80);
+    return snapshot;
   }
 
   private async loadMemberSnapshotViaStreamFile(lib: string, file: string, mbr: string, sqlError?: any): Promise<MemberSnapshot> {
@@ -627,8 +702,7 @@ export class IBMiContent {
     transport: "sql-member" | "cpytostmf",
     warnings: string[]
   ): MemberSnapshot {
-    const content = rawContent.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    const lines = content.split("\n");
+    const { content, lines } = normalizeMemberContent(rawContent, transport);
     const sha256 = crypto.createHash("sha256").update(content, "utf8").digest("hex");
     const marker = metadata.lastChanged || "unknown";
     return {
@@ -758,6 +832,27 @@ export class IBMiContent {
       throw new Error("Connection is in read-only mode");
     }
   }
+}
+
+/**
+ * Normalizes member text so both read transports produce the same content,
+ * SHA-256 and version: line endings become LF, trailing blanks are removed
+ * from every line (the SQL path returns CHAR-padded SRCDTA, CPYTOSTMF output
+ * is trimmed) and the record terminator CPYTOSTMF writes after the last
+ * record is dropped.
+ */
+export function normalizeMemberContent(rawContent: string, transport: "sql-member" | "cpytostmf") {
+  let text = String(rawContent ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (transport === "cpytostmf" && text.endsWith("\n")) text = text.slice(0, -1);
+  const lines = text === "" ? [] : text.split("\n").map(line => line.trimEnd());
+  return { content: lines.join("\n"), lines };
+}
+
+function sameChangeMarker(cached: MemberMetadata, current: MemberMetadata) {
+  if (!cached.lastChanged || !current.lastChanged) return false;
+  if (cached.lastChanged !== current.lastChanged) return false;
+  if (typeof cached.rowCount === "number" && typeof current.rowCount === "number" && cached.rowCount !== current.rowCount) return false;
+  return true;
 }
 
 function escapeString(val: string): string {
