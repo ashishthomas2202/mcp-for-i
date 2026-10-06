@@ -4,6 +4,7 @@ import path from "path";
 import { Tools } from "./Tools.js";
 import { IBMiContent } from "./IBMiContent.js";
 import { CommandData, CommandResult, ConnectionConfig, ConnectionData } from "./types.js";
+import { checkHostKey } from "./knownHosts.js";
 
 const LOCALE = "LC_ALL=EN_US.UTF-8";
 
@@ -57,16 +58,34 @@ export class IBMiClient {
     this.currentConnectionName = connection.name;
 
     this.client = new NodeSSH();
-    await this.client.connect({
-      host: connection.host,
-      port: connection.port,
-      username: connection.username,
-      password: connection.password,
-      privateKey: connection.privateKeyPath ? await fs.readFile(connection.privateKeyPath, "utf8") : undefined,
-      keepaliveInterval: connection.keepaliveInterval,
-      readyTimeout: connection.readyTimeout,
-      debug: connection.sshDebug ? (msg: string) => process.stderr.write(`[ssh] ${msg}\n`) : undefined
-    });
+    // Trust on first use: the host key is recorded on the first connection and
+    // must match on every later one (see docs/security.md).
+    let hostKeyError: Error | undefined;
+    const hostVerifier = (key: Buffer, verify: (valid: boolean) => void) => {
+      checkHostKey({ host: connection.host, port: connection.port, key })
+        .then(() => verify(true))
+        .catch((err: Error) => {
+          hostKeyError = err;
+          verify(false);
+        });
+    };
+    try {
+      await this.client.connect({
+        host: connection.host,
+        port: connection.port,
+        username: connection.username,
+        password: connection.password,
+        privateKey: connection.privateKeyPath ? await fs.readFile(connection.privateKeyPath, "utf8") : undefined,
+        keepaliveInterval: connection.keepaliveInterval,
+        readyTimeout: connection.readyTimeout,
+        hostVerifier,
+        debug: connection.sshDebug ? (msg: string) => process.stderr.write(`[ssh] ${msg}\n`) : undefined
+      });
+    } catch (err) {
+      this.client.dispose();
+      this.client = undefined;
+      throw hostKeyError ?? err;
+    }
 
     await Promise.all([
       this.detectRemoteFeatures(),
