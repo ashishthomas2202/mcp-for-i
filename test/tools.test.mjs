@@ -19,7 +19,12 @@ test("getTools exposes expected tool names", () => {
     "ibmi.filters.delete",
     "ibmi.debug.status",
     "ibmi.debug.startService",
-    "ibmi.debug.stopService"
+    "ibmi.debug.stopService",
+    "ibmi.session.bootstrap",
+    "ibmi.source.resolve",
+    "ibmi.source.inspect",
+    "ibmi.docs.search",
+    "ibmi.docs.open"
   ];
 
   for (const name of expected) {
@@ -28,6 +33,20 @@ test("getTools exposes expected tool names", () => {
 
   const uniqueCount = new Set(names).size;
   assert.equal(uniqueCount, names.length, "tool names should be unique");
+});
+
+test("source tool additions are optional and preserve legacy required arguments", () => {
+  const byName = new Map(getTools().map(tool => [tool.name, tool]));
+  const list = byName.get("ibmi.qsys.members.list");
+  const read = byName.get("ibmi.qsys.members.read");
+  const write = byName.get("ibmi.qsys.members.write");
+
+  assert.deepEqual(list.inputSchema.required, ["library", "sourceFile"]);
+  assert.deepEqual(read.inputSchema.required, ["library", "sourceFile", "member"]);
+  assert.deepEqual(write.inputSchema.required, ["library", "sourceFile", "member", "content"]);
+  assert.equal(list.inputSchema.properties.connectionName.type, "string");
+  assert.equal(read.inputSchema.properties.responseFormat.enum.includes("structured"), true);
+  assert.equal(write.inputSchema.properties.expectedVersion.type, "string");
 });
 
 test("all tools enforce strict top-level input schemas", () => {

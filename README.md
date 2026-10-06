@@ -199,6 +199,23 @@ OTP is only needed when the npm account has two-factor authentication enabled fo
 - Tool schemas are strict (`additionalProperties: false`) with runtime argument validation, including nested connection/action/filter/profile payloads.
 - QSYS object names and source settings are validated before command execution to reduce interpolation and injection risk.
 
+## Fast Source Investigation
+
+The existing member tools remain compatible: an unchanged `ibmi.qsys.members.list` call still returns an array, and an unchanged `ibmi.qsys.members.read` call still returns source text. New callers can opt into faster, bounded workflows:
+
+- `ibmi.session.bootstrap` returns connection, release, library-list, policy, transport, and capability information in one call.
+- `ibmi.source.resolve` finds an exact member across likely source files without returning an entire source-file inventory.
+- `ibmi.source.inspect` performs up to eight metadata, outline, search, range-read, and dependency operations over one consistent member snapshot.
+- `ibmi.qsys.members.list` supports exact/prefix/contains/source-type/change-time filtering and keyset paging with `responseFormat: "page"`.
+- `ibmi.qsys.members.read` supports ranges, context, metadata, SHA-256, and version checks with `responseFormat: "structured"`.
+- `ibmi.qsys.members.write` accepts `expectedVersion` or `expectedSha256` to prevent a stale analysis from overwriting newer source.
+
+Source-date reads use an ephemeral `QTEMP` alias in the same database job. If that path is unavailable, the server falls back to a complete UTF-8 `CPYTOSTMF` read; it never reconstructs a member from search matches.
+
+## IBM i Documentation
+
+`ibmi.docs.search` and `ibmi.docs.open` provide a release-aware, cached catalog of allowlisted official IBM documentation. The same catalog and topic content are exposed as MCP resources under `ibmi-docs://`. Documentation results include their official canonical URL, content version/checksum, and observation time. When local coverage is insufficient, search results explicitly recommend a web fallback instead of presenting cached material as exhaustive.
+
 ## Links
 
 - Main repo: [ashishthomas2202/mcp-for-i](https://github.com/ashishthomas2202/mcp-for-i)

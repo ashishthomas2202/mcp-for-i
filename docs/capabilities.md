@@ -2,7 +2,7 @@
 
 This document summarizes what `mcp-for-i` can do today across the MCP server and local control-plane workflow.
 
-Version context: `0.1.8` codebase.
+Version context: `0.1.13` development codebase.
 
 ## 1) Platform Capabilities
 
@@ -21,6 +21,7 @@ Version context: `0.1.8` codebase.
 ### 1.3 Session Lifecycle
 - Multi-session tracking.
 - Session status/list/keepalive/terminate operations.
+- One-call session bootstrap with release, library-list, policy, transports, and supported fast-path capabilities.
 - Sliding inactivity timeout.
 - Heartbeat and reconnect behavior.
 
@@ -51,6 +52,7 @@ Version context: `0.1.8` codebase.
 - `ibmi.session.status`
 - `ibmi.session.keepalive`
 - `ibmi.session.terminate`
+- `ibmi.session.bootstrap`
 - `ibmi.connections.list`
 - `ibmi.connections.add`
 - `ibmi.connections.update`
@@ -68,6 +70,7 @@ Version context: `0.1.8` codebase.
 - `ibmi.qsys.members.delete`
 - `ibmi.qsys.sourcefiles.create`
 - `ibmi.qsys.libraries.create`
+- Legacy-compatible member list/read responses plus opt-in filtered paging, ranged reads, metadata, version/hash checks, caching, and complete fallback reads.
 
 ### IFS Operations
 - `ibmi.ifs.list`
@@ -80,9 +83,16 @@ Version context: `0.1.8` codebase.
 
 ### Search and Resolution
 - `ibmi.search.members`
+- `ibmi.source.resolve`
+- `ibmi.source.inspect`
 - `ibmi.search.ifs`
 - `ibmi.find.ifs`
 - `ibmi.resolve.path`
+
+### Official IBM i Documentation
+- `ibmi.docs.search`
+- `ibmi.docs.open`
+- MCP resources at `ibmi-docs://catalog` and `ibmi-docs://topic/{ref}`
 
 ### Actions, Filters, Profiles, Library List
 - `ibmi.actions.list`

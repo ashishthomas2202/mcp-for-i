@@ -4,13 +4,20 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ListResourcesRequestSchema,
+  ListToolsRequestSchema,
+  ReadResourceRequestSchema
+} from "@modelcontextprotocol/sdk/types.js";
 import { getTools, handleTool } from "./mcp/tools.js";
 import { McpContext } from "./mcp/context.js";
 import { log } from "./mcp/logger.js";
 import { validateToolInput } from "./mcp/validation.js";
 import { appendAuditRecord } from "./mcp/audit.js";
 import { runControlCommand } from "./controlplane/commands.js";
+import { ibmDocs } from "./ibmi/IbmDocs.js";
 
 const argv = process.argv.slice(2);
 const firstArg = (argv[0] || "").toLowerCase();
@@ -36,7 +43,7 @@ if (firstArg === "--help" || firstArg === "-h" || firstArg === "help") {
 
 const server = new Server(
   { name: "mcp-for-i", version: packageVersion },
-  { capabilities: { tools: {} } }
+  { capabilities: { tools: {}, resources: {} } }
 );
 
 const ctx = new McpContext();
@@ -46,6 +53,39 @@ const toolMap = new Map(tools.map(tool => [tool.name, tool]));
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools
 }));
+
+server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+  resources: [
+    {
+      uri: "ibmi-docs://catalog",
+      name: "IBM i documentation catalog",
+      description: "Release-aware allowlist of official IBM i documentation available through mcp-for-i.",
+      mimeType: "application/json"
+    },
+    ...ibmDocs.listResources()
+  ]
+}));
+
+server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+  resourceTemplates: [{
+    uriTemplate: "ibmi-docs://topic/{ref}",
+    name: "Official IBM i documentation topic",
+    description: "Open a versioned official IBM i documentation topic using a ref from ibmi.docs.search.",
+    mimeType: "text/markdown"
+  }]
+}));
+
+server.setRequestHandler(ReadResourceRequestSchema, async request => {
+  const uri = request.params.uri;
+  const text = await ibmDocs.readResource(uri);
+  return {
+    contents: [{
+      uri,
+      mimeType: uri === "ibmi-docs://catalog" ? "application/json" : "text/markdown",
+      text
+    }]
+  };
+});
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;

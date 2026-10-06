@@ -3,3 +3,5 @@ node_modules/
 dist/
 *.log
 skills.backup-*/
+.presentation-build/
+presentation-output/

@@ -69,8 +69,10 @@ export class IBMiClient {
       debug: connection.sshDebug ? (msg: string) => process.stderr.write(`[ssh] ${msg}\n`) : undefined
     });
 
-    await this.detectRemoteFeatures();
-    await this.loadDefaultLibraryList();
+    await Promise.all([
+      this.detectRemoteFeatures(),
+      this.loadDefaultLibraryList()
+    ]);
   }
 
   async disconnect(): Promise<void> {
@@ -235,13 +237,18 @@ export class IBMiClient {
       ls: ["/QOpenSys/pkgs/bin/ls", "/usr/bin/ls"]
     };
 
-    for (const [name, paths] of Object.entries(featurePaths)) {
-      for (const p of paths) {
-        const res = await this.sendCommand({ command: `test -x ${p} && echo ${p}` });
-        if (res.stdout.trim()) {
-          this.remoteFeatures[name] = p;
-          break;
-        }
+    const discoveryCommand = Object.entries(featurePaths).map(([name, paths]) =>
+      `for p in ${paths.map(Tools.shellQuote).join(" ")}; do ` +
+      `if [ -x "$p" ]; then printf '%s=%s\\n' ${Tools.shellQuote(name)} "$p"; break; fi; done`
+    ).join("; ");
+    const result = await this.sendCommand({ command: discoveryCommand });
+    for (const line of result.stdout.split(/\r?\n/)) {
+      const separator = line.indexOf("=");
+      if (separator <= 0) continue;
+      const name = line.slice(0, separator);
+      const featurePath = line.slice(separator + 1);
+      if (Object.hasOwn(featurePaths, name) && featurePath) {
+        this.remoteFeatures[name] = featurePath;
       }
     }
 

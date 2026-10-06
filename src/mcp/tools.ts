@@ -2,6 +2,8 @@ import { McpContext } from "./context.js";
 import { LocalLanguageActions } from "../ibmi/LocalLanguageActions.js";
 import { CompileTools } from "../ibmi/CompileTools.js";
 import { Search } from "../ibmi/Search.js";
+import { ibmDocs } from "../ibmi/IbmDocs.js";
+import { MemberSnapshot } from "../ibmi/IBMiContent.js";
 import { Action } from "../ibmi/types.js";
 import { Tools } from "../ibmi/Tools.js";
 import { ConnectionPolicy } from "../config/store.js";
@@ -112,6 +114,29 @@ const PROFILE_SCHEMA: JsonSchema = {
   required: ["name"]
 };
 
+const LINE_RANGE_SCHEMA: JsonSchema = {
+  type: "object",
+  properties: {
+    start: { type: "number" },
+    end: { type: "number" }
+  },
+  required: ["start", "end"]
+};
+
+const SOURCE_INSPECTION_OPERATION_SCHEMA: JsonSchema = {
+  type: "object",
+  properties: {
+    operation: { type: "string", enum: ["metadata", "outline", "search", "read_ranges", "dependencies"] },
+    query: { type: "string" },
+    terms: { type: "array", items: { type: "string" } },
+    ranges: { type: "array", items: LINE_RANGE_SCHEMA },
+    before: { type: "number" },
+    after: { type: "number" },
+    maxMatches: { type: "number" }
+  },
+  required: ["operation"]
+};
+
 type Tn5250Field = {
   id: string;
   label: string;
@@ -194,6 +219,15 @@ export function getTools() {
       inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
     },
     {
+      name: "ibmi.session.bootstrap",
+      description: "Return connection, IBM i release, library-list, policy, and transport capabilities in one call.",
+      inputSchema: {
+        type: "object",
+        properties: { connectionName: { type: "string" } },
+        required: ["connectionName"]
+      }
+    },
+    {
       name: "ibmi.connections.list",
       description: "List saved IBM i connections.",
       inputSchema: { type: "object", properties: {} }
@@ -274,7 +308,19 @@ export function getTools() {
       description: "List members in a source file.",
       inputSchema: {
         type: "object",
-        properties: { library: { type: "string" }, sourceFile: { type: "string" } },
+        properties: {
+          connectionName: { type: "string" },
+          library: { type: "string" },
+          sourceFile: { type: "string" },
+          member: { type: "string" },
+          memberPrefix: { type: "string" },
+          memberContains: { type: "string" },
+          sourceTypes: { type: "array", items: { type: "string" } },
+          changedSince: { type: "string" },
+          limit: { type: "number" },
+          cursor: { type: "string" },
+          responseFormat: { type: "string", enum: ["legacy-array", "page"] }
+        },
         required: ["library", "sourceFile"]
       }
     },
@@ -283,7 +329,22 @@ export function getTools() {
       description: "Read a member.",
       inputSchema: {
         type: "object",
-        properties: { library: { type: "string" }, sourceFile: { type: "string" }, member: { type: "string" } },
+        properties: {
+          connectionName: { type: "string" },
+          library: { type: "string" },
+          sourceFile: { type: "string" },
+          member: { type: "string" },
+          startLine: { type: "number" },
+          endLine: { type: "number" },
+          ranges: { type: "array", items: LINE_RANGE_SCHEMA },
+          before: { type: "number" },
+          after: { type: "number" },
+          metadataOnly: { type: "boolean" },
+          expectedVersion: { type: "string" },
+          expectedSha256: { type: "string" },
+          forceFresh: { type: "boolean" },
+          responseFormat: { type: "string", enum: ["text", "structured"] }
+        },
         required: ["library", "sourceFile", "member"]
       }
     },
@@ -292,7 +353,10 @@ export function getTools() {
       description: "Write a member.",
       inputSchema: {
         type: "object",
-        properties: { library: { type: "string" }, sourceFile: { type: "string" }, member: { type: "string" }, content: { type: "string" } },
+        properties: {
+          connectionName: { type: "string" }, library: { type: "string" }, sourceFile: { type: "string" }, member: { type: "string" }, content: { type: "string" },
+          expectedVersion: { type: "string" }, expectedSha256: { type: "string" }
+        },
         required: ["library", "sourceFile", "member", "content"]
       }
     },
@@ -378,12 +442,89 @@ export function getTools() {
       inputSchema: {
         type: "object",
         properties: {
+          connectionName: { type: "string" },
           library: { type: "string" },
           sourceFile: { type: "string" },
           term: { type: "string" },
-          members: { type: ["string", "array"], items: { type: "string" } }
+          terms: { type: "array", items: { type: "string" } },
+          members: { type: ["string", "array"], items: { type: "string" } },
+          caseSensitive: { type: "boolean" },
+          before: { type: "number" },
+          after: { type: "number" },
+          maxMatches: { type: "number" }
         },
-        required: ["library", "sourceFile", "term"]
+        required: ["library", "sourceFile"]
+      }
+    },
+    {
+      name: "ibmi.source.resolve",
+      description: "Resolve an exact source member across candidate source files without listing every member.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          connectionName: { type: "string" },
+          library: { type: "string" },
+          member: { type: "string" },
+          candidateSourceFiles: { type: "array", items: { type: "string" } },
+          sourceTypes: { type: "array", items: { type: "string" } },
+          limit: { type: "number" }
+        },
+        required: ["connectionName", "library", "member"]
+      }
+    },
+    {
+      name: "ibmi.source.inspect",
+      description: "Resolve and inspect one source member with batched metadata, outline, search, ranges, and dependency operations.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          connectionName: { type: "string" },
+          library: { type: "string" },
+          sourceFile: { type: "string" },
+          member: { type: "string" },
+          candidateSourceFiles: { type: "array", items: { type: "string" } },
+          sourceTypes: { type: "array", items: { type: "string" } },
+          operations: { type: "array", items: SOURCE_INSPECTION_OPERATION_SCHEMA },
+          expectedVersion: { type: "string" },
+          expectedSha256: { type: "string" },
+          forceFresh: { type: "boolean" }
+        },
+        required: ["connectionName", "library", "member", "operations"]
+      }
+    },
+    {
+      name: "ibmi.docs.search",
+      description: "Search the release-aware catalog and cache of official IBM i documentation.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          connectionName: { type: "string" },
+          releases: { type: "array", items: { type: "string" } },
+          categories: { type: "array", items: { type: "string" } },
+          limit: { type: "number" },
+          cursor: { type: "string" },
+          freshness: { type: "string", enum: ["indexed", "prefer-live"] }
+        },
+        required: ["query"]
+      }
+    },
+    {
+      name: "ibmi.docs.open",
+      description: "Open and cache an allowlisted official IBM i documentation page.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ref: { type: "string" },
+          url: { type: "string" },
+          expectedVersion: { type: "string" },
+          requireLive: { type: "boolean" },
+          freshness: { type: "string", enum: ["allow-cached", "require-live"] },
+          section: { type: "string" },
+          startLine: { type: "number" },
+          endLine: { type: "number" },
+          maxCharacters: { type: "number" }
+        }
       }
     },
     {
@@ -1268,6 +1409,7 @@ export function getTools() {
   ];
   return tools
     .map(withGuardedApprovalHint)
+    .map(withSourceConnectionName)
     .map(withStrictInputSchema);
 }
 
@@ -1306,6 +1448,37 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       await ctx.terminateSession(args?.connectionName);
       if (name) tn5250Sessions.delete(name);
       return result("Terminated");
+    }
+    case "ibmi.session.bootstrap": {
+      const conn = await ctx.ensureActive(args.connectionName);
+      const system = await readSystemFacts(conn);
+      const config = conn.getConfig();
+      return json({
+        connectionName: conn.currentConnectionName,
+        host: conn.currentHost,
+        systemName: system.systemName,
+        effectiveUser: system.effectiveUser || conn.currentUser,
+        release: system.release,
+        currentLibrary: config.currentLibrary || "QGPL",
+        libraryList: config.libraryList || [],
+        defaultUserLibraries: conn.defaultUserLibraries,
+        ccsid: config.sqlJobCcsid ?? 1208,
+        sourceFileCcsid: config.sourceFileCCSID || "*FILE",
+        policy: ctx.getPolicy(args.connectionName),
+        transports: { sql: "QZDFMDB2", sourceRead: ["sql-member", "cpytostmf"] },
+        remoteFeatures: conn.remoteFeatures,
+        capabilities: {
+          version: "1",
+          memberPaging: true,
+          rangedMemberRead: true,
+          multiTermSearch: true,
+          sourceResolve: true,
+          sourceInspect: true,
+          optimisticConcurrency: true,
+          ibmDocs: true
+        },
+        validatedAt: new Date().toISOString()
+      });
     }
     case "ibmi.connections.list": {
       const list = await connections.list();
@@ -1369,17 +1542,40 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.qsys.members.list": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      const data = await conn.content.getMemberList({ library: args.library, sourceFile: args.sourceFile });
+      const data = hasMemberListExtensions(args)
+        ? await conn.content.getMemberListPage({
+          library: args.library,
+          sourceFile: args.sourceFile,
+          member: args.member,
+          memberPrefix: args.memberPrefix,
+          memberContains: args.memberContains,
+          sourceTypes: args.sourceTypes,
+          changedSince: args.changedSince,
+          limit: args.limit,
+          cursor: args.cursor
+        })
+        : await conn.content.getMemberList({ library: args.library, sourceFile: args.sourceFile });
       return json(data);
     }
     case "ibmi.qsys.members.read": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      const content = await conn.content.downloadMemberContent(args.library, args.sourceFile, args.member);
-      return result(content);
+      if (!hasStructuredMemberReadOptions(args)) {
+        const content = await conn.content.downloadMemberContent(args.library, args.sourceFile, args.member);
+        return result(content);
+      }
+      const snapshot = await conn.content.getMemberSnapshot(args.library, args.sourceFile, args.member, Boolean(args.forceFresh));
+      const conflict = memberVersionConflict(snapshot, args);
+      if (conflict) return json(conflict);
+      return json(formatMemberRead(snapshot, args));
     }
     case "ibmi.qsys.members.write": {
       const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "qsys.write", args);
+      if (args.expectedVersion || args.expectedSha256) {
+        const snapshot = await conn.content.getMemberSnapshot(args.library, args.sourceFile, args.member, true);
+        const conflict = memberVersionConflict(snapshot, args);
+        if (conflict) return json(conflict);
+      }
       await conn.content.uploadMemberContent(args.library, args.sourceFile, args.member, args.content);
       return result("OK");
     }
@@ -1459,8 +1655,90 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.search.members": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const members = args.members || "*";
-      const data = await Search.searchMembers(conn, args.library, args.sourceFile, args.term, members, false);
+      const terms = normalizeSearchTerms(args);
+      const data = await Search.searchMembersTerms(conn, args.library, args.sourceFile, terms, members, false, {
+        caseSensitive: Boolean(args.caseSensitive),
+        before: args.before,
+        after: args.after
+      });
+      const maximum = Math.max(1, Math.min(5_000, Math.floor(args.maxMatches || 500)));
+      let seen = 0;
+      data.hits = data.hits.map(hit => ({
+        ...hit,
+        lines: hit.lines.filter(() => seen++ < maximum)
+      })).filter(hit => hit.lines.length > 0);
       return json(data);
+    }
+    case "ibmi.source.resolve": {
+      const conn = await ctx.ensureActive(args.connectionName);
+      const candidates = await conn.content.resolveMembers({
+        library: args.library,
+        member: args.member,
+        candidateSourceFiles: args.candidateSourceFiles,
+        sourceTypes: args.sourceTypes,
+        limit: args.limit
+      });
+      rankMemberCandidates(candidates, args.candidateSourceFiles);
+      return json({
+        status: candidates.length === 0 ? "not-found" : candidates.length === 1 ? "found" : "ambiguous",
+        library: String(args.library).toUpperCase(),
+        member: String(args.member).toUpperCase(),
+        candidates,
+        returned: candidates.length,
+        observedAt: new Date().toISOString()
+      });
+    }
+    case "ibmi.source.inspect": {
+      const conn = await ctx.ensureActive(args.connectionName);
+      const operations = Array.isArray(args.operations) ? args.operations : [];
+      if (operations.length < 1 || operations.length > 8) throw new Error("Provide between 1 and 8 inspection operations");
+      let sourceFile = args.sourceFile ? String(args.sourceFile).toUpperCase() : "";
+      let resolution: any;
+      if (!sourceFile) {
+        const candidates = await conn.content.resolveMembers({
+          library: args.library,
+          member: args.member,
+          candidateSourceFiles: args.candidateSourceFiles,
+          sourceTypes: args.sourceTypes,
+          limit: 20
+        });
+        rankMemberCandidates(candidates, args.candidateSourceFiles);
+        resolution = {
+          status: candidates.length === 0 ? "not-found" : candidates.length === 1 ? "found" : "ambiguous",
+          candidates
+        };
+        if (candidates.length !== 1) return json(resolution);
+        sourceFile = candidates[0].file;
+      }
+      const snapshot = await conn.content.getMemberSnapshot(args.library, sourceFile, args.member, Boolean(args.forceFresh));
+      const conflict = memberVersionConflict(snapshot, args);
+      if (conflict) return json(conflict);
+      return json({
+        status: "found",
+        identity: snapshot.identity,
+        version: snapshot.version,
+        sha256: snapshot.sha256,
+        observedAt: snapshot.observedAt,
+        complete: snapshot.complete,
+        transport: snapshot.transport,
+        cacheStatus: snapshot.cacheStatus,
+        warnings: snapshot.warnings,
+        ...(resolution ? { resolution } : {}),
+        results: operations.map((operation: any) => inspectMemberOperation(snapshot, operation))
+      });
+    }
+    case "ibmi.docs.search": {
+      let releases = args.releases;
+      if ((!releases || releases.length === 0) && args.connectionName) {
+        const conn = await ctx.ensureActive(args.connectionName);
+        const detected = await readSystemFacts(conn);
+        if (detected.release) releases = [detected.release];
+      }
+      return json(await ibmDocs.search({ ...args, releases }));
+    }
+    case "ibmi.docs.open": {
+      if (!args.ref && !args.url) throw new Error("ref or url is required");
+      return json(await ibmDocs.open(args));
     }
     case "ibmi.search.ifs": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -3253,6 +3531,229 @@ function renderTn5250Screen(screen: Tn5250Screen) {
   return lines.join("\n");
 }
 
+function hasMemberListExtensions(args: any) {
+  return args?.responseFormat === "page" || [
+    "member", "memberPrefix", "memberContains", "sourceTypes", "changedSince", "limit", "cursor"
+  ].some(key => typeof args?.[key] !== "undefined");
+}
+
+function hasStructuredMemberReadOptions(args: any) {
+  return args?.responseFormat === "structured" || [
+    "startLine", "endLine", "ranges", "before", "after", "metadataOnly",
+    "expectedVersion", "expectedSha256", "forceFresh"
+  ].some(key => typeof args?.[key] !== "undefined");
+}
+
+function memberVersionConflict(snapshot: MemberSnapshot, args: any) {
+  const versionMismatch = args?.expectedVersion && args.expectedVersion !== snapshot.version;
+  const hashMismatch = args?.expectedSha256 && String(args.expectedSha256).toLowerCase() !== snapshot.sha256.toLowerCase();
+  if (!versionMismatch && !hashMismatch) return undefined;
+  return {
+    status: "version-conflict",
+    identity: snapshot.identity,
+    expectedVersion: args?.expectedVersion,
+    expectedSha256: args?.expectedSha256,
+    actualVersion: snapshot.version,
+    actualSha256: snapshot.sha256,
+    observedAt: snapshot.observedAt,
+    modified: false
+  };
+}
+
+function formatMemberRead(snapshot: MemberSnapshot, args: any) {
+  const envelope: Record<string, any> = {
+    status: "found",
+    identity: snapshot.identity,
+    metadata: snapshot.metadata,
+    version: snapshot.version,
+    sha256: snapshot.sha256,
+    observedAt: snapshot.observedAt,
+    complete: snapshot.complete,
+    transport: snapshot.transport,
+    cacheStatus: snapshot.cacheStatus,
+    warnings: snapshot.warnings
+  };
+  if (args?.metadataOnly) return envelope;
+
+  const ranges = normalizeLineRanges(args, snapshot.lines.length);
+  if (ranges.length === 0) {
+    return { ...envelope, content: snapshot.content, lineCount: snapshot.lines.length };
+  }
+  return {
+    ...envelope,
+    ranges: ranges.map(range => ({
+      start: range.start,
+      end: range.end,
+      lines: snapshot.lines.slice(range.start - 1, range.end).map((content, index) => ({
+        number: range.start + index,
+        content
+      }))
+    }))
+  };
+}
+
+function normalizeLineRanges(args: any, lineCount: number) {
+  const before = clampInteger(args?.before, 0, 200, 0);
+  const after = clampInteger(args?.after, 0, 200, 0);
+  const requested: Array<{ start: number; end: number }> = [];
+  if (typeof args?.startLine !== "undefined" || typeof args?.endLine !== "undefined") {
+    requested.push({ start: Number(args.startLine || 1), end: Number(args.endLine || args.startLine || lineCount) });
+  }
+  if (Array.isArray(args?.ranges)) {
+    for (const range of args.ranges.slice(0, 8)) requested.push({ start: Number(range.start), end: Number(range.end) });
+  }
+  if (requested.length === 0) return [];
+
+  const normalized = requested.map(range => {
+    if (!Number.isFinite(range.start) || !Number.isFinite(range.end) || range.start < 1 || range.end < range.start) {
+      throw new Error(`Invalid line range ${range.start}-${range.end}`);
+    }
+    return {
+      start: Math.max(1, Math.floor(range.start) - before),
+      end: Math.min(lineCount, Math.floor(range.end) + after)
+    };
+  }).sort((a, b) => a.start - b.start || a.end - b.end);
+
+  const merged: Array<{ start: number; end: number }> = [];
+  for (const range of normalized) {
+    const previous = merged.at(-1);
+    if (previous && range.start <= previous.end + 1) previous.end = Math.max(previous.end, range.end);
+    else merged.push({ ...range });
+  }
+  const total = merged.reduce((sum, range) => sum + range.end - range.start + 1, 0);
+  if (total > 2_000) throw new Error("Requested ranges exceed the 2,000-line response limit");
+  return merged;
+}
+
+function normalizeSearchTerms(args: any) {
+  const terms = [
+    ...(typeof args?.term === "string" ? [args.term] : []),
+    ...(Array.isArray(args?.terms) ? args.terms : [])
+  ].map(value => String(value)).filter(value => value.length > 0);
+  const unique = [...new Set(terms)];
+  if (unique.length < 1 || unique.length > 20) throw new Error("Provide term or between 1 and 20 terms");
+  return unique;
+}
+
+function rankMemberCandidates(candidates: any[], preferredFiles?: string[]) {
+  if (!preferredFiles?.length) return;
+  const ranks = new Map(preferredFiles.map((value, index) => [String(value).toUpperCase(), index]));
+  candidates.sort((a, b) => (ranks.get(String(a.file).toUpperCase()) ?? Number.MAX_SAFE_INTEGER) -
+    (ranks.get(String(b.file).toUpperCase()) ?? Number.MAX_SAFE_INTEGER) || String(a.file).localeCompare(String(b.file)));
+}
+
+function inspectMemberOperation(snapshot: MemberSnapshot, operation: any) {
+  switch (operation.operation) {
+    case "metadata":
+      return { operation: "metadata", metadata: snapshot.metadata };
+    case "read_ranges":
+      return { operation: "read_ranges", ...formatMemberRead(snapshot, { ranges: operation.ranges, before: operation.before, after: operation.after }) };
+    case "search":
+      return { operation: "search", ...searchSnapshot(snapshot, operation) };
+    case "outline":
+      return { operation: "outline", symbols: outlineSnapshot(snapshot) };
+    case "dependencies":
+      return { operation: "dependencies", dependencies: dependenciesFromSnapshot(snapshot) };
+    default:
+      throw new Error(`Unsupported inspection operation: ${operation.operation}`);
+  }
+}
+
+function searchSnapshot(snapshot: MemberSnapshot, operation: any) {
+  const terms = normalizeSearchTerms({ term: operation.query, terms: operation.terms });
+  const before = clampInteger(operation.before, 0, 50, 0);
+  const after = clampInteger(operation.after, 0, 50, 0);
+  const maxMatches = clampInteger(operation.maxMatches, 1, 1_000, 100);
+  const lowered = terms.map(term => term.toLowerCase());
+  const matches: any[] = [];
+  for (let index = 0; index < snapshot.lines.length && matches.length < maxMatches; index++) {
+    const line = snapshot.lines[index];
+    const matchedTerms = terms.filter((_term, termIndex) => line.toLowerCase().includes(lowered[termIndex]));
+    if (matchedTerms.length === 0) continue;
+    const start = Math.max(0, index - before);
+    const end = Math.min(snapshot.lines.length - 1, index + after);
+    matches.push({
+      line: index + 1,
+      content: line,
+      matchedTerms,
+      context: snapshot.lines.slice(start, end + 1).map((content, contextIndex) => ({ number: start + contextIndex + 1, content }))
+    });
+  }
+  return { terms, matches, returned: matches.length, truncated: matches.length >= maxMatches };
+}
+
+function outlineSnapshot(snapshot: MemberSnapshot) {
+  const symbols: any[] = [];
+  const patterns = [
+    { kind: "procedure", regex: /\bdcl-proc\s+([A-Za-z0-9_#$@]+)/i },
+    { kind: "procedure", regex: /^\s*[Pp]\s+([A-Za-z0-9_#$@]+)\s+B\b/ },
+    { kind: "subroutine", regex: /\bbegsr\s+([A-Za-z0-9_#$@]+)/i },
+    { kind: "program", regex: /\bPROGRAM-ID\.?\s+([A-Za-z0-9_#$@-]+)/i },
+    { kind: "paragraph", regex: /^\s{0,8}([A-Za-z0-9][A-Za-z0-9-]+)\.\s*$/ },
+    { kind: "label", regex: /^\s*([A-Za-z0-9_#$@]+):\s*(?:\/\/.*)?$/ }
+  ];
+  snapshot.lines.forEach((line, index) => {
+    for (const pattern of patterns) {
+      const match = pattern.regex.exec(line);
+      if (match) {
+        symbols.push({ name: match[1], kind: pattern.kind, line: index + 1 });
+        break;
+      }
+    }
+  });
+  return symbols.slice(0, 1_000);
+}
+
+function dependenciesFromSnapshot(snapshot: MemberSnapshot) {
+  const found = new Map<string, any>();
+  const patterns = [
+    { kind: "copy", regex: /\/(?:COPY|INCLUDE)\s+([^\s;]+)/ig },
+    { kind: "include", regex: /\bCOPY\s+['\"]?([^'\".\s]+)['\"]?\.?/ig },
+    { kind: "external-call", regex: /\b(?:CALLP?|CALLPRC)\s*\(?\s*['\"]?([A-Za-z0-9_#$@]+)/ig },
+    { kind: "file", regex: /^\s*[Ff]\s*([A-Za-z0-9_#$@]+)\s+/g }
+  ];
+  snapshot.lines.forEach((line, index) => {
+    for (const pattern of patterns) {
+      pattern.regex.lastIndex = 0;
+      for (let match = pattern.regex.exec(line); match; match = pattern.regex.exec(line)) {
+        const name = match[1].replace(/[),;]+$/, "").toUpperCase();
+        const key = `${pattern.kind}:${name}`;
+        if (!found.has(key)) found.set(key, { name, kind: pattern.kind, line: index + 1 });
+      }
+    }
+  });
+  return [...found.values()].slice(0, 1_000);
+}
+
+async function readSystemFacts(conn: any): Promise<{ release?: string; effectiveUser?: string; systemName?: string }> {
+  if (conn.__mcpSystemFacts) return conn.__mcpSystemFacts;
+  try {
+    const rows = await conn.runSQL(
+      "select OS_VERSION, OS_RELEASE, HOST_NAME, current_user as EFFECTIVE_USER " +
+      "from SYSIBMADM.ENV_SYS_INFO fetch first 1 row only"
+    );
+    const row = rows[0];
+    const version = String(row?.OS_VERSION || "").replace(/\D/g, "");
+    const release = String(row?.OS_RELEASE || "").replace(/\D/g, "");
+    const facts = {
+      ...(version && release ? { release: `${Number(version)}.${Number(release)}` } : {}),
+      ...(row?.EFFECTIVE_USER ? { effectiveUser: String(row.EFFECTIVE_USER).trim() } : {}),
+      ...(row?.HOST_NAME ? { systemName: String(row.HOST_NAME).trim() } : {})
+    };
+    conn.__mcpSystemFacts = facts;
+    return facts;
+  } catch {
+    // Older IBM i releases may not expose SYSIBMADM.ENV_SYS_INFO.
+  }
+  return {};
+}
+
+function clampInteger(value: any, minimum: number, maximum: number, fallback: number) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(minimum, Math.min(maximum, Math.floor(parsed)));
+}
+
 function rejectCredentialArgs(args: any, toolName: string) {
   if (!args || typeof args !== "object") return;
   if (typeof args.password === "string" && args.password.length > 0) {
@@ -4016,6 +4517,16 @@ function withGuardedApprovalHint(tool: any) {
       type: "boolean",
       description: "Set true to approve guarded-policy operations."
     };
+  }
+  return { ...tool, inputSchema: schema };
+}
+
+function withSourceConnectionName(tool: any) {
+  if (!/^ibmi\.(?:qsys|search|source)\./.test(tool.name)) return tool;
+  const schema = tool.inputSchema || { type: "object", properties: {} };
+  if (!schema.properties) schema.properties = {};
+  if (!schema.properties.connectionName) {
+    schema.properties.connectionName = { type: "string", description: "Saved IBM i connection name." };
   }
   return { ...tool, inputSchema: schema };
 }

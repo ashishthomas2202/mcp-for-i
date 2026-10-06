@@ -18,6 +18,17 @@ Default settings (editable in the config file):
 - `currentLibrary`: string
 - `customVariables`: list of `{ name, value }`
 
+`tempLibrary` remains accepted for configuration compatibility. Source member reads and source-date writes now use job-local `QTEMP` objects and do not require a persistent `ILEDITOR` library.
+
+## IBM Documentation
+
+Official documentation needs no credentials. The built-in catalog covers IBM i 7.4, 7.5, and 7.6 roots for the site map, manuals, RPG, CL, APIs, IBM i SQL services, security, database performance, and IFS commands. Optional environment settings:
+
+- `MCP_FOR_I_IBM_DOCS_SEEDS`: JSON array of additional `{ title, url, release, categories, keywords }` entries. Every URL is still restricted to `https://www.ibm.com/docs/`.
+- `MCP_FOR_I_IBM_DOCS_CACHE_DIR`: override the local documentation cache directory.
+
+`ibmi.docs.search` is local/indexed by default. Use `freshness: "prefer-live"` for a bounded refresh of matching catalog entries. `ibmi.docs.open` uses cached content by default; use `freshness: "require-live"` when a live fetch is required.
+
 ## Connections
 Connections are stored without passwords. Passwords are stored in OS keychain (or in-session fallback). Each connection can include optional `settings` overrides.
 The control plane health response and Overview page report whether password storage is persistent (`keychain`) or process-only (`session`).

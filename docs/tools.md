@@ -7,6 +7,7 @@
 - `ibmi.session.status`
 - `ibmi.session.keepalive`
 - `ibmi.session.terminate`
+- `ibmi.session.bootstrap`
 - `ibmi.connections.list`
 - `ibmi.connections.add`
 - `ibmi.connections.update`
@@ -25,6 +26,13 @@
 - `ibmi.qsys.sourcefiles.create`
 - `ibmi.qsys.libraries.create`
 
+### Source performance and compatibility notes
+
+- Existing `members.list` calls keep the legacy array response. Set `responseFormat: "page"`, provide a filter, or provide paging arguments to receive a bounded structured page.
+- Existing `members.read` calls keep the legacy text response. Set `responseFormat: "structured"` or request ranges, context, metadata, or a version check to receive the structured snapshot envelope.
+- `members.write` supports optional optimistic-concurrency checks through `expectedVersion` and `expectedSha256`.
+- `members.read` uses a job-local alias for source-date reads and a complete `CPYTOSTMF` fallback if the SQL path is unavailable.
+
 ## IFS
 - `ibmi.ifs.list`
 - `ibmi.ifs.read`
@@ -38,6 +46,22 @@
 - `ibmi.search.members`
 - `ibmi.search.ifs`
 - `ibmi.find.ifs`
+
+`ibmi.search.members` accepts either `term` or up to 20 `terms` in one remote request.
+
+## Composite Source Inspection
+
+- `ibmi.source.resolve`
+- `ibmi.source.inspect`
+
+`ibmi.source.inspect` batches metadata, outline, search, range-read, and dependency extraction over one versioned source snapshot.
+
+## Official IBM i Documentation
+
+- `ibmi.docs.search`
+- `ibmi.docs.open`
+
+The documentation catalog is also exposed through MCP resources: `ibmi-docs://catalog` and `ibmi-docs://topic/{ref}`.
 
 ## Actions
 - `ibmi.actions.list`
