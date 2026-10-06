@@ -439,7 +439,7 @@ export function getTools() {
     },
     {
       name: "ibmi.search.members",
-      description: "Search in source members.",
+      description: "Search in source members. Returns at most maxMatches matching lines (default 100, maximum 1000) and reports truncated: true when more exist. Lines are marked kind \"match\" or \"context\".",
       inputSchema: {
         type: "object",
         properties: {
@@ -1660,14 +1660,9 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const data = await Search.searchMembersTerms(conn, args.library, args.sourceFile, terms, members, false, {
         caseSensitive: Boolean(args.caseSensitive),
         before: args.before,
-        after: args.after
+        after: args.after,
+        maxMatches: args.maxMatches
       });
-      const maximum = Math.max(1, Math.min(5_000, Math.floor(args.maxMatches || 500)));
-      let seen = 0;
-      data.hits = data.hits.map(hit => ({
-        ...hit,
-        lines: hit.lines.filter(() => seen++ < maximum)
-      })).filter(hit => hit.lines.length > 0);
       return json(data);
     }
     case "ibmi.source.resolve": {

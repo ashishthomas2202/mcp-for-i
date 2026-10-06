@@ -49,6 +49,12 @@
 
 `ibmi.search.members` accepts either `term` or up to 20 `terms` in one remote request.
 
+- Terms are matched literally (`-F`) and sent over stdin (`-f -`), never through the shell.
+- `maxMatches` defaults to 100 (maximum 1,000). The limit is applied on the host while the grep runs (`-m` per member plus a bounded output pipe), not after downloading everything.
+- The response includes `matchCount`, `maxMatches`, `truncated` and, when truncated, `truncatedReason` (`max-matches` or `output-limit`). When `truncated` is true, narrow the search (members filter, more specific terms) rather than raising the limit.
+- With `before`/`after` (0 to 50), each returned line has `kind: "match"` or `kind: "context"`.
+- `pfgrep` is used when installed at `/QOpenSys/pkgs/bin/pfgrep`; otherwise grep is used.
+
 ## Composite Source Inspection
 
 - `ibmi.source.resolve`

@@ -144,4 +144,5 @@ export type SearchHit = {
 export type SearchHitLine = {
   number: number;
   content: string;
+  kind?: "match" | "context";
 };

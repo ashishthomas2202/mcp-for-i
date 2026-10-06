@@ -188,7 +188,60 @@ test("multi-term member search uses one command and parses requested context", a
   assert.equal(invocation.stdin, "MATCH\nOTHER");
   assert.match(invocation.command, /-nHR/);
   assert.match(invocation.command, /-B 1 -A 1/);
+  assert.match(invocation.command, /-F -m 101 -f - ORDER\.MBR \| \/QOpenSys\/usr\/bin\/head -n 404$/);
   assert.deepEqual(response.hits[0].lines.map(line => line.number), [2, 3, 4]);
+  assert.deepEqual(response.hits[0].lines.map(line => line.kind), ["context", "match", "context"]);
+  assert.equal(response.matchCount, 1);
+  assert.equal(response.maxMatches, 100);
+  assert.equal(response.truncated, false);
+});
+
+test("member search uses documented pfgrep flags and caps matches during the grep", async () => {
+  let invocation;
+  const client = {
+    validQsysName: () => true,
+    remoteFeatures: { pfgrep: "/QOpenSys/pkgs/bin/pfgrep", grep: "/QOpenSys/pkgs/bin/grep" },
+    sendCommand: async options => {
+      invocation = options;
+      return {
+        code: 0,
+        stderr: "",
+        stdout: "A.MBR:1:x MATCH\nA.MBR-2-after\nB.MBR:7:MATCH y\nB.MBR:9:MATCH z\n"
+      };
+    }
+  };
+  const response = await Search.searchMembersTerms(
+    client, "MYLIB", "QRPGLESRC", ["match"], "*", false, { after: 1, maxMatches: 2 }
+  );
+  assert.equal(invocation.command,
+    "/QOpenSys/pkgs/bin/pfgrep -inHr -A 1 -F -m 3 -f - *.MBR | /QOpenSys/usr/bin/head -n 9");
+  assert.equal(invocation.stdin, "match");
+  assert.equal(response.matchCount, 2);
+  assert.equal(response.truncated, true);
+  assert.equal(response.truncatedReason, "max-matches");
+  assert.deepEqual(response.hits.map(hit => hit.path), ["A.MBR", "B.MBR"]);
+  assert.deepEqual(response.hits[1].lines.map(line => line.number), [7]);
+
+  const capped = await Search.searchMembersTerms(client, "MYLIB", "QRPGLESRC", ["match"], "*", false, { maxMatches: 50_000 });
+  assert.equal(capped.maxMatches, 1000);
+});
+
+test("search.members tool returns the bounded result with truncation details", async () => {
+  const conn = {
+    validQsysName: () => true,
+    remoteFeatures: { grep: "/usr/bin/grep" },
+    sendCommand: async () => ({ code: 0, stderr: "", stdout: "A.MBR:1:hit\nA.MBR:2:hit\n" })
+  };
+  const ctx = {
+    store: {}, activeName: "DEV", ensureActive: async () => conn, getPolicy: () => ({ profile: "power-user" })
+  };
+  const response = await handleTool(ctx, "ibmi.search.members", {
+    library: "MYLIB", sourceFile: "QRPGLESRC", term: "hit", maxMatches: 1
+  });
+  const body = response.structuredContent.data;
+  assert.equal(body.matchCount, 1);
+  assert.equal(body.truncated, true);
+  assert.equal(body.hits[0].lines.length, 1);
 });
 
 test("identical snapshot reads are coalesced and then served from the bounded cache", async () => {
