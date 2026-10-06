@@ -243,7 +243,10 @@ export class McpContext {
     const stored = await this.store.getConnection(name);
     if (!stored) throw new Error(`Unknown connection: ${name}`);
 
-    const password = await getPassword(name);
+    // Key-based connections must still work when the keychain is unavailable.
+    const password = stored.privateKeyPath
+      ? await getPassword(name).catch(() => undefined)
+      : await getPassword(name);
     const connection: ConnectionData = {
       name: stored.name,
       host: stored.host,

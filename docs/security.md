@@ -11,7 +11,8 @@
 - With `MCP_FOR_I_CREDENTIAL_STORE=keychain`, there is no in-memory fallback: saving, reading or deleting a password fails with an error when the keychain is unavailable.
 - In WSL, `keytar` uses the Linux Secret Service inside the distro. It does not automatically use Windows Credential Manager. For persistent credentials in WSL, configure Linux libsecret/Secret Service, use SSH keys, or run MCP-for-i from Windows.
 - Set `MCP_FOR_I_CREDENTIAL_STORE=session` to force process-only password storage.
-- Passwords are never written to the config file.
+- Passwords are never written to the config file. Plaintext passwords found in older config files are moved to the keychain and removed from the file only after the keychain confirms the save; without a persistent keychain they are left in place (with a warning) rather than lost.
+- The config file is written atomically with owner-only permissions, never overwritten after a failed read, and updated under a cross-process lock.
 - `readOnlyMode` refuses every tool that changes the system: member and IFS writes, `ibmi.sql.execute`, `ibmi.cl.run`, `ibmi.tn5250.sendKeys`, `ibmi.actions.run`, and destructive data-queue receives.
 - Connection policies support `read-only`, `guarded`, and `power-user` modes.
 - Guarded mode requires `approve: true` for configured risky operations.
