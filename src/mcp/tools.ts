@@ -6,6 +6,7 @@ import { ibmDocs } from "../ibmi/IbmDocs.js";
 import { MemberSnapshot } from "../ibmi/IBMiContent.js";
 import { Action } from "../ibmi/types.js";
 import { Tools } from "../ibmi/Tools.js";
+import { checkReadOnlySql, getSqlStatementType as parseSqlStatementType } from "../ibmi/sqlParse.js";
 import { ConnectionPolicy } from "../config/store.js";
 import { ConnectionService } from "../controlplane/connectionService.js";
 import { log } from "./logger.js";
@@ -2142,7 +2143,8 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
 
       if (!args?.sql) throw new Error("sql is required when cursor is not provided");
       const sql = String(args.sql);
-      if (!isReadOnlySql(sql)) throw new Error("ibmi.sql.query only supports read-only SQL");
+      const readOnlyCheck = checkReadOnlySql(sql);
+      if (!readOnlyCheck.readOnly) throw new Error(`ibmi.sql.query only supports read-only SQL: ${readOnlyCheck.reason}`);
       const startedAt = Date.now();
       const rows = await withTimeout(
         conn.runSQL(sql),
@@ -4158,14 +4160,7 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMes
 }
 
 function getSqlStatementType(sql: string) {
-  const stripped = sql
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .split("\n")
-    .filter(line => !line.trim().startsWith("--"))
-    .join(" ")
-    .trim();
-  const token = stripped.split(/\s+/)[0] || "UNKNOWN";
-  return token.toUpperCase();
+  return parseSqlStatementType(sql);
 }
 
 function getRowColumns(rows: any[]) {
@@ -4215,14 +4210,7 @@ function toSafeSqlError(err: any, sql: string, timeoutMs: number) {
 }
 
 function isReadOnlySql(sql: string) {
-  const stripped = sql
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .split("\n")
-    .filter(line => !line.trim().startsWith("--"))
-    .join(" ")
-    .trim()
-    .toLowerCase();
-  return stripped.startsWith("select ") || stripped.startsWith("with ") || stripped.startsWith("values ");
+  return checkReadOnlySql(sql).readOnly;
 }
 
 function enforceWritable(ctx: McpContext, conn: any, operation: string, args: any) {
