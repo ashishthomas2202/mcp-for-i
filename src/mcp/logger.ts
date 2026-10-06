@@ -1,4 +1,5 @@
 import fs from "fs";
+import { REDACTED, isSecretKey, redactSecretsInText } from "../security/redact.js";
 
 type LogLevel = "error" | "warn" | "info" | "debug";
 
@@ -45,24 +46,19 @@ function safeWrite(line: string) {
 }
 
 export function redact(value: any): any {
-  const secretKeys = ["password", "pass", "token", "secret", "key", "privatekey"];
   if (Array.isArray(value)) {
     return value.map(redact);
   }
   if (value && typeof value === "object") {
     const out: Record<string, any> = {};
     for (const [k, v] of Object.entries(value)) {
-      const lower = k.toLowerCase();
-      if (secretKeys.some(s => lower.includes(s))) {
-        out[k] = "***";
-      } else {
-        out[k] = redact(v);
-      }
+      out[k] = isSecretKey(k) ? REDACTED : redact(v);
     }
     return out;
   }
-  if (typeof value === "string" && value.length > 500) {
-    return value.substring(0, 500) + "...(truncated)";
+  if (typeof value === "string") {
+    const clean = redactSecretsInText(value);
+    return clean.length > 500 ? clean.substring(0, 500) + "...(truncated)" : clean;
   }
   return value;
 }
