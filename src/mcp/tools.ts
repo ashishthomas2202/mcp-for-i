@@ -1,5 +1,7 @@
 import { McpContext } from "./context.js";
 import { findToolModule, toolModules } from "./modules/index.js";
+import { runActionTool } from "./modules/compile.js";
+import { parseEvfevent } from "../ibmi/evfevent.js";
 import { LocalLanguageActions } from "../ibmi/LocalLanguageActions.js";
 import { CompileTools } from "../ibmi/CompileTools.js";
 import { Search } from "../ibmi/Search.js";
@@ -561,20 +563,33 @@ export function getTools() {
     },
     {
       name: "ibmi.actions.run",
-      description: "Run an action.",
+      description:
+        "Run an action (for example a compile) against a source member or an IFS streamfile. " +
+        "Member targets set &OPENLIB/&OPENSPF/&OPENMBR/&EXT/&NAME; streamfile targets set &FULLPATH/&RELATIVEPATH/&NAME/&EXT. " +
+        "When the command uses OPTION(*EVENTF) the EVFEVENT file is read and errors are returned grouped by file with line, column, severity and message id. " +
+        "Honours the action's deployFirst (with localWorkspace + remoteWorkspace), postDownload (to downloadTo or localWorkspace) and outputToFile. " +
+        "Set includeListing to also return the compile listing spooled file.",
       inputSchema: {
         type: "object",
         properties: {
           actionName: { type: "string" },
           action: ACTION_SCHEMA,
           targetType: { type: "string", enum: ["member", "streamfile", "file"] },
-          targetPath: { type: "string" },
+          targetPath: { type: "string", description: "Streamfile: absolute IFS path. Member: LIB/FILE/MEMBER[.TYPE] (or use library/sourceFile/member)." },
           library: { type: "string" },
           sourceFile: { type: "string" },
           member: { type: "string" },
-          extension: { type: "string" }
+          extension: { type: "string", description: "Member type (looked up when omitted) or streamfile extension." },
+          cwd: { type: "string", description: "Remote working directory for streamfile actions (default remoteWorkspace, then the home directory)." },
+          localWorkspace: { type: "string", description: "Local project folder, used by deployFirst, postDownload and relative outputToFile paths." },
+          remoteWorkspace: { type: "string", description: "IFS folder the local workspace deploys to." },
+          downloadTo: { type: "string", description: "Local folder for postDownload outputs (default localWorkspace)." },
+          evfeventLibrary: { type: "string", description: "Override the EVFEVENT library (default: the compiled object's library)." },
+          evfeventMember: { type: "string", description: "Override the EVFEVENT member (default: the compiled object's name)." },
+          includeListing: { type: "boolean", description: "Also return the compile listing spooled file." },
+          listingMaxLines: { type: "number" }
         },
-        required: ["targetType", "targetPath"]
+        required: ["targetType"]
       }
     }
     ,
@@ -831,7 +846,7 @@ export function getTools() {
     },
     {
       name: "ibmi.diagnostics.parseEvfevent",
-      description: "Parse EVFEVENT text into structured diagnostics.",
+      description: "Parse EVFEVENT (compiler events file) records into errors grouped by source file, with line, column, severity and message id. Errors in SQL precompiler temp files are mapped back to the original source.",
       inputSchema: { type: "object", properties: { content: { type: "string" } }, required: ["content"] }
     },
     {
@@ -1848,57 +1863,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return json(actions);
     }
     case "ibmi.actions.run": {
-      const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
-      const action = await resolveAction(ctx, args);
-      if (!action) throw new Error("Action not found");
-
-      const envVars: Record<string, string> = {};
-      const targetPath = args.targetPath as string;
-      const targetType = args.targetType as string;
-
-      if (targetType === "file") {
-        throw new Error("Local file actions are not supported in this MCP server (use streamfile or member).");
-      }
-
-      if (targetType === "streamfile") {
-        CompileTools.validateStreamfilePath(targetPath);
-        envVars["&FULLPATH"] = targetPath;
-        const base = targetPath.split("/").pop() || targetPath;
-        envVars["&BASENAME"] = base;
-        envVars["&NAME"] = base.includes(".") ? base.substring(0, base.lastIndexOf(".")) : base;
-        envVars["&EXT"] = base.includes(".") ? base.substring(base.lastIndexOf(".") + 1) : "";
-        envVars["&RELATIVEPATH"] = targetPath;
-      }
-
-      if (targetType === "member") {
-        const lib = requireQsysName(conn, args.library, "library");
-        const src = requireQsysName(conn, args.sourceFile, "sourceFile");
-        const mbr = requireQsysName(conn, args.member || targetPath.split("/").pop(), "member");
-        const ext = String(args.extension || "");
-        envVars["&LIBRARY"] = lib;
-        envVars["&SRCFILE"] = src;
-        envVars["&NAME"] = mbr;
-        envVars["&EXT"] = ext;
-        envVars["&EXTL"] = ext.toLowerCase();
-        envVars["&FULLPATH"] = `${lib}/${src}/${mbr}`;
-        envVars["&OPENLIB"] = lib;
-        envVars["&OPENLIBL"] = lib.toLowerCase();
-        envVars["&OPENSPF"] = src;
-        envVars["&OPENSPFL"] = src.toLowerCase();
-        envVars["&OPENMBR"] = mbr;
-        envVars["&OPENMBRL"] = mbr.toLowerCase();
-      }
-
-      const resultCmd = await CompileTools.runCommand(conn, {
-        command: action.command,
-        environment: action.environment,
-        env: envVars
-      }, {
-        commandConfirm: actionCommandGuard(ctx, action.environment, args)
-      });
-
-      return json(mapActionExecution(action, targetType, targetPath, resultCmd));
+      return runActionTool(ctx, args);
     }
     case "ibmi.actions.save": {
       const action = args.action as Action;
@@ -3103,7 +3068,7 @@ async function listActions(ctx: McpContext) {
   return [...builtins, ...custom];
 }
 
-async function resolveAction(ctx: McpContext, args: any): Promise<Action | undefined> {
+export async function resolveAction(ctx: McpContext, args: any): Promise<Action | undefined> {
   if (args.action) return args.action as Action;
   if (!args.actionName) return undefined;
   const actions = await listActions(ctx);
@@ -4689,7 +4654,7 @@ function joinRemotePath(root: string, rel: string) {
   return `${base}/${rel}`.replace(/\\/g, "/");
 }
 
-function mapActionExecution(action: Action, targetType: string, targetPath: string, result: any) {
+export function mapActionExecution(action: Action, targetType: string, targetPath: string, result: any) {
   const diagnostics = normalizeCommandDiagnostics(result);
   const code = Number(result?.code);
   const ok = Number.isFinite(code) ? code === 0 : false;
@@ -4755,7 +4720,7 @@ function normalizeJoblogRow(row: Record<string, unknown>) {
   };
 }
 
-function normalizeSpoolEntry(row: Record<string, unknown>) {
+export function normalizeSpoolEntry(row: Record<string, unknown>) {
   return {
     ...row,
     source: "spool",
@@ -4771,7 +4736,7 @@ function normalizeSpoolEntry(row: Record<string, unknown>) {
   };
 }
 
-function normalizeSpoolLine(row: Record<string, unknown>) {
+export function normalizeSpoolLine(row: Record<string, unknown>) {
   const position = pickFirst(row, ["ORDINAL_POSITION", "LINE_NUMBER"]);
   return {
     ...row,
@@ -5111,7 +5076,7 @@ async function enforceResourcePolicy(ctx: McpContext, toolName: string, args: an
 }
 
 /** Check the policy against an action's expanded command before it runs. */
-function actionCommandGuard(ctx: McpContext, environment: string | undefined, args: any) {
+export function actionCommandGuard(ctx: McpContext, environment: string | undefined, args: any) {
   return async (expanded: string) => {
     const policy = ctx.getPolicy(args?.connectionName);
     const reason = (environment || "ile") === "ile"
@@ -5250,26 +5215,3 @@ export function resolveIfsWriteOperation(pathValue: unknown): string {
   }
   return "ifs.write";
 }
-
-function parseEvfevent(content: string) {
-  const diagnostics: Array<{ source: string; line?: number; column?: number; code?: string; severity: "INFO" | "WARN" | "ERROR"; message: string }> = [];
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.trimEnd();
-    if (!line.trim()) continue;
-    const match = line.match(/^\s*(\d+)\s+(\d+)\s+([A-Z0-9]+)\s+(INFO|WARN|ERROR)?\s*(.*)$/i);
-    if (match) {
-      diagnostics.push({
-        source: "evfevent",
-        line: Number(match[1]),
-        column: Number(match[2]),
-        code: match[3],
-        severity: ((match[4] || "ERROR").toUpperCase() as "INFO" | "WARN" | "ERROR"),
-        message: match[5] || line
-      });
-    } else {
-      diagnostics.push({ source: "evfevent", severity: inferSeverity(line), message: line });
-    }
-  }
-  return diagnostics;
-}
-

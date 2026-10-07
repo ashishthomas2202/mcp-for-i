@@ -38,14 +38,24 @@ export class Variables extends Map<string, string> {
     }
   }
 
+  /**
+   * Replace every variable in one pass. Longer names are tried first and a
+   * name that ends in a letter or digit only matches when the next character
+   * is not part of a name, so `&EXT` never replaces the start of `&EXTL` and
+   * `&OPENLIB` never replaces the start of `&OPENLIBL`.
+   */
   public expand(input: string, keysToOmit: string[] = []) {
-    for (const [key, value] of this.entries()) {
-      if (!keysToOmit.includes(key)) {
-        const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        input = input.replace(new RegExp(escapedKey, `g`), value);
-      }
-    }
-    return input;
+    const keys = Array.from(this.keys())
+      .filter(key => key.length > 0 && !keysToOmit.includes(key))
+      .sort((a, b) => b.length - a.length);
+    if (keys.length === 0) return input;
+    const pattern = keys
+      .map(key => {
+        const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return /[A-Za-z0-9_#@$]$/.test(key) ? `${escaped}(?![A-Za-z0-9_#@$])` : escaped;
+      })
+      .join("|");
+    return input.replace(new RegExp(pattern, "g"), match => this.get(match) ?? match);
   }
 
   toPaseVariables(): Record<string, string> {
