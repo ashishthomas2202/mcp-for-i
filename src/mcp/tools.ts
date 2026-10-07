@@ -113,7 +113,8 @@ const PROFILE_SCHEMA: JsonSchema = {
     name: { type: "string" },
     currentLibrary: { type: "string" },
     libraryList: { type: "array", items: { type: "string" } },
-    customVariables: { type: "array", items: CUSTOM_VARIABLE_SCHEMA }
+    customVariables: { type: "array", items: CUSTOM_VARIABLE_SCHEMA },
+    setLibraryListCommand: { type: "string", description: "CL command run by ibmi.libl.runProfileCommand to set the library list." }
   },
   required: ["name"]
 };
@@ -3962,7 +3963,7 @@ async function readSystemFacts(conn: any): Promise<{ release?: string; effective
   return {};
 }
 
-function clampInteger(value: any, minimum: number, maximum: number, fallback: number) {
+export function clampInteger(value: any, minimum: number, maximum: number, fallback: number) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(minimum, Math.min(maximum, Math.floor(parsed)));
@@ -3978,21 +3979,21 @@ function rejectCredentialArgs(args: any, toolName: string) {
   }
 }
 
-function result(text: string) {
+export function result(text: string) {
   return {
     content: [{ type: "text", text }],
     structuredContent: { ok: true, text }
   };
 }
 
-function json(obj: any) {
+export function json(obj: any) {
   return {
     content: [{ type: "text", text: JSON.stringify(obj, null, 2) }],
     structuredContent: { ok: true, data: obj }
   };
 }
 
-function toolError(message: string, error?: Record<string, any>) {
+export function toolError(message: string, error?: Record<string, any>) {
   return {
     isError: true,
     content: [{ type: "text", text: message }],
@@ -4027,7 +4028,7 @@ function commandOutcome(payload: { ok: boolean; command?: string; stderr?: unkno
   return jsonError(detail ? `${label} (${detail})` : label, payload);
 }
 
-function requireCommandSuccess(res: any, label: string) {
+export function requireCommandSuccess(res: any, label: string) {
   if (!res || res.code !== 0) {
     const detail = String(res?.stderr || res?.stdout || "").trim();
     throw new Error(`${label} failed (exit ${res?.code ?? "unknown"})${detail ? `: ${detail}` : ""}`);
@@ -4180,13 +4181,13 @@ function buildChangeDataAreaCommand(
   return `CHGDTAARA DTAARA(${target} (${startPosition} ${length})) VALUE(${quoteClString(value)})`;
 }
 
-function getConnectionName(ctx: McpContext, args: any): string {
+export function getConnectionName(ctx: McpContext, args: any): string {
   const name = args?.connectionName || ctx.activeName;
   if (!name) throw new Error("connectionName is required (no active connection)");
   return name;
 }
 
-function requireQsysName(conn: any, value: unknown, label: string) {
+export function requireQsysName(conn: any, value: unknown, label: string) {
   const raw = String(value || "").trim().toUpperCase();
   if (!raw) throw new Error(`${label} is required`);
   if (!conn.validQsysName(raw)) throw new Error(`Invalid ${label}: ${raw}`);
@@ -4230,7 +4231,7 @@ function requireMessageKey(value: unknown) {
   throw new Error(`Invalid messageKey: ${value}`);
 }
 
-async function updateConnectionSettings(ctx: McpContext, name: string, update: Record<string, any>) {
+export async function updateConnectionSettings(ctx: McpContext, name: string, update: Record<string, any>) {
   const conn = await ctx.store.getConnection(name);
   if (!conn) throw new Error(`Connection ${name} not found`);
   conn.settings = { ...(conn.settings || {}), ...stripUndefined(update) };
@@ -4243,7 +4244,7 @@ async function updateConnectionSettings(ctx: McpContext, name: string, update: R
   }
 }
 
-async function applyLibraryList(conn: any, libraryList?: string[], currentLibrary?: string) {
+export async function applyLibraryList(conn: any, libraryList?: string[], currentLibrary?: string) {
   if (libraryList && libraryList.length > 0) {
     const normalized = libraryList.map((l: string) => String(l).toUpperCase());
     const invalid = normalized.find((l: string) => !conn.validQsysName(l));
@@ -4604,7 +4605,7 @@ function isReadOnlySql(sql: string) {
   return checkReadOnlySql(sql).readOnly;
 }
 
-function enforceWritable(ctx: McpContext, conn: any, operation: string, args: any) {
+export function enforceWritable(ctx: McpContext, conn: any, operation: string, args: any) {
   if (conn.getConfig().readOnlyMode) throw new Error("Connection is in read-only mode");
   enforcePolicyOperation(ctx, operation, args);
 }

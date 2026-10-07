@@ -53,6 +53,7 @@ Official documentation needs no credentials. The built-in catalog covers IBM i 7
 
 - `MCP_FOR_I_IBM_DOCS_SEEDS`: JSON array of additional `{ title, url, release, categories, keywords }` entries. Every URL is still restricted to `https://www.ibm.com/docs/`.
 - `MCP_FOR_I_IBM_DOCS_CACHE_DIR`: override the local documentation cache directory.
+- `MCP_FOR_I_IBM_DOCS_CACHE_TTL_DAYS`: days before a cached documentation page is fetched again (default 7). An expired copy is still served, with a warning, when the refresh fails.
 
 `ibmi.docs.search` is local/indexed by default. Use `freshness: "prefer-live"` for a bounded refresh of matching catalog entries. `ibmi.docs.open` uses cached content by default; use `freshness: "require-live"` when a live fetch is required.
 

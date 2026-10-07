@@ -46,6 +46,8 @@ export type ConnectionProfile = {
   currentLibrary?: string;
   libraryList?: string[];
   customVariables?: { name: string; value: string }[];
+  /** CL command that sets the library list (as in Code for IBM i profiles). */
+  setLibraryListCommand?: string;
 };
 
 export type StoredConnection = Omit<ConnectionData, "password"> & {

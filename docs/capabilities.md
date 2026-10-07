@@ -87,11 +87,15 @@ Version context: `0.1.13` development codebase.
 - `ibmi.source.inspect`
 - `ibmi.search.ifs`
 - `ibmi.find.ifs`
+- `ibmi.search.changedLines`
 - `ibmi.resolve.path`
+
+### System Information
+- `ibmi.system.info`
 
 ### Official IBM i Documentation
 - `ibmi.docs.search`
-- `ibmi.docs.open`
+- `ibmi.docs.open` (any `https://www.ibm.com/docs/` page)
 - MCP resources at `ibmi-docs://catalog` and `ibmi-docs://topic/{ref}`
 
 ### Actions, Filters, Profiles, Library List
@@ -112,6 +116,9 @@ Version context: `0.1.13` development codebase.
 - `ibmi.libl.remove`
 - `ibmi.libl.setCurrent`
 - `ibmi.libl.validate`
+- `ibmi.libl.move`
+- `ibmi.libl.prune`
+- `ibmi.libl.runProfileCommand`
 - `ibmi.ifs.shortcuts.list`
 - `ibmi.ifs.shortcuts.add`
 - `ibmi.ifs.shortcuts.delete`
