@@ -129,6 +129,11 @@ Version context: `0.1.13` development codebase.
 - `ibmi.deploy.uploadDirectory`
 - `ibmi.deploy.uploadFiles`
 - `ibmi.deploy.setCcsid`
+- `ibmi.deploy.sync` methods: `all`, `changed` (SHA-256), `gitChanged`, `selection`
+
+### Bulk Source Members
+- `ibmi.members.downloadAll`
+- `ibmi.members.uploadChanged`
 
 ### SQL, CL, Diagnostics, Spool, Debug
 - `ibmi.sql.query`

@@ -111,7 +111,14 @@ The documentation catalog is also exposed through MCP resources: `ibmi-docs://ca
 ### Deploy Notes
 - `ibmi.deploy.compare` returns richer drift data: `onlyLocal`, `onlyRemote`, `identical`, `changed`, `unresolved`, and a `summary`.
 - `ibmi.deploy.sync` supports `overwrite`, `dryRun`, and `deleteExtraRemote`.
-- `ibmi.deploy.sync` returns execution mapping (`planned`, `applied`, `errors`) for safer automation.
+- `ibmi.deploy.sync` returns execution mapping (`planned`, `applied`, `errors`) for safer automation, plus a `summary` with `planned`, `uploaded`, `unchanged`, `skipped`, `deleted` and `failed` counts.
+- `ibmi.deploy.sync` takes `method`:
+  - `all` (default): original behavior. Uploads files missing remotely; with `overwrite`, also files whose size differs or is unknown.
+  - `changed`: compares SHA-256 hashes of files present on both sides (local with node crypto, remote with `sha256sum` or `openssl dgst -sha256` in batched calls) and uploads only missing or different files. Fails with a clear error when the IBM i has neither tool.
+  - `gitChanged`: uploads the staged, unstaged and untracked files under `localPath` reported by `git status --porcelain -z` (run without a shell). Deleted files are listed in `planned.gitDeleted`, never removed remotely.
+  - `selection`: uploads the paths listed in `files` (relative to `localPath`; absolute paths and `..` are refused).
+- `deleteExtraRemote` works only with `all` and `changed`.
+- `ibmi.deploy.compare` takes `method: "changed"` to compare by SHA-256 instead of size (`comparedBy: "sha256"`).
 
 ## Filters
 - `ibmi.filters.list`
@@ -247,3 +254,15 @@ The documentation catalog is also exposed through MCP resources: `ibmi-docs://ca
 - The built CL command is checked against `allowCommands`/`denyCommands`, and every library involved against `allowLibraries`/`denyLibraries`. A failing command returns a tool error with the IBM i message.
 - Member copy and attribute changes drop the cached member snapshot for the affected member.
 - IFS copy/move check both paths against `allowPaths`/`denyPaths`. The destination (and the source of a move or recursive copy) gets the same guard as `ibmi.ifs.delete`: no root, top-level directory, `/QSYS.LIB/<lib>.LIB`, second-level `/QOpenSys` or `/QIBM` directory, IBM product directory, `..` or wildcards. The destination may not equal or sit inside the source. An existing destination is refused unless `overwrite=true`; an existing directory then receives the copied or moved entry inside it.
+
+## Bulk Members
+- `ibmi.members.downloadAll`
+- `ibmi.members.uploadChanged`
+
+### Bulk Members Notes
+- `downloadAll` copies every member of `sourceFile` (or `sourceFiles`, or every source file in `library` when neither is given) to `localPath/LIB/FILE/MEMBER.ext`. The extension is the lowercased member type (`mbr` when the type is blank). `memberPrefix` and `sourceTypes` narrow the set; `maxMembers` (default 500, max 5000) caps it and the result reports `truncated`.
+- A manifest `.mcp-for-i-members.json` in `localPath` records each member's source type, `version`, `sha256` and last-change timestamp.
+- Re-running `downloadAll` keeps local files edited since the last download (reported in `skipped`) unless `overwrite: true`.
+- `uploadChanged` walks the tree under `localPath` (filter with `library`, `sourceFile`, `members`). Files whose content still matches the manifest are skipped without contacting the IBM i. A member that changed on the IBM i since download, or exists remotely without a manifest entry, is reported in `conflicts` and not written unless `force: true`. Missing members are created with SRCTYPE from the manifest or the file extension (`createMissing`, default true).
+- `uploadChanged` honors the write gate (read-only mode, policy, `approve`), `denyLibraries`/`allowLibraries` for every library in the tree, and `dryRun`. Written members are dropped from the member snapshot cache and the manifest is updated with their new version.
+- Line endings are normalized to LF before hashing and upload.

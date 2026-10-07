@@ -15,6 +15,7 @@ import { log } from "./logger.js";
 import { assertSafeIfsDeletePath, checkClCommand, checkClCommands, checkResourcePolicy, checkShellCommand, checkSqlEmbeddedCl } from "./policy.js";
 import { configuredLocalRoots, LocalPathMode, resolveAllowedLocalPath } from "../security/localPaths.js";
 import { exportAuditRecords, listAuditRecords, purgeAuditRecords, verifyAuditChain } from "./audit.js";
+import { gitChangedFiles, normalizeDeployMethod, normalizeDeploySelection, sha256LocalFile, sha256RemoteFiles } from "./deployMethods.js";
 import fs from "fs/promises";
 import path from "path";
 import crypto from "crypto";
@@ -754,20 +755,30 @@ export function getTools() {
     },
     {
       name: "ibmi.deploy.compare",
-      description: "Compare local and remote directories (by relative paths).",
-      inputSchema: { type: "object", properties: { localPath: { type: "string" }, remotePath: { type: "string" } }, required: ["localPath", "remotePath"] }
-    },
-    {
-      name: "ibmi.deploy.sync",
-      description: "Sync local directory to remote (upload missing or overwrite).",
+      description: "Compare local and remote directories (by relative paths). method \"all\" compares sizes; method \"changed\" also compares SHA-256 content hashes of files present on both sides.",
       inputSchema: {
         type: "object",
         properties: {
           localPath: { type: "string" },
           remotePath: { type: "string" },
-          overwrite: { type: "boolean", default: false },
+          method: { type: "string", enum: ["all", "changed"], default: "all" }
+        },
+        required: ["localPath", "remotePath"]
+      }
+    },
+    {
+      name: "ibmi.deploy.sync",
+      description: "Sync a local directory to the IFS. method: \"all\" (default) uploads missing files and, with overwrite, size-changed ones; \"changed\" uploads only files whose SHA-256 differs or that are missing remotely; \"gitChanged\" uploads staged, unstaged and untracked files from git status; \"selection\" uploads the listed files (paths relative to localPath). Reports uploaded, unchanged and skipped counts.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          localPath: { type: "string" },
+          remotePath: { type: "string" },
+          method: { type: "string", enum: ["all", "changed", "gitChanged", "selection"], default: "all" },
+          files: { type: "array", items: { type: "string" }, description: "Relative file paths for method \"selection\"." },
+          overwrite: { type: "boolean", default: false, description: "method \"all\" only: also upload files whose size differs." },
           dryRun: { type: "boolean", default: false },
-          deleteExtraRemote: { type: "boolean", default: false }
+          deleteExtraRemote: { type: "boolean", default: false, description: "methods \"all\" and \"changed\" only." }
         },
         required: ["localPath", "remotePath"]
       }
@@ -2135,32 +2146,70 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const conn = await ctx.ensureActive(args?.connectionName);
       const localPath = await guardLocalPath(ctx, args.localPath, "read");
       const remotePath = String(args.remotePath);
+      const method = normalizeDeployMethod(args.method);
+      if (method !== "all" && method !== "changed") throw new Error(`deploy.compare supports method "all" or "changed", not "${method}"`);
       const comparison = await compareDeployTrees(conn, localPath, remotePath);
-      return json(comparison);
+      return json(method === "changed" ? await refineComparisonByHash(conn, comparison) : comparison);
     }
     case "ibmi.deploy.sync": {
       const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "deploy.sync", args);
       const localPath = await guardLocalPath(ctx, args.localPath, "read");
       const remotePath = String(args.remotePath);
+      const method = normalizeDeployMethod(args.method);
       const overwrite = Boolean(args.overwrite);
       const dryRun = Boolean(args.dryRun);
       const deleteExtraRemote = Boolean(args.deleteExtraRemote);
-      const comparison = await compareDeployTrees(conn, localPath, remotePath);
+      if (deleteExtraRemote && (method === "gitChanged" || method === "selection")) {
+        throw new Error(`deleteExtraRemote is only supported with method "all" or "changed"`);
+      }
+      const errors: Array<{ operation: "upload" | "delete"; path: string; message: string }> = [];
 
-      const uploadSet = new Set<string>(comparison.onlyLocal);
-      if (overwrite) {
-        comparison.changed.forEach(entry => uploadSet.add(entry.path));
-        comparison.unresolved.forEach(entry => uploadSet.add(entry.path));
+      let comparison: DeployComparison | undefined;
+      let uploadSet: Set<string>;
+      let skipChanged: string[] = [];
+      let unresolved: string[] = [];
+      let unchanged: string[] = [];
+      let gitDeleted: string[] = [];
+      if (method === "all" || method === "changed") {
+        comparison = await compareDeployTrees(conn, localPath, remotePath);
+        if (method === "changed") comparison = await refineComparisonByHash(conn, comparison);
+        uploadSet = new Set<string>(comparison.onlyLocal);
+        // "changed" compared content, so every differing file is uploaded.
+        const includeChanged = overwrite || method === "changed";
+        if (includeChanged) {
+          comparison.changed.forEach(entry => uploadSet.add(entry.path));
+          comparison.unresolved.forEach(entry => uploadSet.add(entry.path));
+        }
+        skipChanged = includeChanged ? [] : comparison.changed.map(entry => entry.path).sort((a, b) => a.localeCompare(b));
+        unresolved = includeChanged ? [] : comparison.unresolved.map(entry => entry.path).sort((a, b) => a.localeCompare(b));
+        unchanged = [...comparison.identical];
+      } else if (method === "gitChanged") {
+        const git = await gitChangedFiles(localPath);
+        uploadSet = new Set<string>(git.files);
+        gitDeleted = git.deleted;
+      } else {
+        uploadSet = new Set<string>();
+        for (const rel of normalizeDeploySelection(args.files)) {
+          try {
+            const resolved = await guardLocalPath(ctx, path.join(localPath, rel), "read");
+            const relative = path.relative(localPath, resolved);
+            if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+              throw new Error("file is outside localPath");
+            }
+            const stat = await fs.stat(resolved).catch(() => undefined);
+            if (!stat?.isFile()) throw new Error("local file not found");
+            uploadSet.add(rel);
+          } catch (err: any) {
+            errors.push({ operation: "upload", path: rel, message: err?.message || String(err) });
+          }
+        }
       }
       const uploadPlan = Array.from(uploadSet).sort((a, b) => a.localeCompare(b));
-      const skipChanged = overwrite ? [] : comparison.changed.map(entry => entry.path).sort((a, b) => a.localeCompare(b));
-      const unresolved = overwrite ? [] : comparison.unresolved.map(entry => entry.path).sort((a, b) => a.localeCompare(b));
-      const deletePlan = deleteExtraRemote ? [...comparison.onlyRemote] : [];
+      const deletePlan = deleteExtraRemote && comparison ? [...comparison.onlyRemote] : [];
 
       const uploaded: string[] = [];
       const deleted: string[] = [];
-      const errors: Array<{ operation: "upload" | "delete"; path: string; message: string }> = [];
 
       if (!dryRun) {
         const createdDirs = new Set<string>();
@@ -2193,17 +2242,26 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
 
       const syncResult = {
         ok: errors.length === 0,
-        mode: { overwrite, deleteExtraRemote, dryRun },
-        comparison,
+        mode: { method, overwrite, deleteExtraRemote, dryRun },
+        comparison: comparison ?? null,
         planned: {
           upload: uploadPlan,
           delete: deletePlan,
           skippedChanged: skipChanged,
-          unresolved
+          unresolved,
+          ...(method === "gitChanged" ? { gitDeleted } : {})
         },
         applied: {
           uploaded: dryRun ? [] : uploaded,
           deleted: dryRun ? [] : deleted
+        },
+        summary: {
+          planned: uploadPlan.length,
+          uploaded: dryRun ? 0 : uploaded.length,
+          unchanged: unchanged.length,
+          skipped: skipChanged.length + unresolved.length + gitDeleted.length,
+          deleted: dryRun ? 0 : deleted.length,
+          failed: errors.length
         },
         errors
       };
@@ -4163,7 +4221,7 @@ export function toolError(message: string, error?: Record<string, any>) {
   };
 }
 
-function jsonError(message: string, obj: any) {
+export function jsonError(message: string, obj: any) {
   return {
     isError: true,
     content: [{ type: "text", text: `${message}\n${JSON.stringify(obj, null, 2)}` }],
@@ -4433,12 +4491,15 @@ type DeployDiffEntry = {
   path: string;
   localSize?: number;
   remoteSize?: number;
-  reason: "size_mismatch" | "unknown_size";
+  localSha256?: string;
+  remoteSha256?: string;
+  reason: "size_mismatch" | "unknown_size" | "content_mismatch" | "hash_unavailable";
 };
 
 type DeployComparison = {
   localRoot: string;
   remoteRoot: string;
+  comparedBy?: "size" | "sha256";
   onlyLocal: string[];
   onlyRemote: string[];
   identical: string[];
@@ -4515,6 +4576,39 @@ async function compareDeployTrees(conn: any, localRoot: string, remoteRoot: stri
       changed: changed.length,
       unresolved: unresolved.length
     }
+  };
+}
+
+/**
+ * Re-checks every file present on both sides by SHA-256, so files with equal
+ * size but different content count as changed and size-unknown files are
+ * resolved. Files whose remote hash can't be computed stay unresolved.
+ */
+async function refineComparisonByHash(conn: any, comparison: DeployComparison): Promise<DeployComparison> {
+  const sizeOf = new Map<string, DeployDiffEntry>();
+  for (const entry of [...comparison.changed, ...comparison.unresolved]) sizeOf.set(entry.path, entry);
+  const shared = [...comparison.identical, ...comparison.changed.map(e => e.path), ...comparison.unresolved.map(e => e.path)]
+    .sort((a, b) => a.localeCompare(b));
+  const remoteHashes = await sha256RemoteFiles(conn, comparison.remoteRoot, shared);
+  const identical: string[] = [];
+  const changed: DeployDiffEntry[] = [];
+  const unresolved: DeployDiffEntry[] = [];
+  for (const rel of shared) {
+    const sizes = sizeOf.get(rel);
+    const localSha256 = await sha256LocalFile(path.join(comparison.localRoot, rel));
+    const remoteSha256 = remoteHashes.get(rel);
+    const base = { path: rel, localSize: sizes?.localSize, remoteSize: sizes?.remoteSize, localSha256, remoteSha256 };
+    if (!remoteSha256) unresolved.push({ ...base, reason: "hash_unavailable" });
+    else if (remoteSha256 === localSha256) identical.push(rel);
+    else changed.push({ ...base, reason: "content_mismatch" });
+  }
+  return {
+    ...comparison,
+    comparedBy: "sha256",
+    identical,
+    changed,
+    unresolved,
+    summary: { ...comparison.summary, identical: identical.length, changed: changed.length, unresolved: unresolved.length }
   };
 }
 
@@ -5029,7 +5123,7 @@ function actionCommandGuard(ctx: McpContext, environment: string | undefined, ar
 }
 
 /** Resolve a local path and refuse it outside the allowed local roots. */
-async function guardLocalPath(ctx: McpContext, value: unknown, mode: LocalPathMode) {
+export async function guardLocalPath(ctx: McpContext, value: unknown, mode: LocalPathMode) {
   let settingsRoots: unknown;
   try {
     settingsRoots = ((await ctx.store.getSettings()) as any)?.allowedLocalRoots;
