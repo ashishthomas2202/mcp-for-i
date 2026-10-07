@@ -17,7 +17,7 @@ export type ToolModule = {
 };
 
 // Feature modules register here, one import and one array entry each.
-export const toolModules: ToolModule[] = [];
+export const toolModules: ToolModule[] = [objectsModule, membersModule, ifsOpsModule, bulkMembersModule, compareModule, inspectModule];
 
 export function findToolModule(name: string): ToolModule | undefined {
   return toolModules.find(module => module.tools.some(tool => tool.name === name));
