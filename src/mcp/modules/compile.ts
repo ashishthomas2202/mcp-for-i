@@ -202,7 +202,8 @@ export async function readEvfeventMember(conn: any, library: string, member: str
   try {
     const rows: Array<Record<string, unknown>> = await conn.runSQL(
       `create or replace alias QTEMP.MCP_EVFEVENT for "${lib}"."EVFEVENT"("${mbr}");\n` +
-      `select * from QTEMP.MCP_EVFEVENT as E order by rrn(E)`
+      // EVFEVENT is CCSID 65535, so the bytes come back raw unless cast to EBCDIC text.
+      `select rtrim(cast(E.EVFEVENT as varchar(400) ccsid 37)) as EVFEVENT from QTEMP.MCP_EVFEVENT as E order by rrn(E)`
     );
     const lines = (rows || []).map(row => {
       const value = row.EVFEVENT ?? Object.values(row)[0];
@@ -527,7 +528,8 @@ export async function runActionTool(ctx: McpContext, args: any) {
     const firstError = evf?.diagnostics.find(d => d.severity === "ERROR");
     const detail = firstError
       ? `${errorCount} error(s); first: ${firstError.msgid} line ${firstError.line}: ${firstError.text}`
-      : String(commandResult.stderr || commandResult.stdout || "").trim().split(/\r?\n/)[0] || `exit ${commandResult.code}`;
+      : (Array.isArray(payload.diagnostics) ? payload.diagnostics.find((d: any) => d.severity === "ERROR")?.message : undefined)
+        || String(commandResult.stderr || commandResult.stdout || "").trim().split(/\r?\n/)[0] || `exit ${commandResult.code}`;
     return jsonError(`Action "${action.name}" failed (${detail})`, payload);
   }
   return json(payload);
