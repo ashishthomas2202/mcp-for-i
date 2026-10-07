@@ -523,7 +523,7 @@ export function getTools() {
     },
     {
       name: "ibmi.docs.open",
-      description: "Open and cache an allowlisted official IBM i documentation page.",
+      description: "Open and cache an official IBM documentation page: a ref from ibmi.docs.search or any https://www.ibm.com/docs/ URL. Cached copies expire after 7 days by default.",
       inputSchema: {
         type: "object",
         properties: {
