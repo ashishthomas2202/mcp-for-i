@@ -210,3 +210,32 @@ The documentation catalog is also exposed through MCP resources: `ibmi-docs://ca
 - Sessions are stateful per IBM i connection.
 - `setField` supports `fieldId: "command"` (or `"1"` alias), then `sendKeys: "Enter"` to execute.
 - `sendKeys` supports guardrails through policy checks and optional `approve=true` for guarded operations.
+
+## Compare
+- `ibmi.compare.text`
+
+### Compare Notes
+- Compares any two of: a source member (`{ "type": "member", "library", "sourceFile", "member" }`), an IFS stream file (`{ "type": "ifs", "path" }`) or a local file (`{ "type": "local", "path" }`). Member and IFS sides may name their own `connectionName`, so the same member can be compared across two systems.
+- Returns a unified diff plus `stats` (`hunks`, `added`, `removed`), `identical`, and size/line count/SHA-256 for each side.
+- Options: `context` (default 3), `ignoreTrailingWhitespace` (default true), `ignoreCase` (default false), `maxBytes` per side (default 2 MB, max 16 MB), `maxDiffLines` (default 2000; counts always cover the whole diff and `truncated` says when the text was cut).
+- Members are read through the member snapshot reader: only the source text is compared (no sequence numbers or source dates) and the record padding is trimmed. A missing final newline is not reported as a difference.
+- Local files must be inside the allowed local roots. IFS and local files must be UTF-8 text. Library and IFS path policies are checked for each side.
+
+## Inspection
+- `ibmi.objects.describe`
+- `ibmi.members.describe`
+- `ibmi.ifs.stat`
+- `ibmi.programs.info`
+- `ibmi.objects.whereUsed`
+- `ibmi.tables.describe`
+- `ibmi.routines.describe`
+
+### Inspection Notes
+- All inspection tools are read-only, cap their queries with `FETCH FIRST`, and upper-case and validate every name.
+- `ibmi.objects.describe` reads `QSYS2.OBJECT_STATISTICS` (owner, size, text, attribute, created/changed/last-used/save dates and source file information when recorded). `objectType` defaults to `*ALL`. If the system rejects the `OBJECT_NAME` argument, the library listing is filtered by name instead. `attributes` holds every non-empty column the service returned.
+- `ibmi.members.describe` reads `QSYS2.SYSPARTITIONSTAT` (source type, text, records, data size, created/changed/source-changed/last-used dates) plus the record length and the `SRCDTA` CCSID.
+- `ibmi.ifs.stat` reads `QSYS2.IFS_OBJECT_STATISTICS` (type, CCSID, owner, size, dates). On releases without that service it falls back to `ls -ldL` (no CCSID) and adds a warning.
+- `ibmi.programs.info` reads `QSYS2.PROGRAM_INFO` for a `*PGM` or `*SRVPGM` (program type, activation group, adopted authority, source location, target release), bound modules from `QSYS2.BOUND_MODULE_INFO`, bound service programs from `QSYS2.BOUND_SRVPGM_INFO`, and exports/imports from `QSYS2.PROGRAM_EXPORT_IMPORT_INFO`. For a service program it returns `binderSource` (`STRPGMEXP PGMLVL(*CURRENT) SIGNATURE(*GEN)` with one `EXPORT` per exported symbol). Check the export order against `DSPSRVPGM DETAIL(*SIGNATURE)` before binding with it. Missing optional services become `warnings`.
+- `ibmi.objects.whereUsed` runs `DSPPGMREF` into a uniquely named QTEMP outfile and reads it in the same SQL job. `direction: "uses"` lists what a program references (`library`, `program`, optional `programType`). `direction: "usedBy"` scans every program, service program and module in `library` and returns the references to `object` (optional `objectLibrary`, which also matches `*LIBL` references, and `objectType`), plus a de-duplicated `programs` list. Scanning a large library can take a while.
+- `ibmi.tables.describe` accepts system or SQL names and returns the table row from `QSYS2.SYSTABLES`, columns from `QSYS2.SYSCOLUMNS`, constraints with key columns (`SYSCST`/`SYSKEYCST`) and SQL indexes with their keys (`SYSINDEXES`/`SYSKEYS`). Keys of DDS keyed files and logical files are not included.
+- `ibmi.routines.describe` returns every overload from `QSYS2.SYSROUTINES` with parameters from `QSYS2.SYSPARMS` and a readable `signature`. `includeDefinition` adds the SQL routine body (capped at 64 KB).

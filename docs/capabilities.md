@@ -116,6 +116,16 @@ Version context: `0.1.13` development codebase.
 - `ibmi.ifs.shortcuts.add`
 - `ibmi.ifs.shortcuts.delete`
 
+### Compare and Inspection
+- `ibmi.compare.text`
+- `ibmi.objects.describe`
+- `ibmi.members.describe`
+- `ibmi.ifs.stat`
+- `ibmi.programs.info`
+- `ibmi.objects.whereUsed`
+- `ibmi.tables.describe`
+- `ibmi.routines.describe`
+
 ### Deploy and File Sync
 - `ibmi.deploy.compare`
 - `ibmi.deploy.sync`
