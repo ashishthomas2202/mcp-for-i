@@ -1,5 +1,7 @@
 # Tools
 
+Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`), so MCP clients can auto-approve read-only tools and ask before destructive ones. Only the IBM Docs tools reach the internet (`openWorldHint: true`).
+
 ## Connection
 - `ibmi.connect`
 - `ibmi.disconnect`
