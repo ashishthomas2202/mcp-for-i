@@ -366,6 +366,20 @@ export function renderControlPlaneHtml(token = "") {
     .dialog-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 20px; border-top: 1px solid var(--line); background: var(--surface-2); }
     .dialog-error { display: none; margin-bottom: 16px; padding: 10px 12px; border-radius: var(--r-md); background: var(--danger-soft); color: var(--danger); font-size: 12.5px; word-break: break-word; }
     .dialog-error.show { display: block; }
+    .test-result { display: none; margin-bottom: 16px; padding: 10px 12px; border-radius: var(--r-md); border: 1px solid var(--line); background: var(--surface-2); font-size: 12.5px; }
+    .test-result.show { display: block; }
+    .test-result .tr-title { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+    .test-result.ok .tr-title { color: var(--ok); }
+    .test-result.warn .tr-title { color: var(--warn); }
+    .test-result.danger .tr-title { color: var(--danger); }
+    .test-result .tr-msg { margin-top: 4px; color: var(--text-2); word-break: break-word; }
+    .test-result ul { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 3px; }
+    .test-result li { display: flex; gap: 8px; color: var(--text-3); }
+    .test-result li .mark { flex: none; width: 14px; text-align: center; }
+    .test-result li.ok .mark { color: var(--ok); }
+    .test-result li.fail .mark { color: var(--danger); }
+    .test-result li .detail { word-break: break-all; }
+    .dialog-foot .spacer { flex: 1; }
     #confirmDialog { width: min(420px, calc(100vw - 32px)); }
     #confirmDialog .dialog-body { display: flex; gap: 12px; }
     .confirm-icon { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; background: var(--danger-soft); color: var(--danger); flex: none; }
@@ -554,7 +568,7 @@ export function renderControlPlaneHtml(token = "") {
           </div>
           <div class="table-wrap" id="connectionsTableWrap">
             <table>
-              <thead><tr><th>Name</th><th>Host</th><th>User</th><th>Policy</th><th>Library context</th><th class="right"><span class="sr-only">Actions</span></th></tr></thead>
+              <thead><tr><th>Name</th><th>Host</th><th>User</th><th>Status</th><th>Policy</th><th>Library context</th><th class="right"><span class="sr-only">Actions</span></th></tr></thead>
               <tbody id="connectionsBody"></tbody>
             </table>
           </div>
@@ -711,6 +725,7 @@ export function renderControlPlaneHtml(token = "") {
       </div>
       <div class="dialog-body">
         <div class="dialog-error" id="connectionError" role="alert"></div>
+        <div class="test-result" id="connectionTestResult" role="status" aria-live="polite"></div>
 
         <div class="form-section">
           <div class="section-title eyebrow">Server</div>
@@ -802,6 +817,8 @@ export function renderControlPlaneHtml(token = "") {
         </div>
       </div>
       <div class="dialog-foot">
+        <button id="testConnectionBtn" class="btn btn-secondary" type="button" title="Sign on once and sign off, without saving">Test connection</button>
+        <span class="spacer"></span>
         <button id="cancelConnectionBtn" class="btn btn-secondary" type="button">Cancel</button>
         <button id="saveConnectionBtn" class="btn btn-primary" type="submit">Save connection</button>
       </div>
@@ -841,7 +858,7 @@ export function renderControlPlaneHtml(token = "") {
       disableService: "Disable background service"
     };
     const POLICY_CHIP = { "read-only": ["ok", "Read-only"], "guarded": ["info", "Guarded"], "power-user": ["warn", "Power user"] };
-    const state = { online: false, busy: false, jobs: {}, connections: [], editingName: "", service: null, settings: null };
+    const state = { online: false, busy: false, jobs: {}, connections: [], editingName: "", service: null, settings: null, testing: {} };
     const $ = id => document.getElementById(id);
     const TOKEN_HEADER = "X-MCP-For-I-Token";
     const API_TOKEN = (document.querySelector("meta[name='mcp-for-i-token']") || {}).content || "";
@@ -1099,9 +1116,11 @@ export function renderControlPlaneHtml(token = "") {
           "<td><div class='cell-primary'>" + escapeHtml(conn.name) + "</div>" + (conn.privateKeyPath ? "<div class='cell-sub'>SSH key</div>" : "") + "</td>" +
           "<td class='mono' style='font-size:12.5px'>" + escapeHtml(conn.host || "") + "<span class='cell-sub'>:" + escapeHtml(String(conn.port || 22)) + "</span></td>" +
           "<td class='mono' style='font-size:12.5px'>" + escapeHtml(conn.username || "") + "</td>" +
+          "<td>" + testStatusChip(conn.name, conn.lastTest) + "</td>" +
           "<td><span class='chip " + pc[0] + "'>" + escapeHtml(pc[1]) + "</span></td>" +
           "<td>" + ctx + "</td>" +
           "<td class='right'><div class='row-actions'>" +
+          "<button class='btn btn-ghost btn-icon' data-action='test' data-name='" + enc + "' type='button' title='Test connection' aria-label='Test " + escapeHtml(conn.name) + "'>" + icon("pulse") + "</button>" +
           "<button class='btn btn-ghost btn-icon' data-action='edit' data-name='" + enc + "' type='button' title='Edit' aria-label='Edit " + escapeHtml(conn.name) + "'>" + icon("edit") + "</button>" +
           "<button class='btn btn-ghost btn-icon danger-hover' data-action='delete' data-name='" + enc + "' type='button' title='Delete' aria-label='Delete " + escapeHtml(conn.name) + "'>" + icon("trash") + "</button>" +
           "</div></td>";
@@ -1109,6 +1128,59 @@ export function renderControlPlaneHtml(token = "") {
       }
       body.querySelectorAll("button").forEach(btn => btn.addEventListener("click", onConnectionAction));
       syncControls();
+    }
+    const TEST_LABELS = {
+      "ok": "Connected", "invalid-input": "Incomplete", "host-not-found": "Host not found",
+      "host-unreachable": "Unreachable", "port-closed": "SSH port closed", "port-timeout": "No answer",
+      "not-ssh": "Not SSH", "host-key-changed": "Host key changed", "no-credentials": "No password",
+      "key-unreadable": "Key problem", "auth-failed": "Sign-on rejected", "password-expired": "Password expired",
+      "password-already-rejected": "Password rejected", "timeout": "Timed out", "error": "Failed"
+    };
+    function testTone(result) {
+      if (result.ok) return result.warnings && result.warnings.length ? "warn" : "ok";
+      return result.code === "no-credentials" ? "warn" : "danger";
+    }
+    function testSummary(result) {
+      return [result.message].concat(result.warnings || []).join(" ");
+    }
+    function testStatusChip(name, result) {
+      if (state.testing[name]) return "<span class='chip info running'>Testing</span>";
+      if (!result) return "<span class='chip plain'>Not tested</span>";
+      const when = result.testedAt ? (" Tested " + formatTime(result.testedAt) + ".") : "";
+      return "<span class='chip " + testTone(result) + "' title='" + escapeHtml(testSummary(result) + when) + "'>" +
+        escapeHtml(TEST_LABELS[result.code] || result.code) + "</span>";
+    }
+    function renderTestResult(result) {
+      const box = $("connectionTestResult");
+      if (!result) { box.className = "test-result"; box.innerHTML = ""; return; }
+      const tone = testTone(result);
+      const steps = (result.steps || []).map(s =>
+        "<li class='" + (s.ok ? "ok" : "fail") + "'><span class='mark'>" + (s.ok ? "&#10003;" : "&#10007;") + "</span>" +
+        "<span><strong>" + escapeHtml(s.name) + "</strong> <span class='detail'>" + escapeHtml(s.detail || "") + "</span></span></li>").join("");
+      const warnings = (result.warnings || []).map(w => "<li class='fail'><span class='mark'>!</span><span>" + escapeHtml(w) + "</span></li>").join("");
+      box.className = "test-result show " + tone;
+      box.innerHTML = "<div class='tr-title'>" + icon(tone === "ok" ? "check" : "alert", 14) + escapeHtml(TEST_LABELS[result.code] || result.code) + "</div>" +
+        "<div class='tr-msg'>" + escapeHtml(result.message) + "</div>" +
+        (steps || warnings ? "<ul>" + steps + warnings + "</ul>" : "");
+    }
+    async function testSavedConnection(name, btn) {
+      if (state.testing[name]) return;
+      state.testing[name] = true;
+      renderConnections(state.connections);
+      let result = null;
+      try {
+        result = (await api("/api/connections/" + encodeURIComponent(name) + "/test", { method: "POST", body: "{}" })).result;
+      } catch (err) {
+        toast("error", "Could not test " + name, errorMessage(err));
+      } finally {
+        delete state.testing[name];
+      }
+      try { await loadConnections(); } catch { renderConnections(state.connections); }
+      if (result) {
+        if (result.ok && !(result.warnings || []).length) toast("ok", name + ": connected", result.message);
+        else toast(result.ok ? "info" : "error", name + ": " + (TEST_LABELS[result.code] || result.code), testSummary(result));
+      }
+      return result;
     }
     function versionChip(status) {
       if (status === "latest") return ["Up to date", "ok"];
@@ -1345,6 +1417,7 @@ export function renderControlPlaneHtml(token = "") {
       $("connSessionReconnectAttempts").value = s.sessionReconnectAttempts ? String(s.sessionReconnectAttempts) : "";
       $("overridesDisclosure").open = Boolean(s.sessionIdleMinutes || s.sessionPingSeconds || s.sessionReconnectAttempts);
       $("connectionError").classList.remove("show");
+      renderTestResult(null);
       document.querySelectorAll("#connectionForm .field").forEach(f => f.classList.remove("invalid"));
       const dialog = $("connectionDialog");
       if (typeof dialog.showModal === "function") dialog.showModal(); else dialog.setAttribute("open", "open");
@@ -1363,6 +1436,10 @@ export function renderControlPlaneHtml(token = "") {
       if (!conn) return;
       if (action === "edit") {
         openConnectionDialog("edit", conn);
+        return;
+      }
+      if (action === "test") {
+        await testSavedConnection(name, btn);
         return;
       }
       if (action === "delete") {
@@ -1430,8 +1507,43 @@ export function renderControlPlaneHtml(token = "") {
         } catch (err) {
           $("connectionError").textContent = errorMessage(err);
           $("connectionError").classList.add("show");
+          return;
+        }
+        // One check after saving, so the list shows whether the details work.
+        testSavedConnection(name);
+      });
+    }
+    async function testConnectionFromDialog() {
+      $("connectionError").classList.remove("show");
+      let first = null;
+      const check = (id, valid) => {
+        $(id).closest(".field").classList.toggle("invalid", !valid);
+        if (!valid && !first) first = $(id);
+      };
+      check("connUser", Boolean($("connUser").value.trim()));
+      check("connHost", Boolean($("connHost").value.trim()));
+      const port = Number($("connPort").value || 22);
+      check("connPort", Number.isInteger(port) && port >= 1 && port <= 65535);
+      if (first) { first.focus(); return; }
+      const payload = {
+        name: state.editingName || undefined,
+        host: $("connHost").value.trim(),
+        port,
+        username: $("connUser").value.trim(),
+        privateKeyPath: $("connKeyPath").value.trim() || undefined,
+        password: $("connPassword").value || undefined
+      };
+      renderTestResult(null);
+      await withLoading($("testConnectionBtn"), async () => {
+        try {
+          const result = (await api("/api/connections/test", { method: "POST", body: JSON.stringify(payload) })).result;
+          renderTestResult(result);
+        } catch (err) {
+          $("connectionError").textContent = errorMessage(err);
+          $("connectionError").classList.add("show");
         }
       });
+      $("connectionTestResult").scrollIntoView({ block: "nearest" });
     }
 
     /* Settings */
@@ -1591,6 +1703,7 @@ export function renderControlPlaneHtml(token = "") {
     $("emptyAddConnectionBtn").addEventListener("click", () => openConnectionDialog("add", {}));
     $("connectionForm").addEventListener("submit", saveConnectionFromDialog);
     $("cancelConnectionBtn").addEventListener("click", closeConnectionDialog);
+    $("testConnectionBtn").addEventListener("click", testConnectionFromDialog);
     $("closeConnectionDialogBtn").addEventListener("click", closeConnectionDialog);
     ["connName", "connUser", "connHost", "connPort"].forEach(id => $(id).addEventListener("input", () => $(id).closest(".field").classList.remove("invalid")));
     $("connectionDialog").addEventListener("click", e => { if (e.target === e.currentTarget) closeConnectionDialog(); });
