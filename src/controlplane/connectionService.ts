@@ -1,6 +1,7 @@
 import { ConfigStore, ConnectionPolicy, StoredConnection } from "../config/store.js";
 import { deletePassword, getPassword, setPassword } from "../security/credentialStore.js";
 import { ControlPlaneError } from "./errors.js";
+import { ConnectionTestResult, ConnectionTestTarget, testConnection } from "./connectionTest.js";
 
 /** True when host, port or username differ (host compared case-insensitively). */
 export function connectionEndpointChanged(
@@ -27,11 +28,83 @@ export type ConnectionUpsertInput = {
   storePassword?: boolean;
 };
 
+export type ConnectionTestInput = {
+  /** Saved connection whose stored password may be used when none is given. */
+  name?: string;
+  host: string;
+  port?: number;
+  username: string;
+  password?: string;
+  privateKeyPath?: string;
+};
+
 export class ConnectionService {
-  constructor(private readonly store: ConfigStore) {}
+  /** Last test result per saved connection, kept in memory only. */
+  private readonly lastTests = new Map<string, ConnectionTestResult>();
+  /** Endpoints with a test in progress, so a double click signs on once. */
+  private readonly running = new Set<string>();
+
+  constructor(
+    private readonly store: ConfigStore,
+    private readonly runTest: (target: ConnectionTestTarget) => Promise<ConnectionTestResult> = testConnection
+  ) {}
 
   async list() {
-    return this.store.listConnections();
+    const list = await this.store.listConnections();
+    return list.map(conn => {
+      const lastTest = this.lastTests.get(conn.name);
+      return lastTest ? { ...conn, lastTest } : conn;
+    });
+  }
+
+  /** Tests a saved connection with its stored details and password. */
+  async testSaved(name: string) {
+    const stored = await this.store.getConnection(name);
+    if (!stored) throw new ControlPlaneError(404, `Connection ${name} not found`);
+    const password = await getPassword(name).catch(() => undefined);
+    const result = await this.guardedTest({
+      host: stored.host,
+      port: stored.port,
+      username: stored.username,
+      password: password || undefined,
+      privateKeyPath: stored.privateKeyPath
+    });
+    this.lastTests.set(name, result);
+    return result;
+  }
+
+  /**
+   * Tests details that may not be saved yet (the add and edit form). A saved
+   * password is only used for the same host, port and user it was saved for.
+   */
+  async testDetails(input: ConnectionTestInput) {
+    const host = typeof input?.host === "string" ? input.host.trim() : "";
+    const username = typeof input?.username === "string" ? input.username.trim() : "";
+    if (!host || !username) throw new ControlPlaneError(400, "host and username are required");
+    const port = Number(input.port || 22);
+    let password = typeof input.password === "string" && input.password ? input.password : undefined;
+    const name = typeof input.name === "string" ? input.name.trim() : "";
+    const stored = name ? await this.store.getConnection(name) : undefined;
+    if (!password && stored && !connectionEndpointChanged(stored, { host, port, username })) {
+      password = (await getPassword(name).catch(() => undefined)) || undefined;
+    }
+    const privateKeyPath = typeof input.privateKeyPath === "string" && input.privateKeyPath.trim()
+      ? input.privateKeyPath.trim()
+      : undefined;
+    return this.guardedTest({ host, port, username, password, privateKeyPath });
+  }
+
+  private async guardedTest(target: ConnectionTestTarget) {
+    const key = [target.host.trim().toLowerCase(), Number(target.port || 22), target.username.trim().toUpperCase()].join("|");
+    if (this.running.has(key)) {
+      throw new ControlPlaneError(409, "A test of this connection is already running");
+    }
+    this.running.add(key);
+    try {
+      return await this.runTest(target);
+    } finally {
+      this.running.delete(key);
+    }
   }
 
   async get(name: string) {
@@ -90,6 +163,10 @@ export class ConnectionService {
     }
 
     await this.store.upsertConnection(next);
+    // An earlier result says nothing about new details or a new password.
+    if (endpointChanged || newPassword || next.privateKeyPath !== existing.privateKeyPath) {
+      this.lastTests.delete(name);
+    }
     if (newPassword && (input.storePassword || endpointChanged)) {
       if (input.storePassword === false) {
         // The caller does not want it stored; drop the old one so it is not
@@ -124,17 +201,22 @@ export class ConnectionService {
       await setPassword(newName, password);
     }
     await deletePassword(oldName);
+    const lastTest = this.lastTests.get(oldName);
+    this.lastTests.delete(oldName);
+    if (lastTest) this.lastTests.set(newName, lastTest);
     return this.get(newName);
   }
 
   async delete(name: string) {
     await this.store.deleteConnection(name);
     await deletePassword(name);
+    this.lastTests.delete(name);
   }
 
   async setConnectionPassword(name: string, password: string) {
     const existing = await this.store.getConnection(name);
     if (!existing) throw new Error(`Connection ${name} not found`);
     await setPassword(name, password);
+    this.lastTests.delete(name);
   }
 }

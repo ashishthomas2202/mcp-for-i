@@ -7,7 +7,7 @@ import { URL } from "url";
 import { fileURLToPath } from "url";
 import { ConfigStore, Settings, getConfigDir } from "../config/store.js";
 import { getCredentialStoreStatus } from "../security/credentialStore.js";
-import { ConnectionService, ConnectionUpsertInput } from "./connectionService.js";
+import { ConnectionService, ConnectionTestInput, ConnectionUpsertInput } from "./connectionService.js";
 import { RuntimeService } from "./runtimeService.js";
 import { ClientIntegrationService } from "./clientIntegrationService.js";
 import { renderControlPlaneHtml } from "./ui.js";
@@ -302,6 +302,20 @@ async function routeRequest(req: IncomingMessage, res: ServerResponse, services:
     const body = await readJson(req);
     const created = await services.connections.add(body as ConnectionUpsertInput);
     sendJson(res, 201, { connection: created });
+    return;
+  }
+
+  if (method === "POST" && pathname === "/api/connections/test") {
+    const body = await readJson(req);
+    const result = await services.connections.testDetails(body as ConnectionTestInput);
+    sendJson(res, 200, { result });
+    return;
+  }
+
+  const matchTest = pathname.match(/^\/api\/connections\/([^/]+)\/test$/);
+  if (matchTest && method === "POST") {
+    const result = await services.connections.testSaved(decodeURIComponent(matchTest[1]));
+    sendJson(res, 200, { result });
     return;
   }
 
