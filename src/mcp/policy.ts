@@ -356,6 +356,9 @@ export function assertSafeIfsTargetPath(value: unknown, operation: string, verb 
   if (segments[0] === "qsys.lib" && segments.length === 2) {
     throw refuse(`cannot ${verb} a library through the IFS (${normalized})`);
   }
+  if (segments[0] === "home" && segments.length === 2) {
+    throw refuse(`cannot ${verb} a user home directory (${normalized})`);
+  }
   if ((segments[0] === "qopensys" || segments[0] === "qibm") && segments.length === 2) {
     throw refuse(`cannot ${verb} system directory ${normalized}`);
   }

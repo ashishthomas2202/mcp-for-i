@@ -410,8 +410,16 @@ export function getTools() {
     },
     {
       name: "ibmi.ifs.delete",
-      description: "Delete an IFS file or directory.",
-      inputSchema: { type: "object", properties: { path: { type: "string" }, recursive: { type: "boolean" } }, required: ["path"] }
+      description: "Delete an IFS file or directory. A recursive delete needs confirmPath equal to path and is refused for paths less than three levels deep (for example /home/USER).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          recursive: { type: "boolean" },
+          confirmPath: { type: "string", description: "Required with recursive=true: repeat the exact path to confirm the delete." }
+        },
+        required: ["path"]
+      }
     },
     {
       name: "ibmi.ifs.upload",
@@ -1666,6 +1674,15 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const conn = await ctx.ensureActive(args?.connectionName);
       enforceWritable(ctx, conn, "ifs.delete", args);
       const deletePath = assertSafeIfsDeletePath(args.path);
+      if (args.recursive) {
+        // A recursive delete removes a whole tree, so it must be deep enough and confirmed.
+        if (deletePath.split("/").filter(Boolean).length < 3) {
+          throw new Error(`ifs.delete refused: recursive deletes need a path at least three levels deep (${deletePath})`);
+        }
+        if (typeof args.confirmPath !== "string" || args.confirmPath.trim().replace(/\/+$/, "") !== deletePath) {
+          throw new Error("ifs.delete refused: recursive deletes need confirmPath set to the exact path being deleted");
+        }
+      }
       const flag = args.recursive ? "-rf" : "-f";
       requireCommandSuccess(await conn.sendCommand({ command: `rm ${flag} ${Tools.escapePath(deletePath)}` }), "rm");
       return result("OK");

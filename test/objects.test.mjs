@@ -290,7 +290,7 @@ test("ifs.copy reads from system paths but refuses system destinations", async (
   }
   await assert.rejects(handleTool(ctx, "ibmi.ifs.copy", { sourcePath: "/", destinationPath: "/home/dev/root" }), /root/);
   await assert.rejects(handleTool(ctx, "ibmi.ifs.copy", { sourcePath: "/home", destinationPath: "/home/dev/x", recursive: true }), /top-level/);
-  await assert.rejects(handleTool(ctx, "ibmi.ifs.copy", { sourcePath: "/home/dev", destinationPath: "/home/dev/sub", recursive: true }), /inside sourcePath/);
+  await assert.rejects(handleTool(ctx, "ibmi.ifs.copy", { sourcePath: "/home/dev/proj", destinationPath: "/home/dev/proj/sub", recursive: true }), /inside sourcePath/);
 });
 
 test("ifs.move guards both paths", async () => {

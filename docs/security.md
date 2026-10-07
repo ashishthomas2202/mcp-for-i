@@ -78,6 +78,8 @@ Tools that touch files on your PC only accept paths inside the allowed local roo
 
 `ibmi.ifs.delete` refuses empty or relative paths, paths containing `..` or wildcards, `/`, any top-level directory, `/QSYS.LIB/<lib>.LIB`, second-level directories under `/QOpenSys` and `/QIBM`, and IBM product and system library locations.
 
+It also refuses user home directories (`/home/<user>`). A recursive delete must name a path at least three levels deep (for example `/home/USER/work`) and repeat it in `confirmPath`, because `rm -rf` on a home or project folder cannot be undone.
+
 ## Shell quoting
 
 Action commands in the `ile` environment are passed to `system` as a single-quoted shell word, so quotes, backticks and `$` in a command or target path cannot start another shell command. Streamfile action targets must be absolute IFS paths without quotes, backticks, `$`, backslashes, `;`, `|`, `&`, `<`, `>` or control characters.
