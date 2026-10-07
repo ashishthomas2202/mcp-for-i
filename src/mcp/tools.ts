@@ -1,5 +1,6 @@
 import { McpContext } from "./context.js";
 import { findToolModule, toolModules } from "./modules/index.js";
+import { withAnnotations } from "./annotations.js";
 import { runActionTool } from "./modules/compile.js";
 import { parseEvfevent } from "../ibmi/evfevent.js";
 import { LocalLanguageActions } from "../ibmi/LocalLanguageActions.js";
@@ -1465,7 +1466,8 @@ export function getTools() {
   return [...tools, ...toolModules.flatMap(module => module.tools)]
     .map(withGuardedApprovalHint)
     .map(withSourceConnectionName)
-    .map(withStrictInputSchema);
+    .map(withStrictInputSchema)
+    .map(withAnnotations);
 }
 
 export async function handleTool(ctx: McpContext, name: string, args: any) {
