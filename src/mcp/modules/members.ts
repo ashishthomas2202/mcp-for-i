@@ -101,6 +101,20 @@ async function memberExists(conn: any, library: string, sourceFile: string, memb
   return Array.isArray(rows) && rows.length > 0;
 }
 
+async function memberAttributes(conn: any, library: string, sourceFile: string, member: string) {
+  const rows = await conn.runSQL(
+    `select SOURCE_TYPE, PARTITION_TEXT from QSYS2.SYSPARTITIONSTAT where SYSTEM_TABLE_SCHEMA = ${Tools.sqlString(library)} ` +
+    `and SYSTEM_TABLE_NAME = ${Tools.sqlString(sourceFile)} and SYSTEM_TABLE_MEMBER = ${Tools.sqlString(member)} ` +
+    `fetch first 1 rows only`
+  ).catch(() => []);
+  const row = Array.isArray(rows) && rows[0] ? rows[0] : {};
+  const srctype = String(row.SOURCE_TYPE ?? "").trim().toUpperCase();
+  return {
+    srctype: /^[A-Z0-9_]{1,10}$/.test(srctype) ? srctype : "",
+    text: String(row.PARTITION_TEXT ?? "").trim()
+  };
+}
+
 async function handle(ctx: McpContext, name: string, args: any) {
   args = args || {};
   const conn = await ctx.ensureActive(args.connectionName);
@@ -129,7 +143,20 @@ async function handle(ctx: McpContext, name: string, args: any) {
         `CPYSRCF FROMFILE(${library}/${sourceFile}) TOFILE(${toLibrary}/${toSourceFile}) ` +
         `FROMMBR(${member}) TOMBR(${toMember}) MBROPT(*REPLACE)`;
       try {
-        return commandOutcome(await runCheckedCl(ctx, conn, args, command));
+        const copied = await runCheckedCl(ctx, conn, args, command);
+        if (copied.code === 0) {
+          // CPYSRCF does not carry the source type or text to a new member.
+          const attributes = await memberAttributes(conn, library, sourceFile, member);
+          if (attributes.srctype || attributes.text) {
+            const change =
+              `CHGPFM FILE(${toLibrary}/${toSourceFile}) MBR(${toMember})` +
+              (attributes.srctype ? ` SRCTYPE(${attributes.srctype})` : "") +
+              (attributes.text ? ` TEXT(${clTextValue(attributes.text)})` : "");
+            const changed = await runCheckedCl(ctx, conn, args, change);
+            if (changed.code !== 0) return commandOutcome(changed);
+          }
+        }
+        return commandOutcome(copied);
       } finally {
         invalidate(conn, toLibrary, toSourceFile, toMember);
       }

@@ -4288,6 +4288,10 @@ async function listRemoteFiles(conn: any, remoteRoot: string): Promise<Map<strin
   const find = conn.remoteFeatures.find || "/QOpenSys/pkgs/bin/find";
   const stat = conn.remoteFeatures.stat;
 
+  // A remote root that does not exist yet is an empty tree (first deploy).
+  const exists = await conn.sendCommand({ command: `test -d ${Tools.escapePath(normalizedRoot)}` });
+  if (exists.code !== 0) return new Map<string, DeployFileMeta>();
+
   if (stat) {
     const statCmd = `${find} ${Tools.escapePath(normalizedRoot)} -type f -exec ${stat} -c '%n|%s' {} \\;`;
     const statRes = await conn.sendCommand({ command: statCmd });

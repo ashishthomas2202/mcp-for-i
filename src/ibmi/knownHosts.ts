@@ -2,6 +2,7 @@ import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
 import { getConfigDir } from "../config/store.js";
+import { writeFileAtomic } from "../util/atomicWrite.js";
 
 /**
  * Trust-on-first-use SSH host key store (also holds pinned TLS certificates
@@ -126,14 +127,8 @@ export async function readKnownHosts(filePath: string): Promise<KnownHostsFile> 
 
 export async function writeKnownHosts(filePath: string, data: KnownHostsFile) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const tmp = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(data, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
-  try {
-    await fs.rename(tmp, filePath);
-  } catch (err) {
-    await fs.rm(tmp, { force: true }).catch(() => undefined);
-    throw err;
-  }
+  // Retries the rename on Windows sharing errors (antivirus, indexer).
+  await writeFileAtomic(filePath, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
 }
 
 let queue: Promise<unknown> = Promise.resolve();
