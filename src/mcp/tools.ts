@@ -1,5 +1,7 @@
 import { McpContext } from "./context.js";
 import { findToolModule, toolModules } from "./modules/index.js";
+import { runActionTool } from "./modules/compile.js";
+import { parseEvfevent } from "../ibmi/evfevent.js";
 import { LocalLanguageActions } from "../ibmi/LocalLanguageActions.js";
 import { CompileTools } from "../ibmi/CompileTools.js";
 import { Search } from "../ibmi/Search.js";
@@ -556,20 +558,33 @@ export function getTools() {
     },
     {
       name: "ibmi.actions.run",
-      description: "Run an action.",
+      description:
+        "Run an action (for example a compile) against a source member or an IFS streamfile. " +
+        "Member targets set &OPENLIB/&OPENSPF/&OPENMBR/&EXT/&NAME; streamfile targets set &FULLPATH/&RELATIVEPATH/&NAME/&EXT. " +
+        "When the command uses OPTION(*EVENTF) the EVFEVENT file is read and errors are returned grouped by file with line, column, severity and message id. " +
+        "Honours the action's deployFirst (with localWorkspace + remoteWorkspace), postDownload (to downloadTo or localWorkspace) and outputToFile. " +
+        "Set includeListing to also return the compile listing spooled file.",
       inputSchema: {
         type: "object",
         properties: {
           actionName: { type: "string" },
           action: ACTION_SCHEMA,
           targetType: { type: "string", enum: ["member", "streamfile", "file"] },
-          targetPath: { type: "string" },
+          targetPath: { type: "string", description: "Streamfile: absolute IFS path. Member: LIB/FILE/MEMBER[.TYPE] (or use library/sourceFile/member)." },
           library: { type: "string" },
           sourceFile: { type: "string" },
           member: { type: "string" },
-          extension: { type: "string" }
+          extension: { type: "string", description: "Member type (looked up when omitted) or streamfile extension." },
+          cwd: { type: "string", description: "Remote working directory for streamfile actions (default remoteWorkspace, then the home directory)." },
+          localWorkspace: { type: "string", description: "Local project folder, used by deployFirst, postDownload and relative outputToFile paths." },
+          remoteWorkspace: { type: "string", description: "IFS folder the local workspace deploys to." },
+          downloadTo: { type: "string", description: "Local folder for postDownload outputs (default localWorkspace)." },
+          evfeventLibrary: { type: "string", description: "Override the EVFEVENT library (default: the compiled object's library)." },
+          evfeventMember: { type: "string", description: "Override the EVFEVENT member (default: the compiled object's name)." },
+          includeListing: { type: "boolean", description: "Also return the compile listing spooled file." },
+          listingMaxLines: { type: "number" }
         },
-        required: ["targetType", "targetPath"]
+        required: ["targetType"]
       }
     }
     ,
@@ -816,7 +831,7 @@ export function getTools() {
     },
     {
       name: "ibmi.diagnostics.parseEvfevent",
-      description: "Parse EVFEVENT text into structured diagnostics.",
+      description: "Parse EVFEVENT (compiler events file) records into errors grouped by source file, with line, column, severity and message id. Errors in SQL precompiler temp files are mapped back to the original source.",
       inputSchema: { type: "object", properties: { content: { type: "string" } }, required: ["content"] }
     },
     {
@@ -1813,57 +1828,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return json(actions);
     }
     case "ibmi.actions.run": {
-      const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
-      const action = await resolveAction(ctx, args);
-      if (!action) throw new Error("Action not found");
-
-      const envVars: Record<string, string> = {};
-      const targetPath = args.targetPath as string;
-      const targetType = args.targetType as string;
-
-      if (targetType === "file") {
-        throw new Error("Local file actions are not supported in this MCP server (use streamfile or member).");
-      }
-
-      if (targetType === "streamfile") {
-        CompileTools.validateStreamfilePath(targetPath);
-        envVars["&FULLPATH"] = targetPath;
-        const base = targetPath.split("/").pop() || targetPath;
-        envVars["&BASENAME"] = base;
-        envVars["&NAME"] = base.includes(".") ? base.substring(0, base.lastIndexOf(".")) : base;
-        envVars["&EXT"] = base.includes(".") ? base.substring(base.lastIndexOf(".") + 1) : "";
-        envVars["&RELATIVEPATH"] = targetPath;
-      }
-
-      if (targetType === "member") {
-        const lib = requireQsysName(conn, args.library, "library");
-        const src = requireQsysName(conn, args.sourceFile, "sourceFile");
-        const mbr = requireQsysName(conn, args.member || targetPath.split("/").pop(), "member");
-        const ext = String(args.extension || "");
-        envVars["&LIBRARY"] = lib;
-        envVars["&SRCFILE"] = src;
-        envVars["&NAME"] = mbr;
-        envVars["&EXT"] = ext;
-        envVars["&EXTL"] = ext.toLowerCase();
-        envVars["&FULLPATH"] = `${lib}/${src}/${mbr}`;
-        envVars["&OPENLIB"] = lib;
-        envVars["&OPENLIBL"] = lib.toLowerCase();
-        envVars["&OPENSPF"] = src;
-        envVars["&OPENSPFL"] = src.toLowerCase();
-        envVars["&OPENMBR"] = mbr;
-        envVars["&OPENMBRL"] = mbr.toLowerCase();
-      }
-
-      const resultCmd = await CompileTools.runCommand(conn, {
-        command: action.command,
-        environment: action.environment,
-        env: envVars
-      }, {
-        commandConfirm: actionCommandGuard(ctx, action.environment, args)
-      });
-
-      return json(mapActionExecution(action, targetType, targetPath, resultCmd));
+      return runActionTool(ctx, args);
     }
     case "ibmi.actions.save": {
       const action = args.action as Action;
@@ -3021,7 +2986,7 @@ async function listActions(ctx: McpContext) {
   return [...builtins, ...custom];
 }
 
-async function resolveAction(ctx: McpContext, args: any): Promise<Action | undefined> {
+export async function resolveAction(ctx: McpContext, args: any): Promise<Action | undefined> {
   if (args.action) return args.action as Action;
   if (!args.actionName) return undefined;
   const actions = await listActions(ctx);
@@ -3985,7 +3950,7 @@ function result(text: string) {
   };
 }
 
-function json(obj: any) {
+export function json(obj: any) {
   return {
     content: [{ type: "text", text: JSON.stringify(obj, null, 2) }],
     structuredContent: { ok: true, data: obj }
@@ -4006,7 +3971,7 @@ function toolError(message: string, error?: Record<string, any>) {
   };
 }
 
-function jsonError(message: string, obj: any) {
+export function jsonError(message: string, obj: any) {
   return {
     isError: true,
     content: [{ type: "text", text: `${message}\n${JSON.stringify(obj, null, 2)}` }],
@@ -4020,7 +3985,7 @@ function jsonError(message: string, obj: any) {
 
 // Returns the payload as normal JSON when the command worked and as a tool
 // error (isError) when it did not, so agents can't mistake a failure for "OK".
-function commandOutcome(payload: { ok: boolean; command?: string; stderr?: unknown; [key: string]: unknown }) {
+export function commandOutcome(payload: { ok: boolean; command?: string; stderr?: unknown; [key: string]: unknown }) {
   if (payload.ok) return json(payload);
   const detail = String(payload.stderr || "").trim().split(/\r?\n/)[0] || "";
   const label = payload.command ? `Command failed: ${payload.command}` : "Command failed";
@@ -4186,7 +4151,7 @@ function getConnectionName(ctx: McpContext, args: any): string {
   return name;
 }
 
-function requireQsysName(conn: any, value: unknown, label: string) {
+export function requireQsysName(conn: any, value: unknown, label: string) {
   const raw = String(value || "").trim().toUpperCase();
   if (!raw) throw new Error(`${label} is required`);
   if (!conn.validQsysName(raw)) throw new Error(`Invalid ${label}: ${raw}`);
@@ -4438,7 +4403,7 @@ function joinRemotePath(root: string, rel: string) {
   return `${base}/${rel}`.replace(/\\/g, "/");
 }
 
-function mapActionExecution(action: Action, targetType: string, targetPath: string, result: any) {
+export function mapActionExecution(action: Action, targetType: string, targetPath: string, result: any) {
   const diagnostics = normalizeCommandDiagnostics(result);
   const code = Number(result?.code);
   const ok = Number.isFinite(code) ? code === 0 : false;
@@ -4504,7 +4469,7 @@ function normalizeJoblogRow(row: Record<string, unknown>) {
   };
 }
 
-function normalizeSpoolEntry(row: Record<string, unknown>) {
+export function normalizeSpoolEntry(row: Record<string, unknown>) {
   return {
     ...row,
     source: "spool",
@@ -4520,7 +4485,7 @@ function normalizeSpoolEntry(row: Record<string, unknown>) {
   };
 }
 
-function normalizeSpoolLine(row: Record<string, unknown>) {
+export function normalizeSpoolLine(row: Record<string, unknown>) {
   const position = pickFirst(row, ["ORDINAL_POSITION", "LINE_NUMBER"]);
   return {
     ...row,
@@ -4530,7 +4495,7 @@ function normalizeSpoolLine(row: Record<string, unknown>) {
   };
 }
 
-function clampNumber(value: unknown, fallback: number, min: number, max: number) {
+export function clampNumber(value: unknown, fallback: number, min: number, max: number) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(n)));
@@ -4604,7 +4569,7 @@ function isReadOnlySql(sql: string) {
   return checkReadOnlySql(sql).readOnly;
 }
 
-function enforceWritable(ctx: McpContext, conn: any, operation: string, args: any) {
+export function enforceWritable(ctx: McpContext, conn: any, operation: string, args: any) {
   if (conn.getConfig().readOnlyMode) throw new Error("Connection is in read-only mode");
   enforcePolicyOperation(ctx, operation, args);
 }
@@ -4860,7 +4825,7 @@ async function enforceResourcePolicy(ctx: McpContext, toolName: string, args: an
 }
 
 /** Check the policy against an action's expanded command before it runs. */
-function actionCommandGuard(ctx: McpContext, environment: string | undefined, args: any) {
+export function actionCommandGuard(ctx: McpContext, environment: string | undefined, args: any) {
   return async (expanded: string) => {
     const policy = ctx.getPolicy(args?.connectionName);
     const reason = (environment || "ile") === "ile"
@@ -4872,7 +4837,7 @@ function actionCommandGuard(ctx: McpContext, environment: string | undefined, ar
 }
 
 /** Resolve a local path and refuse it outside the allowed local roots. */
-async function guardLocalPath(ctx: McpContext, value: unknown, mode: LocalPathMode) {
+export async function guardLocalPath(ctx: McpContext, value: unknown, mode: LocalPathMode) {
   let settingsRoots: unknown;
   try {
     settingsRoots = ((await ctx.store.getSettings()) as any)?.allowedLocalRoots;
@@ -4999,26 +4964,3 @@ function resolveIfsWriteOperation(pathValue: unknown): string {
   }
   return "ifs.write";
 }
-
-function parseEvfevent(content: string) {
-  const diagnostics: Array<{ source: string; line?: number; column?: number; code?: string; severity: "INFO" | "WARN" | "ERROR"; message: string }> = [];
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.trimEnd();
-    if (!line.trim()) continue;
-    const match = line.match(/^\s*(\d+)\s+(\d+)\s+([A-Z0-9]+)\s+(INFO|WARN|ERROR)?\s*(.*)$/i);
-    if (match) {
-      diagnostics.push({
-        source: "evfevent",
-        line: Number(match[1]),
-        column: Number(match[2]),
-        code: match[3],
-        severity: ((match[4] || "ERROR").toUpperCase() as "INFO" | "WARN" | "ERROR"),
-        message: match[5] || line
-      });
-    } else {
-      diagnostics.push({ source: "evfevent", severity: inferSeverity(line), message: line });
-    }
-  }
-  return diagnostics;
-}
-

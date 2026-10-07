@@ -96,7 +96,7 @@ Version context: `0.1.13` development codebase.
 
 ### Actions, Filters, Profiles, Library List
 - `ibmi.actions.list`
-- `ibmi.actions.run`
+- `ibmi.actions.run` (compiles members or streamfiles and returns EVFEVENT errors by file; see docs/tools.md "Compile and errors")
 - `ibmi.actions.save`
 - `ibmi.actions.delete`
 - `ibmi.filters.list`
@@ -128,6 +128,7 @@ Version context: `0.1.13` development codebase.
 - `ibmi.sql.execute`
 - `ibmi.cl.run`
 - `ibmi.diagnostics.parseEvfevent`
+- `ibmi.compile.listing`
 - `ibmi.joblog.get`
 - `ibmi.spool.list`
 - `ibmi.spool.read`

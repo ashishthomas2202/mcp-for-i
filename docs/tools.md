@@ -210,3 +210,22 @@ The documentation catalog is also exposed through MCP resources: `ibmi-docs://ca
 - Sessions are stateful per IBM i connection.
 - `setField` supports `fieldId: "command"` (or `"1"` alias), then `sendKeys: "Enter"` to execute.
 - `sendKeys` supports guardrails through policy checks and optional `approve=true` for guarded operations.
+
+## Compile and errors
+- `ibmi.actions.run` (compile against a member or streamfile)
+- `ibmi.compile.listing`
+- `ibmi.diagnostics.parseEvfevent`
+
+### Compile Notes
+- Member targets: pass `targetType: "member"` and `targetPath: "LIB/FILE/MEMBER[.TYPE]"` (or `library`, `sourceFile`, `member`). The action gets `&OPENLIB`, `&OPENSPF`, `&OPENMBR` (and lowercase `&OPENLIBL`, `&OPENSPFL`, `&OPENMBRL`), `&EXT` (member type, looked up when not given), `&EXTL`, `&NAME`, `&NAMEL`, `&BASENAME`, `&SRCFILE` (`LIB/FILE`), `&SRCLIB`, `&SRCPF`.
+- Streamfile targets: `targetPath` is an absolute IFS path. The action gets `&FULLPATH`, `&RELATIVEPATH` (relative to the working directory), `&FILEDIR`, `&PARENT`, `&BASENAME`, `&NAME`, `&NAMEL`, `&EXT`, `&EXTL`. The working directory is `cwd`, else `remoteWorkspace`, else the home directory.
+- Built-in actions are typed `member` or `streamfile`; running one against the other kind of target is refused, and so is any command that still contains a target variable the target did not set (for example `&RELATIVEPATH` on a member).
+- Longer variable names are substituted first and a name only matches as a whole word, so `&EXT` does not corrupt `&EXTL`.
+- When the command uses `OPTION(*EVENTF)`, the EVFEVENT member is read from the library and name of the object the command creates (`PGM(`, `MODULE(`, `OBJ(`, `SRVPGM(`, `CMD(`, `FILE(` ...; `*CURLIB`/`*LIBL` resolve to the current library). Override with `evfeventLibrary` / `evfeventMember`. The result has `errors` (grouped by source file, each with `line`, `column`, `endLine`, `endColumn`, `severity`, `severityLevel`, `msgid`, `text`) and `errorSummary`.
+- `deployFirst`: with `localWorkspace` and `remoteWorkspace`, the workspace is pushed with `ibmi.deploy.sync` (`overwrite: true`) before the command runs. Without a local workspace the deploy is reported as skipped.
+- `postDownload`: listed paths (relative to the working directory, or absolute) are downloaded to `downloadTo` (default `localWorkspace`). Downloaded `.evfevent` files are parsed and merged into `errors`.
+- `outputToFile`: the command, exit code, stdout and stderr are written to this local path. `&LOCAL` or a relative path resolves against `localWorkspace`.
+- `includeListing: true` returns the compile listing: the newest spooled file named after the object (else `QSYSPRT`, else `QPJOBLOG`) owned by the user and created since the command started.
+- A failed command is returned as a tool error that names the first EVFEVENT error.
+- `ibmi.compile.listing` (read-only) fetches the same listing on its own: `objectName`, optional `userName`, `since` (IBM i timestamp) and `maxLines`.
+- `ibmi.diagnostics.parseEvfevent` parses EVFEVENT text (TIMESTAMP, PROCESSOR, FILEID, FILEEND, EXPANSION, ERROR records). Errors that the compiler reports against a temporary file such as `QTEMP/QSQLTEMP1` are mapped back to the original source line through the precompiler's EXPANSION records.
