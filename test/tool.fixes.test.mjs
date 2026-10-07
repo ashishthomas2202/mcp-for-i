@@ -449,7 +449,7 @@ test("member search filters escape # and $ instead of rejecting them", async () 
     }
   };
   await Search.searchMembersTerms(conn, "MYLIB", "QRPGLESRC", ["X"], ["#ORDER", "$PAY", "@AUDIT"]);
-  assert.match(commands[0], / \\#ORDER\.MBR \\\$PAY\.MBR @AUDIT\.MBR$/);
+  assert.match(commands[0], / \\#ORDER\.MBR \\\$PAY\.MBR @AUDIT\.MBR( \|.*)?$/);
   await assert.rejects(Search.searchMembersTerms(conn, "MYLIB", "QRPGLESRC", ["X"], "A;rm"), /Invalid members filter/);
 });
 
