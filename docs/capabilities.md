@@ -68,8 +68,13 @@ Version context: `0.1.13` development codebase.
 - `ibmi.qsys.members.create`
 - `ibmi.qsys.members.rename`
 - `ibmi.qsys.members.delete`
+- `ibmi.qsys.members.copy`
+- `ibmi.qsys.members.changeText`
+- `ibmi.qsys.members.changeType`
 - `ibmi.qsys.sourcefiles.create`
 - `ibmi.qsys.libraries.create`
+- `ibmi.objects.copy`, `ibmi.objects.move`, `ibmi.objects.rename`, `ibmi.objects.delete`, `ibmi.objects.changeDescription`
+- `ibmi.libraries.copy`
 - Legacy-compatible member list/read responses plus opt-in filtered paging, ranged reads, metadata, version/hash checks, caching, and complete fallback reads.
 
 ### IFS Operations
@@ -78,6 +83,8 @@ Version context: `0.1.13` development codebase.
 - `ibmi.ifs.write`
 - `ibmi.ifs.mkdir`
 - `ibmi.ifs.delete`
+- `ibmi.ifs.copy`
+- `ibmi.ifs.move`
 - `ibmi.ifs.upload`
 - `ibmi.ifs.download`
 

@@ -3061,7 +3061,7 @@ type ClCommandResult = {
   [key: string]: unknown;
 };
 
-async function runClCommand(conn: any, command: string, environment: string, cwd: string | undefined, timeoutMs: number): Promise<ClCommandResult> {
+export async function runClCommand(conn: any, command: string, environment: string, cwd: string | undefined, timeoutMs: number): Promise<ClCommandResult> {
   if (environment === "pase") {
     return await withTimeout(
       conn.sendCommand({ command, directory: cwd }),
@@ -4135,21 +4135,21 @@ function rejectCredentialArgs(args: any, toolName: string) {
   }
 }
 
-function result(text: string) {
+export function result(text: string) {
   return {
     content: [{ type: "text", text }],
     structuredContent: { ok: true, text }
   };
 }
 
-function json(obj: any) {
+export function json(obj: any) {
   return {
     content: [{ type: "text", text: JSON.stringify(obj, null, 2) }],
     structuredContent: { ok: true, data: obj }
   };
 }
 
-function toolError(message: string, error?: Record<string, any>) {
+export function toolError(message: string, error?: Record<string, any>) {
   return {
     isError: true,
     content: [{ type: "text", text: message }],
@@ -4177,14 +4177,14 @@ function jsonError(message: string, obj: any) {
 
 // Returns the payload as normal JSON when the command worked and as a tool
 // error (isError) when it did not, so agents can't mistake a failure for "OK".
-function commandOutcome(payload: { ok: boolean; command?: string; stderr?: unknown; [key: string]: unknown }) {
+export function commandOutcome(payload: { ok: boolean; command?: string; stderr?: unknown; [key: string]: unknown }) {
   if (payload.ok) return json(payload);
   const detail = String(payload.stderr || "").trim().split(/\r?\n/)[0] || "";
   const label = payload.command ? `Command failed: ${payload.command}` : "Command failed";
   return jsonError(detail ? `${label} (${detail})` : label, payload);
 }
 
-function requireCommandSuccess(res: any, label: string) {
+export function requireCommandSuccess(res: any, label: string) {
   if (!res || res.code !== 0) {
     const detail = String(res?.stderr || res?.stdout || "").trim();
     throw new Error(`${label} failed (exit ${res?.code ?? "unknown"})${detail ? `: ${detail}` : ""}`);
@@ -4687,7 +4687,7 @@ function normalizeSpoolLine(row: Record<string, unknown>) {
   };
 }
 
-function clampNumber(value: unknown, fallback: number, min: number, max: number) {
+export function clampNumber(value: unknown, fallback: number, min: number, max: number) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(n)));
@@ -4761,7 +4761,7 @@ function isReadOnlySql(sql: string) {
   return checkReadOnlySql(sql).readOnly;
 }
 
-function enforceWritable(ctx: McpContext, conn: any, operation: string, args: any) {
+export function enforceWritable(ctx: McpContext, conn: any, operation: string, args: any) {
   if (conn.getConfig().readOnlyMode) throw new Error("Connection is in read-only mode");
   enforcePolicyOperation(ctx, operation, args);
 }
@@ -4804,11 +4804,11 @@ function requireIfsJournalObjectType(value: unknown) {
   return objectType;
 }
 
-function quoteClString(value: string) {
+export function quoteClString(value: string) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
-function requireIbmObjectName(value: unknown, label: string) {
+export function requireIbmObjectName(value: unknown, label: string) {
   const name = String(value || "").trim().toUpperCase();
   if (!/^[A-Z#@$][A-Z0-9#@$]{0,9}$/.test(name)) {
     throw new Error(`Invalid ${label}: ${value}`);
@@ -5149,7 +5149,7 @@ function isObjectSchema(schema: JsonSchema) {
   return schema.type === "object";
 }
 
-function resolveIfsWriteOperation(pathValue: unknown): string {
+export function resolveIfsWriteOperation(pathValue: unknown): string {
   const target = String(pathValue || "");
   if (/^\/qsys\.lib\//i.test(target)) {
     return "qsys.write";
