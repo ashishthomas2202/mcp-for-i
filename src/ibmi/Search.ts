@@ -20,6 +20,18 @@ export namespace Search {
     return searchMembersTerms(connection, library, sourceFile, [searchTerm], members, readOnly);
   }
 
+  export const MEMBER_SEARCH_DEFAULT_MAX_MATCHES = 100;
+  export const MEMBER_SEARCH_MAX_MATCHES = 1_000;
+
+  export type MemberSearchResults = SearchResults & {
+    terms: string[];
+    matchCount: number;
+    maxMatches: number;
+    truncated: boolean;
+    truncatedReason?: "max-matches" | "output-limit";
+    warnings?: string[];
+  };
+
   export async function searchMembersTerms(
     connection: IBMiClient,
     library: string,
@@ -27,8 +39,8 @@ export namespace Search {
     searchTerms: string[],
     members: string | Array<string | IBMiMember>,
     readOnly?: boolean,
-    options?: { caseSensitive?: boolean; before?: number; after?: number }
-  ): Promise<SearchResults & { terms: string[] }> {
+    options?: { caseSensitive?: boolean; before?: number; after?: number; maxMatches?: number }
+  ): Promise<MemberSearchResults> {
     const lib = String(library || "").trim().toUpperCase();
     const src = String(sourceFile || "").trim().toUpperCase();
     if (!connection.validQsysName(lib)) {
@@ -68,17 +80,27 @@ export namespace Search {
       }
     }
 
+    const before = clampCount(options?.before, 0, 50, 0);
+    const after = clampCount(options?.after, 0, 50, 0);
+    const maxMatches = clampCount(options?.maxMatches, 1, MEMBER_SEARCH_MAX_MATCHES, MEMBER_SEARCH_DEFAULT_MAX_MATCHES);
     const contextFlags = [
-      options?.before ? `-B ${Math.max(0, Math.min(50, Math.floor(options.before)))}` : "",
-      options?.after ? `-A ${Math.max(0, Math.min(50, Math.floor(options.after)))}` : ""
+      before ? `-B ${before}` : "",
+      after ? `-A ${after}` : ""
     ].filter(Boolean).join(" ");
-    // Pass patterns over stdin for both single- and multi-term searches. This
-    // avoids shell expansion and keeps the command shape constant.
-    const flags = "-F -f -";
+    // pfgrep documents -F (literal), -f - (patterns from stdin, one per line),
+    // -m (matches per member), -A/-B (context), -n, -H, -i and -r, all with
+    // grep semantics. Patterns go over stdin so terms never reach the shell.
+    // -m stops each member early; one extra match per member reveals whether
+    // the cap cut anything off. The total across members is bounded by head,
+    // which ends the grep as soon as enough lines have been produced.
+    const flags = `-F -m ${maxMatches + 1} -f -`;
     const modeFlags = options?.caseSensitive ? "-nHr" : "-inHr";
-    const command = pfgrep
+    const outputLineLimit = (maxMatches + 1) * (before + after + 2);
+    const grep = connection.remoteFeatures.grep || "/usr/bin/grep";
+    const searchCommand = pfgrep
       ? `${pfgrep} ${modeFlags} ${contextFlags} ${flags} ${memberFilter}`
-      : `/usr/bin/grep ${options?.caseSensitive ? "-nHR" : "-inHR"} ${contextFlags} ${flags} ${memberFilter}`;
+      : `${grep} ${options?.caseSensitive ? "-nHR" : "-inHR"} ${contextFlags} ${flags} ${memberFilter}`;
+    const command = `${searchCommand.replace(/\s+/g, " ")} | /QOpenSys/usr/bin/head -n ${outputLineLimit}`;
 
     const result: CommandResult = await connection.sendCommand({
       command,
@@ -86,20 +108,70 @@ export namespace Search {
       stdin: terms.join("\n")
     });
 
-    if (!result.stderr) {
-      let hits = parseGrepOutput(result.stdout || '', readOnly);
-
-      if (detailedMembers) {
-        hits = hits.filter(hit => {
-          const hitMember = parseHitPath(hit);
-          return detailedMembers!.some(member => member.name === hitMember.name && member.library === hitMember.library && member.file === hitMember.file);
-        });
-      }
-
-      return { term: terms[0]!, terms, hits };
+    const stdout = result.stdout || "";
+    if (result.stderr && !stdout.trim()) {
+      throw new Error(result.stderr || "Search failed");
     }
 
-    throw new Error(result.stderr || "Search failed");
+    const outputLines = stdout.split("\n").filter(line => line.length > 0);
+    const parsed = parseMemberGrepOutput(stdout, maxMatches, readOnly);
+    let hits = parsed.hits;
+
+    if (detailedMembers) {
+      hits = hits.filter(hit => {
+        const hitMember = parseHitPath(hit);
+        return detailedMembers!.some(member => member.name === hitMember.name && member.library === hitMember.library && member.file === hitMember.file);
+      });
+    }
+
+    const outputLimited = outputLines.length >= outputLineLimit;
+    const truncated = parsed.truncated || outputLimited;
+    return {
+      term: terms[0]!,
+      terms,
+      hits,
+      matchCount: parsed.matchCount,
+      maxMatches,
+      truncated,
+      ...(truncated ? { truncatedReason: parsed.truncated ? "max-matches" as const : "output-limit" as const } : {}),
+      ...(result.stderr ? { warnings: [String(result.stderr).trim()] } : {})
+    };
+  }
+
+  // Parses grep-style output where matching lines use "path:line:text" and
+  // context lines use "path-line-text". Keeps at most maxMatches matches and
+  // the context that belongs to them.
+  function parseMemberGrepOutput(output: string, maxMatches: number, readonly?: boolean) {
+    const hits: SearchHit[] = [];
+    let matchCount = 0;
+    let truncated = false;
+    for (const line of output.split("\n")) {
+      if (!line || line === "--" || line.startsWith("Binary")) continue;
+      const parsed = /^(.*?)([:-])(\d+)\2(.*)$/.exec(line);
+      if (!parsed) continue;
+      const kind = parsed[2] === ":" ? "match" : "context";
+      if (kind === "match") {
+        if (matchCount >= maxMatches) {
+          truncated = true;
+          break;
+        }
+        matchCount++;
+      }
+      const path = parsed[1];
+      let hit = hits.find(entry => entry.path === path);
+      if (!hit) {
+        hit = { path, lines: [], readonly };
+        hits.push(hit);
+      }
+      hit.lines.push({ number: Number(parsed[3]), content: parsed[4], kind });
+    }
+    return { hits, matchCount, truncated };
+  }
+
+  function clampCount(value: unknown, minimum: number, maximum: number, fallback: number) {
+    const parsed = Number(value);
+    if (value === undefined || value === null || !Number.isFinite(parsed)) return fallback;
+    return Math.max(minimum, Math.min(maximum, Math.floor(parsed)));
   }
 
   export type IfsSearchResults = SearchResults & { exitCode: number; warnings?: string[] };

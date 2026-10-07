@@ -19,6 +19,8 @@ Default settings (editable in the config file):
 - `autoClearTempData`: boolean
 - `sourceFileCCSID`: string (default `*FILE`)
 - `enableSourceDates`: boolean (Phase 2+)
+- `sourceReadMaxBytes`: number (default `2000000`): largest member, in UTF-8 bytes after trimming trailing blanks, that a full `members.read` returns. Larger members fail with `SOURCE_TOO_LARGE` and the agent is told to read line ranges or search instead. `0` disables the byte cap.
+- `sourceReadMaxLines`: number (default `50000`): the same cap in lines. Checked against the catalog row count before any content is downloaded. `0` disables the line cap.
 - `homeDirectory`: string
 - `libraryList`: string[]
 - `currentLibrary`: string
