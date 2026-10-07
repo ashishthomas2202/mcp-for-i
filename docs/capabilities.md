@@ -28,7 +28,7 @@ Version context: `0.1.13` development codebase.
 ### 1.4 Agent-Safe Structured Results
 - Tool responses expose structured payloads for automation.
 - SQL/CL/diagnostic outputs normalized where applicable.
-- TN5250 state model includes machine-readable fields/history.
+- TN5250 screens are returned as text rows plus machine-readable fields (position, label, protected/hidden flags); hidden field contents are never returned.
 
 ### 1.5 Auditing and Compliance Foundations
 - Tamper-evident hash-chain audit record for tool calls.
@@ -176,8 +176,8 @@ Version context: `0.1.13` development codebase.
 - `ibmi.journal.endIfs`
 - `ibmi.journal.receivers.retention`
 
-### TN5250 Command Session (CL console)
-These tools are a simulated CL command console: the command field runs through QCMDEXC. They are not real 5250 emulation and cannot display or drive green-screen programs. ENTER is subject to read-only mode and the command policy.
+### TN5250 (5250 green-screen sessions)
+A real TN5250 client: connects to the saved connection's host on port 23 (or 992 with TLS), reads the actual screen and fields, fills fields and presses keys (Enter, F1-F24, PageUp/PageDown, Clear, Help, Attn, SysReq). Optional sign-on uses the stored credentials. AID keys go through the write gate: read-only connections cannot press them, and text on a `===>` command line is checked against the command policy. See [tools](tools.md#tn5250-notes) for details and limits.
 
 - `ibmi.tn5250.connect`
 - `ibmi.tn5250.readScreen`

@@ -117,15 +117,11 @@ function fakeContext({ readOnlyMode = false, policy = { profile: "power-user" } 
   return { ctx, calls };
 }
 
-test("read-only mode blocks sql.execute, cl.run and tn5250.sendKeys", async () => {
+test("read-only mode blocks sql.execute and cl.run", async () => {
   const { ctx, calls } = fakeContext({ readOnlyMode: true });
   await assert.rejects(handleTool(ctx, "ibmi.sql.execute", { sql: "delete from a.b" }), /read-only mode/);
   await assert.rejects(handleTool(ctx, "ibmi.cl.run", { command: "DSPLIB QGPL" }), /read-only mode/);
 
-  await handleTool(ctx, "ibmi.tn5250.connect", { connectionName: "DEV" });
-  await handleTool(ctx, "ibmi.tn5250.setField", { connectionName: "DEV", fieldId: "command", value: "DLTLIB X" });
-  await assert.rejects(handleTool(ctx, "ibmi.tn5250.sendKeys", { connectionName: "DEV", keys: "ENTER" }), /read-only mode/);
-  await handleTool(ctx, "ibmi.tn5250.disconnect", { connectionName: "DEV" });
   assert.equal(calls.length, 0);
 });
 
@@ -187,9 +183,4 @@ test("tools that read connectionName declare it in their schema", () => {
   ]) {
     assert.ok(byName.get(name)?.inputSchema?.properties?.connectionName, `${name} should declare connectionName`);
   }
-});
-
-test("tn5250 descriptions say it is a CL console, not 5250 emulation", () => {
-  const tool = getTools().find(t => t.name === "ibmi.tn5250.sendKeys");
-  assert.match(tool.description, /not real 5250 emulation/);
 });

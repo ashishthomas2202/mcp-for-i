@@ -17,6 +17,7 @@ import { log } from "./mcp/logger.js";
 import { redactSecrets, redactSecretsInText } from "./security/redact.js";
 import { validateToolInput } from "./mcp/validation.js";
 import { appendAuditRecord } from "./mcp/audit.js";
+import { redactModuleArgs } from "./mcp/modules/index.js";
 import { runControlCommand } from "./controlplane/commands.js";
 import { ibmDocs } from "./ibmi/IbmDocs.js";
 
@@ -92,6 +93,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   const correlationId = crypto.randomUUID();
   const startedAt = Date.now();
+  // Computed before the call: module redaction depends on the state the call starts from.
+  let redactedArgs: unknown;
   try {
     const toolDef = toolMap.get(name);
     if (!toolDef) throw new Error(`Unknown tool: ${name}`);
@@ -99,7 +102,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (errors.length > 0) {
       throw new Error(`Invalid arguments: ${errors.join("; ")}`);
     }
-    const redactedArgs = redactSensitive(args || {});
+    redactedArgs = redactSensitive(redactModuleArgs(ctx, name, args || {}));
     log("info", "tool.call", { name, correlationId, args: redactedArgs });
     const result = await handleTool(ctx, name, args || {});
     const durationMs = Date.now() - startedAt;
@@ -122,7 +125,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     await safeAppendAudit({
       tool: name,
       status: "error",
-      args: redactSensitive(args || {}),
+      args: redactedArgs ?? redactSensitive(redactModuleArgs(ctx, name, args || {})),
       connectionName: resolveConnectionName(name, args || {}, ctx.activeName),
       approve: Boolean(args && typeof args === "object" && (args as any).approve),
       durationMs,

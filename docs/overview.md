@@ -6,7 +6,7 @@ Current platform scope includes:
 - Secure onboarding and connection lifecycle management.
 - Guarded policy and approval-gated operations.
 - Session lifecycle controls with keepalive/reconnect behavior.
-- QSYS, IFS, search, deploy, SQL/CL, diagnostics, and TN5250 command-session tooling.
+- QSYS, IFS, search, deploy, SQL/CL, diagnostics, and TN5250 (5250 green-screen) sessions.
 - Audit-chain integrity features plus journaling and compliance-report tooling.
 - IBM i operations-control tooling for spool/job/subsystem/message-queue lifecycles, lock/authority visibility, and data queue/data area operations.
 

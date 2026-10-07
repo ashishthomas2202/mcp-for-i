@@ -13,11 +13,16 @@
 - Set `MCP_FOR_I_CREDENTIAL_STORE=session` to force process-only password storage.
 - Passwords are never written to the config file. Plaintext passwords found in older config files are moved to the keychain and removed from the file only after the keychain confirms the save; without a persistent keychain they are left in place (with a warning) rather than lost.
 - The config file is written atomically with owner-only permissions, never overwritten after a failed read, and updated under a cross-process lock.
-- `readOnlyMode` refuses every tool that changes the system: member and IFS writes, `ibmi.sql.execute`, `ibmi.cl.run`, `ibmi.tn5250.sendKeys`, `ibmi.actions.run`, and destructive data-queue receives.
+- `readOnlyMode` refuses every tool that changes the system: member and IFS writes, `ibmi.sql.execute`, `ibmi.cl.run`, every AID key of `ibmi.tn5250.sendKeys` (and `ibmi.tn5250.connect` with `signOn`), `ibmi.actions.run`, and destructive data-queue receives.
 - Connection policies support `read-only`, `guarded`, and `power-user` modes.
 - Guarded mode requires `approve: true` for configured risky operations.
 - Command, library and IFS path allow/deny lists are enforced. CL command names are normalized (trimmed, uppercased, library qualifier removed) before matching, and the command lists also apply to the expanded command of `ibmi.actions.run` and to CL embedded in SQL (`@` lines and `QCMDEXC`). See [configuration](configuration.md) for the exact rules.
-- `ibmi.tn5250.*` is a CL command console, not a 5250 emulator. Every command entered goes through the same read-only and command-policy checks as `ibmi.cl.run`.
+- `ibmi.tn5250.*` is a real 5250 terminal session. A 5250 screen does not say what an Enter key will do: it might run a CL command, update a file in an application, or sign off. So the controls are coarse:
+  - `readOnlyMode` (and the `read-only` policy) blocks sending any AID key at all (Enter, F-keys, PageUp/PageDown, Clear, Help, Attn, SysReq) and `signOn`. A read-only connection can only open a session and read the first screen.
+  - `denyCommands` / `allowCommands` only apply to text on a recognised command line (an input field labelled `===>`, as on IBM i menus and the command entry display). That text is checked as `cl.run`, which also requires `approve=true` under the default guarded policy. Commands reached any other way (menu options, prompt screens, application programs, F-keys) are not checked. Treat the policy as a guard against obvious mistakes, not a sandbox; use IBM i object authority and a limited user profile for real restrictions.
+  - Other AID keys are checked as the `tn5250.sendKeys` operation; add it to `requireApprovalFor` to require `approve=true` for every key press.
+- TN5250 passwords come only from the connection's stored password (`signOn`, or `setField` with `useStoredPassword`). Over TLS the password is offered with RFC 4777 auto sign-on (plain-text password inside the TLS channel); on plain telnet it is typed into the sign-on screen and travels unencrypted, as with any 5250 emulator. Use port 992 (TLS) wherever possible.
+- Anything typed into a hidden (non-display) 5250 field is redacted from the log and the audit record, and readScreen/snapshot never return hidden field contents.
 
 ## Control plane
 
@@ -39,6 +44,12 @@ The local control plane (`mcp-for-i control`) only accepts requests from its own
   - set `MCP_FOR_I_ACCEPT_NEW_HOSTKEY` for one start of the server and connect again, then unset it. Accepted values, comma separated: `host:port` or `host` (that host only), the new `SHA256:...` fingerprint (only that key), or `1`/`true` (any host; avoid this); or
   - remove the host's entry from `known_hosts.json`; the next connection trusts the key it sees.
 - A damaged `known_hosts.json` is never silently reset; connections fail until it is fixed or removed.
+
+## TN5250 TLS certificates
+
+- A TN5250 TLS certificate that chains to a trusted CA and matches the host name is accepted.
+- Any other certificate (typically the self-signed certificate of the IBM i Telnet server) is trusted on first use: its SHA-256 fingerprint is pinned per `host:port` in `known_tls_certs.json` in the mcp-for-i config directory, and a different certificate later is refused.
+- To accept an expected change (certificate renewed), set `MCP_FOR_I_ACCEPT_NEW_TLSCERT` the same way as `MCP_FOR_I_ACCEPT_NEW_HOSTKEY` (`host:port`, `host`, the new `SHA256:...` fingerprint, or `1`), or remove the entry from `known_tls_certs.json`.
 
 ## SQL handling
 

@@ -39,6 +39,9 @@ export type Settings = {
   sessionIdleMinutes: number;
   sessionPingSeconds: number;
   sessionReconnectAttempts: number;
+  tn5250Port?: number;
+  tn5250Tls?: boolean;
+  tn5250DeviceName?: string;
 };
 
 export type ConnectionProfile = {
