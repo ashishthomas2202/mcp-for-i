@@ -210,3 +210,25 @@ The documentation catalog is also exposed through MCP resources: `ibmi-docs://ca
 - Sessions are stateful per IBM i connection.
 - `setField` supports `fieldId: "command"` (or `"1"` alias), then `sendKeys: "Enter"` to execute.
 - `sendKeys` supports guardrails through policy checks and optional `approve=true` for guarded operations.
+
+## Object, Member and IFS Operations
+- `ibmi.objects.copy` - `CRTDUPOBJ` to `toLibrary` (default: same library) as `newObject` (default: same name); `data=true` adds `DATA(*YES)` for `*FILE`.
+- `ibmi.objects.move` - `MOVOBJ` to `toLibrary`.
+- `ibmi.objects.rename` - `RNMOBJ` to `newObject`.
+- `ibmi.objects.delete` - runs the delete command for the type (`DLTPGM`, `DLTSRVPGM`, `DLTF`, `DLTDTAARA`, ...). `objectType: "*LIB"` deletes the library named in `library` with `DLTLIB` and needs `approve=true` plus `confirmName` repeating the library name.
+- `ibmi.objects.changeDescription` - `CHGOBJD TEXT(...)`; an empty `text` sets `*BLANK`.
+- `ibmi.libraries.copy` - `CPYLIB FROMLIB TOLIB CRTLIB(*YES|*NO) DATA(*YES|*NO)`; `createLibrary` and `data` default to true; `timeoutMs` defaults to 10 minutes.
+- `ibmi.qsys.members.copy` - `CPYSRCF ... MBROPT(*REPLACE)` to `toLibrary`/`toSourceFile`/`toMember` (each defaults to the source value). Refuses an existing target member unless `replace=true`.
+- `ibmi.qsys.members.changeText` - `CHGPFM TEXT(...)`.
+- `ibmi.qsys.members.changeType` - `CHGPFM SRCTYPE(...)`.
+- `ibmi.ifs.copy` - `cp`, or `cp -R` with `recursive=true`.
+- `ibmi.ifs.move` - `mv`.
+
+### Object, Member and IFS Operation Notes
+- All of these tools change the system: they are refused in read-only mode and by the read-only policy profile, and need `approve=true` when the guarded profile lists their operation (`qsys.write`; IFS tools use `ifs.write` or `qsys.write` for the destination, and `ibmi.ifs.move` also `ifs.delete`).
+- Supported object types: `*PGM`, `*SRVPGM`, `*MODULE`, `*FILE`, `*DTAARA`, `*DTAQ`, `*CMD`, `*MSGF`, `*MENU`, `*PNLGRP`, `*BNDDIR`, `*JOBD`, `*OUTQ`, `*USRSPC`, `*USRIDX`, `*USRQ`, `*SQLPKG`, `*QRYDFN`, `*JRN`, `*JRNRCV`, `*SBSD`, `*CLS`, `*TBL` (plus `*LIB` for delete).
+- Names are validated and uppercased; text is limited to 50 characters, quoted for CL, and may not contain control characters.
+- Objects in IBM system libraries (`QSYS*`, `QUSRSYS`, `QRECOVERY`, `QSPL`, `QRPLOBJ`, `QHLPSYS`, `QDOC`, `QSRV`, `SYSIBM`, `SYSIBMADM`, `SYSPROC`, `SYSTOOLS`, `SYSCAT`, `SYSFUN`, `SYSSTAT`, `#*`) are never changed, moved, deleted or copied into. Deleting a library and copying into a library (`CPYLIB` target) also refuse every `Q*` name, including `QGPL` and `QTEMP`.
+- The built CL command is checked against `allowCommands`/`denyCommands`, and every library involved against `allowLibraries`/`denyLibraries`. A failing command returns a tool error with the IBM i message.
+- Member copy and attribute changes drop the cached member snapshot for the affected member.
+- IFS copy/move check both paths against `allowPaths`/`denyPaths`. The destination (and the source of a move or recursive copy) gets the same guard as `ibmi.ifs.delete`: no root, top-level directory, `/QSYS.LIB/<lib>.LIB`, second-level `/QOpenSys` or `/QIBM` directory, IBM product directory, `..` or wildcards. The destination may not equal or sit inside the source. An existing destination is refused unless `overwrite=true`; an existing directory then receives the copied or moved entry inside it.

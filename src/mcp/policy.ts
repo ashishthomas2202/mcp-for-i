@@ -330,27 +330,37 @@ const PROTECTED_DELETE_PREFIXES = [
  * directories. Returns the normalized path.
  */
 export function assertSafeIfsDeletePath(value: unknown): string {
+  return assertSafeIfsTargetPath(value, "ifs.delete", "delete");
+}
+
+/**
+ * The same guard as assertSafeIfsDeletePath for other operations that change
+ * or remove what is at a path (copy destinations, move sources and targets).
+ * `operation` names the tool in the error and `verb` describes the change.
+ */
+export function assertSafeIfsTargetPath(value: unknown, operation: string, verb = "modify"): string {
+  const refuse = (reason: string) => new Error(`${operation} refused: ${reason}`);
   const raw = String(value ?? "").trim();
-  if (!raw) throw new Error("ifs.delete refused: path is empty");
-  if (/[\0\r\n]/.test(raw)) throw new Error("ifs.delete refused: path contains control characters");
-  if (!raw.startsWith("/")) throw new Error("ifs.delete refused: path must be absolute");
+  if (!raw) throw refuse("path is empty");
+  if (/[\0\r\n]/.test(raw)) throw refuse("path contains control characters");
+  if (!raw.startsWith("/")) throw refuse("path must be absolute");
   if (raw.split(/[\\/]/).some(segment => segment === "..")) {
-    throw new Error("ifs.delete refused: path must not contain '..'");
+    throw refuse("path must not contain '..'");
   }
-  if (/[*?[\]]/.test(raw)) throw new Error("ifs.delete refused: wildcards are not allowed");
+  if (/[*?[\]]/.test(raw)) throw refuse("wildcards are not allowed");
   const normalized = normalizeIfsPath(raw);
   const lower = normalized.toLowerCase();
   const segments = lower.split("/").filter(Boolean);
-  if (segments.length === 0) throw new Error("ifs.delete refused: cannot delete the root directory");
-  if (segments.length === 1) throw new Error(`ifs.delete refused: cannot delete top-level directory ${normalized}`);
+  if (segments.length === 0) throw refuse(`cannot ${verb} the root directory`);
+  if (segments.length === 1) throw refuse(`cannot ${verb} top-level directory ${normalized}`);
   if (segments[0] === "qsys.lib" && segments.length === 2) {
-    throw new Error(`ifs.delete refused: cannot delete a library through the IFS (${normalized})`);
+    throw refuse(`cannot ${verb} a library through the IFS (${normalized})`);
   }
   if ((segments[0] === "qopensys" || segments[0] === "qibm") && segments.length === 2) {
-    throw new Error(`ifs.delete refused: cannot delete system directory ${normalized}`);
+    throw refuse(`cannot ${verb} system directory ${normalized}`);
   }
   if (PROTECTED_DELETE_PREFIXES.some(prefix => lower === prefix || lower.startsWith(`${prefix}/`))) {
-    throw new Error(`ifs.delete refused: ${normalized} is a protected system location`);
+    throw refuse(`${normalized} is a protected system location`);
   }
   return normalized;
 }

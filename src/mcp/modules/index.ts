@@ -1,4 +1,7 @@
 import type { McpContext } from "../context.js";
+import { objectsModule } from "./objects.js";
+import { membersModule } from "./members.js";
+import { ifsOpsModule } from "./ifsOps.js";
 
 /**
  * A group of tools that lives in its own file. getTools() appends every
@@ -11,7 +14,7 @@ export type ToolModule = {
 };
 
 // Feature modules register here, one import and one array entry each.
-export const toolModules: ToolModule[] = [];
+export const toolModules: ToolModule[] = [objectsModule, membersModule, ifsOpsModule];
 
 export function findToolModule(name: string): ToolModule | undefined {
   return toolModules.find(module => module.tools.some(tool => tool.name === name));
