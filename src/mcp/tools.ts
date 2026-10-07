@@ -1,5 +1,5 @@
 import { McpContext } from "./context.js";
-import { findToolModule, toolModules } from "./modules/index.js";
+import { findToolModule, notifyModulesOfDisconnect, toolModules } from "./modules/index.js";
 import { withAnnotations } from "./annotations.js";
 import { runActionTool } from "./modules/compile.js";
 import { parseEvfevent } from "../ibmi/evfevent.js";
@@ -85,7 +85,10 @@ const SETTINGS_SCHEMA: JsonSchema = {
     debugSepPort: { type: "number" },
     sessionIdleMinutes: { type: "number" },
     sessionPingSeconds: { type: "number" },
-    sessionReconnectAttempts: { type: "number" }
+    sessionReconnectAttempts: { type: "number" },
+    tn5250Port: { type: "number", description: "TN5250 telnet port (default 23, or 992 when tn5250Tls is true)." },
+    tn5250Tls: { type: "boolean", description: "Use TLS for TN5250 sessions (default true when the port is 992)." },
+    tn5250DeviceName: { type: "string", description: "Virtual device name requested for TN5250 sessions." }
   }
 };
 
@@ -153,48 +156,6 @@ const SOURCE_INSPECTION_OPERATION_SCHEMA: JsonSchema = {
   },
   required: ["operation"]
 };
-
-type Tn5250Field = {
-  id: string;
-  label: string;
-  value: string;
-  row: number;
-  col: number;
-  length: number;
-  protected?: boolean;
-};
-
-type Tn5250HistoryEntry = {
-  at: string;
-  command: string;
-  ok: boolean;
-  code: number;
-  stderr?: string;
-  messages: string[];
-};
-
-type Tn5250Screen = {
-  sessionId: string;
-  connectionName: string;
-  title: string;
-  status: "ready" | "busy";
-  textLines: string[];
-  fields: Tn5250Field[];
-  cursorFieldId: string;
-  lastKeys: string[];
-  commandHistory: Tn5250HistoryEntry[];
-  updatedAt: string;
-};
-
-type Tn5250Session = {
-  connectionName: string;
-  createdAt: number;
-  screen: Tn5250Screen;
-};
-
-const tn5250Sessions = new Map<string, Tn5250Session>();
-const TN5250_MAX_LINES = 30;
-const TN5250_MAX_HISTORY = 20;
 
 export function getTools() {
   const tools = [
@@ -1423,49 +1384,6 @@ export function getTools() {
           connectionName: { type: "string" }
         }
       }
-    },
-    {
-      name: "ibmi.tn5250.connect",
-      description: "Open the CL command console for a connection. This is a simulated CL command console (commands run through QCMDEXC), not real 5250 emulation: it cannot display or drive green-screen programs.",
-      inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
-    },
-    {
-      name: "ibmi.tn5250.readScreen",
-      description: "Read the CL command console's simulated screen (command field, messages and history). Not a real 5250 screen.",
-      inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
-    },
-    {
-      name: "ibmi.tn5250.setField",
-      description: "Set a field on the CL command console, normally the 'command' field. Not a real 5250 field.",
-      inputSchema: {
-        type: "object",
-        properties: { fieldId: { type: "string" }, value: { type: "string" }, connectionName: { type: "string" } },
-        required: ["fieldId", "value"]
-      }
-    },
-    {
-      name: "ibmi.tn5250.sendKeys",
-      description: "Send keys to the CL command console. ENTER runs the command field as a CL command through QCMDEXC (subject to read-only mode and command policy); CLEAR, F3 and F12 clear it. This is a simulated CL command console (commands run through QCMDEXC), not real 5250 emulation: it cannot display or drive green-screen programs.",
-      inputSchema: {
-        type: "object",
-        properties: { keys: { type: "string" }, timeoutMs: { type: "number" }, connectionName: { type: "string" }, approve: { type: "boolean" } },
-        required: ["keys"]
-      }
-    },
-    {
-      name: "ibmi.tn5250.waitFor",
-      description: "Wait until text appears in the CL command console's message area. Not a real 5250 screen.",
-      inputSchema: { type: "object", properties: { text: { type: "string" }, timeoutMs: { type: "number" }, connectionName: { type: "string" } } }
-    },
-    {
-      name: "ibmi.tn5250.snapshot",
-      description: "Capture the CL command console state as text. Not a real 5250 screen.",
-      inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
-    },
-    {
-      name: "ibmi.tn5250.disconnect",
-      description: "Close the CL command console for a connection.",
-      inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
     }
   ];
   return [...tools, ...toolModules.flatMap(module => module.tools)]
@@ -1492,11 +1410,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.disconnect": {
       const name = args?.connectionName || ctx.activeName;
       await ctx.disconnect(args?.connectionName);
-      if (name) {
-        tn5250Sessions.delete(name);
-      } else {
-        tn5250Sessions.clear();
-      }
+      notifyModulesOfDisconnect(name);
       return result("Disconnected");
     }
     case "ibmi.session.list": {
@@ -1511,7 +1425,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.session.terminate": {
       const name = args?.connectionName || ctx.activeName;
       await ctx.terminateSession(args?.connectionName);
-      if (name) tn5250Sessions.delete(name);
+      notifyModulesOfDisconnect(name);
       return result("Terminated");
     }
     case "ibmi.session.bootstrap": {
@@ -2944,123 +2858,6 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         signature
       });
     }
-    case "ibmi.tn5250.connect": {
-      const name = getConnectionName(ctx, args);
-      await ctx.ensureActive(name);
-      const session = ensureTn5250Session(name);
-      appendTn5250Message(session, `Session ready for ${name}.`);
-      return json(session.screen);
-    }
-    case "ibmi.tn5250.readScreen": {
-      const session = requireTn5250Session(ctx, args);
-      return json(session.screen);
-    }
-    case "ibmi.tn5250.setField": {
-      const session = requireTn5250Session(ctx, args);
-      const field = findTn5250Field(session, args.fieldId);
-      if (!field) throw new Error(`TN5250 field not found: ${args.fieldId}`);
-      if (field.protected) throw new Error(`TN5250 field is protected: ${field.id}`);
-      const value = String(args.value || "");
-      field.value = value.length > field.length ? value.substring(0, field.length) : value;
-      touchTn5250Session(session);
-      return json(session.screen);
-    }
-    case "ibmi.tn5250.sendKeys": {
-      const session = requireTn5250Session(ctx, args);
-      const conn = await ctx.ensureActive(session.connectionName);
-      const keys = parseTn5250Keys(args.keys);
-      const timeoutMs = clampNumber(args?.timeoutMs, 45000, 1000, 300000);
-      const commandField = findTn5250Field(session, "command");
-
-      session.screen.lastKeys = keys;
-      session.screen.status = "busy";
-      touchTn5250Session(session);
-
-      for (const key of keys) {
-        if (key === "ENTER" || key === "RETURN") {
-          const command = String(commandField?.value || "").trim();
-          if (!command) {
-            appendTn5250Message(session, "No command entered.");
-            continue;
-          }
-
-          enforceWritable(ctx, conn, "cl.run", {
-            ...args,
-            command,
-            environment: "ile",
-            connectionName: session.connectionName
-          });
-
-          const cmdResult = await runClCommand(conn, command, "ile", undefined, timeoutMs);
-          const recent = await readRecentJoblogMessages(conn, 5);
-          const messages = recent.map((row: any) => {
-            const id = String(row.MESSAGE_ID || "");
-            const text = String(row.MESSAGE_TEXT || "");
-            return id ? `[${id}] ${text}` : text;
-          });
-
-          session.screen.commandHistory.unshift({
-            at: new Date().toISOString(),
-            command,
-            ok: cmdResult.code === 0,
-            code: cmdResult.code,
-            stderr: cmdResult.stderr ? String(cmdResult.stderr) : undefined,
-            messages: messages.slice(0, 5)
-          });
-          if (session.screen.commandHistory.length > TN5250_MAX_HISTORY) {
-            session.screen.commandHistory = session.screen.commandHistory.slice(0, TN5250_MAX_HISTORY);
-          }
-
-          appendTn5250Message(session, `${cmdResult.code === 0 ? "OK" : "ERROR"}: ${command}`);
-          for (const line of messages.slice(0, 3)) {
-            appendTn5250Message(session, line);
-          }
-          if (commandField) commandField.value = "";
-          continue;
-        }
-
-        if (key === "CLEAR" || key === "F3" || key === "F12") {
-          resetTn5250Screen(session, `Cleared via ${key}.`);
-          continue;
-        }
-
-        if (key === "TAB") {
-          rotateTn5250Cursor(session);
-          continue;
-        }
-
-        appendTn5250Message(session, `Unsupported key: ${key}`);
-      }
-
-      session.screen.status = "ready";
-      touchTn5250Session(session);
-      return json(session.screen);
-    }
-    case "ibmi.tn5250.waitFor": {
-      const session = requireTn5250Session(ctx, args);
-      const timeoutMs = clampNumber(args?.timeoutMs, 5000, 250, 120000);
-      const pattern = args?.text ? String(args.text) : "";
-      if (!pattern) {
-        return json({ matched: true, timeoutMs, screen: session.screen });
-      }
-      const matched = await waitForTn5250Text(session, pattern, timeoutMs);
-      return json({ matched, text: pattern, timeoutMs, screen: session.screen });
-    }
-    case "ibmi.tn5250.snapshot": {
-      const session = requireTn5250Session(ctx, args);
-      return json({
-        capturedAt: new Date().toISOString(),
-        connectionName: session.connectionName,
-        plainText: renderTn5250Screen(session.screen),
-        screen: session.screen
-      });
-    }
-    case "ibmi.tn5250.disconnect": {
-      const name = resolveTn5250SessionName(ctx, args);
-      if (!name) throw new Error("connectionName is required (no active session)");
-      const existed = tn5250Sessions.delete(name);
-      return json({ disconnected: existed, connectionName: name });
-    }
   }
 
   throw new Error(`Unknown tool: ${name}`);
@@ -3109,17 +2906,6 @@ export async function runClCommand(conn: any, command: string, environment: stri
     return { code: 0, signal: null, stdout: "", stderr: "", command };
   } catch (err: any) {
     return { code: 1, signal: null, stdout: "", stderr: err?.message || String(err), command };
-  }
-}
-
-async function readRecentJoblogMessages(conn: any, limit: number) {
-  try {
-    const capped = clampNumber(limit, 5, 1, 20);
-    return await conn.runSQL(
-      `select message_id, message_text, severity, message_timestamp from table(qsys2.joblog_info('*')) order by message_timestamp desc fetch first ${capped} rows only`
-    );
-  } catch {
-    return [];
   }
 }
 
@@ -3663,133 +3449,6 @@ export function toNullableString(value: unknown) {
   if (typeof value === "undefined" || value === null) return null;
   const text = String(value).trim();
   return text.length > 0 ? text : null;
-}
-
-function ensureTn5250Session(connectionName: string): Tn5250Session {
-  const existing = tn5250Sessions.get(connectionName);
-  if (existing) {
-    touchTn5250Session(existing);
-    return existing;
-  }
-
-  const now = new Date().toISOString();
-  const session: Tn5250Session = {
-    connectionName,
-    createdAt: Date.now(),
-    screen: {
-      sessionId: `tn5250:${connectionName}`,
-      connectionName,
-      title: "MCP TN5250 Command Session",
-      status: "ready",
-      textLines: [
-        `Connected to ${connectionName}.`,
-        "Set field 'command' (or fieldId '1') and send Enter.",
-        "Supported keys: Enter, Tab, F3, F12, Clear."
-      ],
-      fields: [
-        {
-          id: "command",
-          label: "Command",
-          value: "",
-          row: 20,
-          col: 2,
-          length: 512,
-          protected: false
-        }
-      ],
-      cursorFieldId: "command",
-      lastKeys: [],
-      commandHistory: [],
-      updatedAt: now
-    }
-  };
-  tn5250Sessions.set(connectionName, session);
-  return session;
-}
-
-function requireTn5250Session(ctx: McpContext, args: any): Tn5250Session {
-  const name = resolveTn5250SessionName(ctx, args);
-  if (!name) throw new Error("connectionName is required (no active session)");
-  const session = tn5250Sessions.get(name);
-  if (!session) {
-    throw new Error(`TN5250 session for ${name} not found. Call ibmi.tn5250.connect first.`);
-  }
-  return session;
-}
-
-function resolveTn5250SessionName(ctx: McpContext, args: any) {
-  return args?.connectionName || ctx.activeName;
-}
-
-function findTn5250Field(session: Tn5250Session, fieldId: string): Tn5250Field | undefined {
-  const normalized = String(fieldId || "").trim().toLowerCase();
-  if (!normalized) return undefined;
-  const aliases = normalized === "1" ? ["command", "1"] : [normalized];
-  return session.screen.fields.find(field => {
-    const id = field.id.toLowerCase();
-    return aliases.includes(id);
-  });
-}
-
-function parseTn5250Keys(value: string) {
-  const raw = String(value || "").trim();
-  if (!raw) throw new Error("keys is required");
-  return raw
-    .split(/[,\s+]+/)
-    .map(part => part.trim().toUpperCase())
-    .filter(Boolean);
-}
-
-function touchTn5250Session(session: Tn5250Session) {
-  session.screen.updatedAt = new Date().toISOString();
-  tn5250Sessions.set(session.connectionName, session);
-}
-
-function appendTn5250Message(session: Tn5250Session, message: string) {
-  session.screen.textLines.unshift(message);
-  if (session.screen.textLines.length > TN5250_MAX_LINES) {
-    session.screen.textLines = session.screen.textLines.slice(0, TN5250_MAX_LINES);
-  }
-  touchTn5250Session(session);
-}
-
-function resetTn5250Screen(session: Tn5250Session, message: string) {
-  const commandField = findTn5250Field(session, "command");
-  if (commandField) commandField.value = "";
-  session.screen.textLines = [message, `Connected to ${session.connectionName}.`];
-  session.screen.cursorFieldId = "command";
-  session.screen.lastKeys = [];
-  touchTn5250Session(session);
-}
-
-function rotateTn5250Cursor(session: Tn5250Session) {
-  const fields = session.screen.fields;
-  if (fields.length === 0) return;
-  const idx = fields.findIndex(field => field.id === session.screen.cursorFieldId);
-  const next = idx >= 0 ? (idx + 1) % fields.length : 0;
-  session.screen.cursorFieldId = fields[next].id;
-  touchTn5250Session(session);
-}
-
-async function waitForTn5250Text(session: Tn5250Session, text: string, timeoutMs: number) {
-  const deadline = Date.now() + timeoutMs;
-  const needle = String(text).toLowerCase();
-  while (Date.now() <= deadline) {
-    const haystack = renderTn5250Screen(session.screen).toLowerCase();
-    if (haystack.includes(needle)) return true;
-    await new Promise(resolve => setTimeout(resolve, 200));
-  }
-  return false;
-}
-
-function renderTn5250Screen(screen: Tn5250Screen) {
-  const lines: string[] = [];
-  lines.push(`${screen.title} (${screen.status})`);
-  lines.push(...screen.textLines);
-  for (const field of screen.fields) {
-    lines.push(`${field.label}[${field.id}]=${field.value}`);
-  }
-  return lines.join("\n");
 }
 
 function hasMemberListExtensions(args: any) {

@@ -104,7 +104,7 @@ export function isNewHostKeyAccepted(acceptNew: string | undefined, host: string
   });
 }
 
-async function readKnownHosts(filePath: string): Promise<KnownHostsFile> {
+export async function readKnownHosts(filePath: string): Promise<KnownHostsFile> {
   let raw: string;
   try {
     raw = await fs.readFile(filePath, "utf8");
@@ -124,7 +124,7 @@ async function readKnownHosts(filePath: string): Promise<KnownHostsFile> {
   return certificates ? { version: 1, hosts, certificates } : { version: 1, hosts };
 }
 
-async function writeKnownHosts(filePath: string, data: KnownHostsFile) {
+export async function writeKnownHosts(filePath: string, data: KnownHostsFile) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const tmp = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
   await fs.writeFile(tmp, JSON.stringify(data, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });

@@ -9,6 +9,7 @@ import { compileModule } from "./compile.js";
 import { changedLinesModule } from "./changedLines.js";
 import { liblModule } from "./libl.js";
 import { systemModule } from "./system.js";
+import { tn5250Module } from "./tn5250.js";
 
 /**
  * A group of tools that lives in its own file. getTools() appends every
@@ -18,11 +19,39 @@ import { systemModule } from "./system.js";
 export type ToolModule = {
   tools: Array<{ name: string; description: string; inputSchema: Record<string, any>; annotations?: Record<string, any> }>;
   handle: (ctx: McpContext, name: string, args: any) => Promise<any>;
+  /**
+   * Optional: rewrite a call's arguments before they are logged or audited,
+   * for secrets only the module can recognise. Must not mutate `args`.
+   */
+  redactArgs?: (ctx: McpContext, name: string, args: any) => any;
+  /** Optional: called after ibmi.disconnect / ibmi.session.terminate (undefined name = all). */
+  onDisconnect?: (connectionName?: string) => void;
 };
 
 // Feature modules register here, one import and one array entry each.
-export const toolModules: ToolModule[] = [objectsModule, membersModule, ifsOpsModule, bulkMembersModule, compareModule, inspectModule, compileModule, systemModule, changedLinesModule, liblModule];
+export const toolModules: ToolModule[] = [objectsModule, membersModule, ifsOpsModule, bulkMembersModule, compareModule, inspectModule, compileModule, systemModule, changedLinesModule, liblModule, tn5250Module];
 
 export function findToolModule(name: string): ToolModule | undefined {
   return toolModules.find(module => module.tools.some(tool => tool.name === name));
+}
+
+/** Arguments with module-specific secrets removed, ready for generic redaction. */
+export function redactModuleArgs(ctx: McpContext, name: string, args: any) {
+  const module = findToolModule(name);
+  if (!module?.redactArgs) return args;
+  try {
+    return module.redactArgs(ctx, name, args);
+  } catch {
+    return args;
+  }
+}
+
+export function notifyModulesOfDisconnect(connectionName?: string) {
+  for (const module of toolModules) {
+    try {
+      module.onDisconnect?.(connectionName);
+    } catch {
+      // a module's cleanup must not break disconnecting
+    }
+  }
 }

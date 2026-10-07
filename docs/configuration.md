@@ -13,7 +13,7 @@ Config file is stored under the user config directory:
 
 ## Settings
 Default settings (editable in the config file):
-- `readOnlyMode`: boolean. When true, every tool that changes the system is refused, including `ibmi.sql.execute`, `ibmi.cl.run` and `ibmi.tn5250.sendKeys`.
+- `readOnlyMode`: boolean. When true, every tool that changes the system is refused, including `ibmi.sql.execute`, `ibmi.cl.run` and every AID key sent by `ibmi.tn5250.sendKeys`.
 - `tempLibrary`: string
 - `tempDir`: string
 - `autoClearTempData`: boolean
@@ -31,6 +31,9 @@ Default settings (editable in the config file):
 - `mapepireServerPath`: path of `mapepire-server.jar` on the IBM i for `ssh` mode (default: `/QOpenSys/pkgs/lib/mapepire/mapepire-server.jar`, then `/opt/mapepire/lib/mapepire/mapepire-server.jar`).
 - `mapepireJavaPath`: Java for `ssh` mode (default: the newest of jdk21, jdk17, jdk11, jdk80 under `/QOpenSys/QIBM/ProdData/JavaVM`).
 - `allowedLocalRoots`: string[] (global settings only; see "Local file access" below)
+- `tn5250Port`: number. TN5250 telnet port (default 23, or 992 when `tn5250Tls` is true).
+- `tn5250Tls`: boolean. Use TLS for TN5250 (default true when the port is 992).
+- `tn5250DeviceName`: string. Virtual device name requested for TN5250 sessions (1-10 characters).
 
 `tempLibrary` remains accepted for configuration compatibility. Source member reads and source-date writes now use job-local `QTEMP` objects and do not require a persistent `ILEDITOR` library.
 
@@ -115,7 +118,7 @@ Connections can also define policy, for example:
 - `power-user`
 
 Policy lists (all optional, matched case-insensitively):
-- `denyCommands` / `allowCommands`: CL command names. A library qualifier is ignored on both sides, so `DLTLIB` also blocks `QSYS/DLTLIB` and `*LIBL/DLTLIB`. A trailing `*` makes a generic entry (`DLT*`). When `allowCommands` is not empty, only listed commands may run, and QSH/PASE commands are refused because they cannot be verified. The lists apply to `ibmi.cl.run`, `ibmi.tn5250.sendKeys`, the expanded command of `ibmi.actions.run`, and CL embedded in SQL (lines starting with `@` and `QCMDEXC` calls; a `QCMDEXC` call whose command is not a string literal is refused while a command list is set).
+- `denyCommands` / `allowCommands`: CL command names. A library qualifier is ignored on both sides, so `DLTLIB` also blocks `QSYS/DLTLIB` and `*LIBL/DLTLIB`. A trailing `*` makes a generic entry (`DLT*`). When `allowCommands` is not empty, only listed commands may run, and QSH/PASE commands are refused because they cannot be verified. The lists apply to `ibmi.cl.run`, text on a recognised `===>` command line when `ibmi.tn5250.sendKeys` presses an AID key (other 5250 input cannot be checked; see [security](security.md)), the expanded command of `ibmi.actions.run`, and CL embedded in SQL (lines starting with `@` and `QCMDEXC` calls; a `QCMDEXC` call whose command is not a string literal is refused while a command list is set).
 - `denyLibraries` / `allowLibraries`: library names, with optional trailing `*`. They apply to every tool argument that names a library (`library`, `journalLibrary`, `libraryList`, qualified `LIB/OBJ` values, `/QSYS.LIB/<lib>.LIB/...` paths). With `allowLibraries` set, special values such as `*LIBL` and generic names are refused because they cannot be checked.
 - `denyPaths` / `allowPaths`: absolute IFS paths. An entry covers the path and everything below it; `*` matches within one path segment. With `allowPaths` set, relative paths are refused. Remote symlinks are not resolved.
 - Deny entries always win over allow entries.
