@@ -119,7 +119,8 @@ const PROFILE_SCHEMA: JsonSchema = {
     name: { type: "string" },
     currentLibrary: { type: "string" },
     libraryList: { type: "array", items: { type: "string" } },
-    customVariables: { type: "array", items: CUSTOM_VARIABLE_SCHEMA }
+    customVariables: { type: "array", items: CUSTOM_VARIABLE_SCHEMA },
+    setLibraryListCommand: { type: "string", description: "CL command run by ibmi.libl.runProfileCommand to set the library list." }
   },
   required: ["name"]
 };
@@ -530,7 +531,7 @@ export function getTools() {
     },
     {
       name: "ibmi.docs.open",
-      description: "Open and cache an allowlisted official IBM i documentation page.",
+      description: "Open and cache an official IBM documentation page: a ref from ibmi.docs.search or any https://www.ibm.com/docs/ URL. Cached copies expire after 7 days by default.",
       inputSchema: {
         type: "object",
         properties: {
@@ -4360,7 +4361,7 @@ function buildChangeDataAreaCommand(
   return `CHGDTAARA DTAARA(${target} (${startPosition} ${length})) VALUE(${quoteClString(value)})`;
 }
 
-function getConnectionName(ctx: McpContext, args: any): string {
+export function getConnectionName(ctx: McpContext, args: any): string {
   const name = args?.connectionName || ctx.activeName;
   if (!name) throw new Error("connectionName is required (no active connection)");
   return name;
@@ -4410,7 +4411,7 @@ function requireMessageKey(value: unknown) {
   throw new Error(`Invalid messageKey: ${value}`);
 }
 
-async function updateConnectionSettings(ctx: McpContext, name: string, update: Record<string, any>) {
+export async function updateConnectionSettings(ctx: McpContext, name: string, update: Record<string, any>) {
   const conn = await ctx.store.getConnection(name);
   if (!conn) throw new Error(`Connection ${name} not found`);
   conn.settings = { ...(conn.settings || {}), ...stripUndefined(update) };
@@ -4423,7 +4424,7 @@ async function updateConnectionSettings(ctx: McpContext, name: string, update: R
   }
 }
 
-async function applyLibraryList(conn: any, libraryList?: string[], currentLibrary?: string) {
+export async function applyLibraryList(conn: any, libraryList?: string[], currentLibrary?: string) {
   if (libraryList && libraryList.length > 0) {
     const normalized = libraryList.map((l: string) => String(l).toUpperCase());
     const invalid = normalized.find((l: string) => !conn.validQsysName(l));

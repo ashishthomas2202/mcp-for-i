@@ -26,22 +26,69 @@ type MarkdownSection = {
   endLine: number;
 };
 
+/** Releases with an IBM Docs collection. 7.1 and earlier were retired from IBM Docs. */
+export const SUPPORTED_DOC_RELEASES = ["7.2", "7.3", "7.4", "7.5", "7.6"];
+const CURRENT_RELEASES = ["7.4", "7.5", "7.6"];
+const OLDER_RELEASES = ["7.2", "7.3"];
+
+const MAX_BODY_BYTES = 12 * 1024 * 1024;
+const MAX_REDIRECTS = 3;
+const DEFAULT_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
 const DEFAULT_SEEDS: IbmDocsSeed[] = [
-  ...["7.4", "7.5", "7.6"].map(release => ({
+  ...OLDER_RELEASES.flatMap(release => [
+    {
+      title: `IBM i ${release} documentation overview`,
+      topic: "documentation-overview-whats-new",
+      categories: ["overview", "programming", "database", "systems-management"],
+      keywords: ["IBM i", "RPG", "CL", "SQL", "QSYS2", "IFS", "API", "security", "database", "system administration"]
+    },
+    {
+      title: `IBM i ${release} PDF files and manuals`,
+      topic: "documentation-pdf-files-manuals",
+      categories: ["manuals", "programming", "database", "systems-management"],
+      keywords: ["manual", "reference", "RPG", "COBOL", "CL", "SQL", "API", "ILE", "DDS", "backup", "security"]
+    },
+    {
+      title: `IBM i ${release} CL command finder`,
+      topic: "language-cl-command-finder",
+      categories: ["programming", "cl", "commands"],
+      keywords: ["CL", "command", "CRTLIB", "CRTPGM", "DSPJOB", "WRKACTJOB", "QCMDEXC"]
+    },
+    {
+      title: `IBM i ${release} APIs overview`,
+      topic: "interfaces-apis-overview",
+      categories: ["programming", "apis"],
+      keywords: ["API", "QUSRMBRD", "QUSLJOB", "QUSLOBJ", "QUSRSPLA", "user space", "service program"]
+    },
+    {
+      title: `IBM i ${release} ILE RPG Reference`,
+      topic: "rpg-ile-reference",
+      categories: ["programming", "rpg", "ile"],
+      keywords: ["RPGLE", "RPG IV", "free form", "operation codes", "built-in functions", "subprocedure", "prototype"]
+    }
+  ].map(seed => ({
+    title: seed.title,
+    url: `https://www.ibm.com/docs/en/i/${release}.0?topic=${seed.topic}`,
+    release,
+    categories: seed.categories,
+    keywords: seed.keywords
+  }))),
+  ...CURRENT_RELEASES.map(release => ({
     title: `IBM i ${release} documentation overview`,
     url: `https://www.ibm.com/docs/en/i/${release}.0?topic=documentation-overview-whats-new`,
     release,
     categories: ["overview", "programming", "database", "systems-management"],
     keywords: ["IBM i", "RPG", "CL", "SQL", "QSYS2", "IFS", "API", "security", "database", "performance", "system administration"]
   })),
-  ...["7.4", "7.5", "7.6"].map(release => ({
+  ...CURRENT_RELEASES.map(release => ({
     title: `IBM i ${release} PDF files and manuals`,
     url: `https://www.ibm.com/docs/en/i/${release}.0?topic=documentation-pdf-files-manuals`,
     release,
     categories: ["manuals", "programming", "database", "systems-management"],
     keywords: ["manual", "reference", "RPG", "COBOL", "CL", "SQL", "API", "ILE", "DDS", "backup", "security"]
   })),
-  ...["7.4", "7.5", "7.6"].flatMap(release => [
+  ...CURRENT_RELEASES.flatMap(release => [
     {
       title: `IBM i ${release} documentation site map`,
       topic: "documentation-site-map",
@@ -105,10 +152,16 @@ export class IbmDocsService {
   private readonly seeds: IbmDocsSeed[];
   private readonly cacheDir: string;
   private readonly httpFetch: typeof fetch;
+  private readonly cacheTtlMs: number;
+  private readonly now: () => number;
+  private cacheDirReady?: Promise<void>;
+  private cacheLoaded = false;
 
-  constructor(options: { seeds?: IbmDocsSeed[]; cacheDir?: string; fetch?: typeof fetch } = {}) {
+  constructor(options: { seeds?: IbmDocsSeed[]; cacheDir?: string; fetch?: typeof fetch; cacheTtlMs?: number; now?: () => number } = {}) {
     this.cacheDir = options.cacheDir || process.env.MCP_FOR_I_IBM_DOCS_CACHE_DIR || path.join(getConfigDir(), "ibm-docs");
     this.httpFetch = options.fetch || fetch;
+    this.cacheTtlMs = resolveCacheTtl(options.cacheTtlMs);
+    this.now = options.now || Date.now;
     this.seeds = [...DEFAULT_SEEDS, ...loadExtraSeeds(), ...(options.seeds || [])]
       .map(seed => ({ ...seed, url: validateOfficialUrl(seed.url).toString() }))
       .filter((seed, index, all) => all.findIndex(item => item.url === seed.url) === index);
@@ -131,6 +184,13 @@ export class IbmDocsService {
     const releaseSet = new Set((options.releases || []).map(normalizeRelease));
     const categorySet = new Set((options.categories || []).map(value => value.toLowerCase()));
     const refreshWarnings: string[] = [];
+    const unsupportedReleases = [...releaseSet].filter(release => !SUPPORTED_DOC_RELEASES.includes(release));
+    if (unsupportedReleases.length) {
+      refreshWarnings.push(
+        `IBM Docs has no collection for IBM i ${unsupportedReleases.join(", ")}; supported releases are ${SUPPORTED_DOC_RELEASES.join(", ")}. ` +
+        "Older manuals may only exist as PDFs or Redbooks."
+      );
+    }
     if (options.freshness === "prefer-live") {
       const refreshCandidates = this.seeds.flatMap(seed => {
         if (releaseSet.size && !releaseSet.has(normalizeRelease(seed.release))) return [];
@@ -144,7 +204,7 @@ export class IbmDocsService {
         if (outcome.status === "rejected") refreshWarnings.push(`Could not refresh ${refreshCandidates[index].title}: ${outcome.reason?.message || String(outcome.reason)}`);
       });
     }
-    const matches = this.seeds.flatMap(seed => {
+    const matches = this.searchableEntries().flatMap(seed => {
       if (releaseSet.size && !releaseSet.has(normalizeRelease(seed.release))) return [];
       if (categorySet.size && !seed.categories.some(category => categorySet.has(category.toLowerCase()))) return [];
       const cached = this.cache.get(seed.url);
@@ -178,8 +238,10 @@ export class IbmDocsService {
         headingPath: match?.headingPath || [],
         excerpt: cached ? excerptFor(cached.content, terms, match?.index) : seed.keywords.join(", "),
         score,
-        matchReasons: cached ? ["official-doc-content", "curated-official-catalog"] : ["curated-official-catalog"],
-        freshness: cached ? "cached" : "catalog",
+        matchReasons: cached
+          ? ["official-doc-content", seed.opened ? "previously-opened-page" : "curated-official-catalog"]
+          : ["curated-official-catalog"],
+        freshness: cached ? (this.isExpired(cached) ? "stale" : "cached") : "catalog",
         version: cached?.version,
         observedAt: cached?.fetchedAt
       }); }),
@@ -217,11 +279,30 @@ export class IbmDocsService {
     startLine?: number;
     endLine?: number;
   }) {
+    // Any https://www.ibm.com/docs/ page may be opened; the seeds only drive search.
     const url = options.url ? validateOfficialUrl(options.url).toString() : decodeRef(String(options.ref || ""));
-    if (!this.seeds.some(seed => seed.url === url)) throw new Error("IBM documentation URL is not in the approved catalog");
-    let document = options.requireLive || options.freshness === "require-live" ? undefined : await this.cachedDocument(url);
-    const cacheStatus = document ? "hit" : "miss";
-    document ||= await this.fetchDocument(url);
+    const requireLive = options.requireLive || options.freshness === "require-live";
+    const cached = requireLive ? undefined : await this.cachedDocument(url);
+    const warnings: string[] = [];
+    let document: CachedDocument;
+    let cacheStatus: "hit" | "miss" | "refreshed" | "stale";
+    if (cached && !this.isExpired(cached)) {
+      document = cached;
+      cacheStatus = "hit";
+    } else if (cached) {
+      try {
+        document = await this.fetchDocument(url);
+        cacheStatus = "refreshed";
+      } catch (error: any) {
+        // Serve the expired copy rather than nothing, and say so.
+        document = cached;
+        cacheStatus = "stale";
+        warnings.push(`Cached copy is older than the cache expiry and could not be refreshed: ${error?.message || String(error)}`);
+      }
+    } else {
+      document = await this.fetchDocument(url);
+      cacheStatus = "miss";
+    }
     if (options.expectedVersion && options.expectedVersion !== document.version) {
       return {
         status: "version-conflict" as const,
@@ -251,7 +332,11 @@ export class IbmDocsService {
       observedAt: document.fetchedAt,
       cacheStatus,
       complete,
-      ...(complete ? {} : { truncatedReason: `Document exceeds maxCharacters=${maximum}` })
+      ...(complete ? {} : { truncatedReason: `Document exceeds maxCharacters=${maximum}` }),
+      ...(document.release === "unknown" || SUPPORTED_DOC_RELEASES.includes(document.release) ? {} : {
+        releaseNote: `IBM i ${document.release} is not a release this catalog covers (${SUPPORTED_DOC_RELEASES.join(", ")}).`
+      }),
+      ...(warnings.length ? { warnings } : {})
     };
   }
 
@@ -295,31 +380,33 @@ export class IbmDocsService {
     timer.unref?.();
     try {
       let response: Response | undefined;
-      for (let redirects = 0; redirects <= 3; redirects += 1) {
+      for (let redirects = 0; ; redirects += 1) {
         response = await this.httpFetch(current, { redirect: "manual", signal: controller.signal, headers: { accept: "text/html" } });
         if (![301, 302, 303, 307, 308].includes(response.status)) break;
+        await response.body?.cancel().catch(() => undefined);
         const location = response.headers.get("location");
-        if (!location || redirects === 3) throw new Error("IBM documentation redirect limit exceeded");
+        if (!location) throw new Error("IBM documentation redirect had no location");
+        if (redirects >= MAX_REDIRECTS) throw new Error("IBM documentation redirect limit exceeded");
+        // Redirects may only stay on https://www.ibm.com/docs/.
         current = validateOfficialUrl(new URL(location, current).toString());
       }
       if (!response?.ok) throw new Error(`IBM documentation request failed (${response?.status || "unknown"})`);
       const contentType = response.headers.get("content-type") || "";
       if (!contentType.toLowerCase().includes("text/html")) throw new Error("IBM documentation response was not HTML");
       const declaredLength = Number(response.headers.get("content-length") || 0);
-      if (declaredLength > 12 * 1024 * 1024) throw new Error("IBM documentation response exceeds 12 MiB");
-      const html = await response.text();
-      if (Buffer.byteLength(html, "utf8") > 12 * 1024 * 1024) throw new Error("IBM documentation response exceeds 12 MiB");
-      const seed = this.seeds.find(item => item.url === url)!;
+      if (declaredLength > MAX_BODY_BYTES) throw new Error("IBM documentation response exceeds 12 MiB");
+      const html = await readBodyWithLimit(response, MAX_BODY_BYTES);
+      const seed = this.seeds.find(item => item.url === url);
       const parsed = htmlToMarkdown(html);
       const document: CachedDocument = {
-        title: parsed.title || seed.title,
+        title: parsed.title || seed?.title || url,
         url,
-        release: seed.release,
+        release: seed?.release || releaseFromUrl(url),
         content: parsed.content,
         version: crypto.createHash("sha256").update(parsed.content, "utf8").digest("hex"),
-        fetchedAt: new Date().toISOString()
+        fetchedAt: new Date(this.now()).toISOString()
       };
-      await fs.mkdir(this.cacheDir, { recursive: true });
+      await this.ensureCacheDir();
       await fs.writeFile(this.cachePath(url), JSON.stringify(document), "utf8");
       this.cache.set(url, document);
       return document;
@@ -328,20 +415,59 @@ export class IbmDocsService {
     }
   }
 
+  private isExpired(document: CachedDocument) {
+    const fetched = Date.parse(document.fetchedAt);
+    if (!Number.isFinite(fetched)) return true;
+    return this.now() - fetched > this.cacheTtlMs;
+  }
+
+  /** Seeds plus any non-seed pages that were opened before, so they are searchable too. */
+  private searchableEntries(): Array<IbmDocsSeed & { opened?: boolean }> {
+    const seedUrls = new Set(this.seeds.map(seed => seed.url));
+    const opened = [...this.cache.values()]
+      .filter(document => !seedUrls.has(document.url))
+      .map(document => ({
+        title: document.title,
+        url: document.url,
+        release: document.release,
+        categories: [] as string[],
+        keywords: [] as string[],
+        opened: true
+      }));
+    return [...this.seeds, ...opened];
+  }
+
+  private ensureCacheDir() {
+    this.cacheDirReady ||= fs.mkdir(this.cacheDir, { recursive: true }).then(() => undefined, error => {
+      this.cacheDirReady = undefined;
+      throw error;
+    });
+    return this.cacheDirReady;
+  }
+
   private async cachedDocument(url: string) {
     await this.loadCachedDocuments();
     return this.cache.get(url);
   }
 
   private async loadCachedDocuments() {
-    await fs.mkdir(this.cacheDir, { recursive: true });
-    await Promise.all(this.seeds.map(async seed => {
-      if (this.cache.has(seed.url)) return;
+    if (this.cacheLoaded) return;
+    let entries: string[] = [];
+    try {
+      entries = await fs.readdir(this.cacheDir);
+    } catch {
+      // No cache directory yet; it is created on the first fetch.
+    }
+    await Promise.all(entries.filter(name => /^[0-9a-f]{64}\.json$/.test(name)).map(async name => {
       try {
-        const parsed = JSON.parse(await fs.readFile(this.cachePath(seed.url), "utf8")) as CachedDocument;
-        if (parsed.url === seed.url && typeof parsed.content === "string") this.cache.set(seed.url, parsed);
+        const parsed = JSON.parse(await fs.readFile(path.join(this.cacheDir, name), "utf8")) as CachedDocument;
+        if (typeof parsed?.url !== "string" || typeof parsed.content !== "string") return;
+        const url = validateOfficialUrl(parsed.url).toString();
+        if (this.cachePath(url) !== path.join(this.cacheDir, name)) return;
+        if (!this.cache.has(url)) this.cache.set(url, { ...parsed, url });
       } catch {}
     }));
+    this.cacheLoaded = true;
   }
 
   private cachePath(url: string) {
@@ -351,14 +477,61 @@ export class IbmDocsService {
 
 export const ibmDocs = new IbmDocsService();
 
-function validateOfficialUrl(value: string) {
-  const url = new URL(value);
-  if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "www.ibm.com" || url.port || !url.pathname.startsWith("/docs/")) {
+export function validateOfficialUrl(value: string) {
+  const raw = String(value ?? "").trim();
+  if (!raw || raw.length > 2048 || /[\s\\]/.test(raw)) throw new Error("IBM documentation URLs must use https://www.ibm.com/docs/");
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
     throw new Error("IBM documentation URLs must use https://www.ibm.com/docs/");
   }
-  if (url.username || url.password) throw new Error("IBM documentation URLs may not include user information");
+  if (url.username || url.password || /^https:\/\/[^/]*@/i.test(raw)) {
+    throw new Error("IBM documentation URLs may not include user information");
+  }
+  // An explicit port (even :443) is rejected by looking at the raw authority.
+  const authority = /^https:\/\/([^/?#]*)/i.exec(raw)?.[1] || "";
+  if (url.protocol !== "https:" || url.hostname !== "www.ibm.com" || url.port || authority.toLowerCase() !== "www.ibm.com" || !url.pathname.startsWith("/docs/")) {
+    throw new Error("IBM documentation URLs must use https://www.ibm.com/docs/");
+  }
   url.hash = "";
   return url;
+}
+
+/** IBM Docs paths look like /docs/en/i/7.5.0 or /docs/en/i/7.5; returns "7.5" or "unknown". */
+export function releaseFromUrl(value: string) {
+  const match = /^\/docs\/[a-z]{2}(?:-[a-z]{2})?\/i\/(\d+)\.(\d+)(?:\.\d+)?(?:\/|$)/i.exec(new URL(value).pathname);
+  return match ? `${Number(match[1])}.${Number(match[2])}` : "unknown";
+}
+
+function resolveCacheTtl(option?: number) {
+  if (typeof option === "number" && Number.isFinite(option) && option >= 0) return option;
+  const days = Number(process.env.MCP_FOR_I_IBM_DOCS_CACHE_TTL_DAYS);
+  if (process.env.MCP_FOR_I_IBM_DOCS_CACHE_TTL_DAYS && Number.isFinite(days) && days >= 0) return days * 24 * 60 * 60 * 1000;
+  return DEFAULT_CACHE_TTL_MS;
+}
+
+/** Reads the body as text, failing as soon as more than `limit` bytes arrive. */
+async function readBodyWithLimit(response: Response, limit: number) {
+  if (!response.body) {
+    const text = await response.text();
+    if (Buffer.byteLength(text, "utf8") > limit) throw new Error("IBM documentation response exceeds 12 MiB");
+    return text;
+  }
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > limit) {
+      await reader.cancel().catch(() => undefined);
+      throw new Error("IBM documentation response exceeds 12 MiB");
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 function loadExtraSeeds(): IbmDocsSeed[] {
@@ -384,9 +557,20 @@ function loadExtraSeeds(): IbmDocsSeed[] {
 
 function htmlToMarkdown(html: string) {
   const title = decodeEntities((/<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1] || "").replace(/<[^>]+>/g, " ")).trim();
-  const content = decodeEntities(html
+  const tables: string[] = [];
+  const withoutScripts = html
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "");
+  // Tables become Markdown tables. They are swapped for placeholders so the
+  // generic tag stripping below does not flatten them; innermost tables first.
+  let tableSource = withoutScripts;
+  for (let pass = 0; pass < 5 && /<table\b/i.test(tableSource); pass += 1) {
+    tableSource = tableSource.replace(/<table\b[^>]*>((?:(?!<table\b)[\s\S])*?)<\/table>/gi, (_all, body) => {
+      tables.push(htmlTableToMarkdown(body, tables));
+      return `\n\u0000TABLE${tables.length - 1}\u0000\n`;
+    });
+  }
+  const content = decodeEntities(tableSource
     .replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi, (_all, level, text) => `\n${"#".repeat(Number(level))} ${stripTags(text)}\n`)
     .replace(/<pre\b[^>]*>([\s\S]*?)<\/pre>/gi, (_all, text) => `\n\`\`\`\n${stripTags(text).trim()}\n\`\`\`\n`)
     .replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, (_all, text) => `\`${stripTags(text).trim()}\``)
@@ -397,8 +581,36 @@ function htmlToMarkdown(html: string) {
     .replace(/[ \t]+/g, " ")
     .replace(/\n[ \t]+/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
+    .replace(/\u0000TABLE(\d+)\u0000/g, (_all, index) => tables[Number(index)] || "")
     .trim();
   return { title, content };
+}
+
+/** Converts the inside of a <table> element into a Markdown table. */
+export function htmlTableToMarkdown(body: string, nested: string[] = []) {
+  const caption = /<caption\b[^>]*>([\s\S]*?)<\/caption>/i.exec(body)?.[1];
+  const rows: string[][] = [];
+  for (const rowMatch of body.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)) {
+    const cells: string[] = [];
+    for (const cellMatch of rowMatch[1].matchAll(/<(th|td)\b([^>]*)>([\s\S]*?)<\/(?:th|td)>/gi)) {
+      const text = stripTags(cellMatch[3].replace(/<br\s*\/?>/gi, " "))
+        .replace(/\u0000TABLE(\d+)\u0000/g, (_all, index) => (nested[Number(index)] || "").replace(/\s*\n\s*/g, " "))
+        .replace(/\|/g, "\\|")
+        .trim();
+      cells.push(text);
+      const span = Number(/colspan\s*=\s*["']?(\d+)/i.exec(cellMatch[2])?.[1] || 1);
+      for (let extra = 1; extra < Math.min(span, 20); extra += 1) cells.push("");
+    }
+    if (cells.length) rows.push(cells);
+  }
+  const captionText = caption ? stripTags(caption).trim() : "";
+  if (!rows.length) return captionText;
+  const width = Math.max(...rows.map(row => row.length));
+  const pad = (cells: string[]) => `| ${[...cells, ...Array(width - cells.length).fill("")].join(" | ")} |`;
+  // The first row is used as the header (IBM Docs tables start with <th> cells).
+  const [first, ...rest] = rows;
+  const lines = [pad(first), `| ${Array(width).fill("---").join(" | ")} |`, ...rest.map(pad)];
+  return [captionText ? `**${captionText}**` : "", ...lines].filter(Boolean).join("\n");
 }
 
 function stripTags(value: string) {

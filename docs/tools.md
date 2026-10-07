@@ -78,6 +78,11 @@ Outline and dependency extraction follow the member source type: RPG (fully free
 
 The documentation catalog is also exposed through MCP resources: `ibmi-docs://catalog` and `ibmi-docs://topic/{ref}`.
 
+- `ibmi.docs.open` accepts a `ref` from search or any `https://www.ibm.com/docs/...` URL (for example a single CL command or API page). The URL must be https, host exactly `www.ibm.com`, path under `/docs/`, with no user information or port. Redirects are followed only within `www.ibm.com/docs/`, at most 3.
+- Pages are capped at 12 MiB while downloading, HTML tables become Markdown tables, and pages that were opened become searchable.
+- Cached pages expire after 7 days (`MCP_FOR_I_IBM_DOCS_CACHE_TTL_DAYS`). `cacheStatus` is `hit`, `miss`, `refreshed` or `stale` (expired copy served because the refresh failed).
+- The search catalog covers IBM i 7.2 to 7.6. Asking for an older release returns a warning saying IBM Docs has no collection for it.
+
 ## Actions
 - `ibmi.actions.list`
 - `ibmi.actions.run`
@@ -91,6 +96,9 @@ The documentation catalog is also exposed through MCP resources: `ibmi-docs://ca
 - `ibmi.libl.remove`
 - `ibmi.libl.setCurrent`
 - `ibmi.libl.validate`
+- `ibmi.libl.move`
+- `ibmi.libl.prune`
+- `ibmi.libl.runProfileCommand`
 
 ## Profiles
 - `ibmi.profiles.list`
@@ -314,3 +322,31 @@ The documentation catalog is also exposed through MCP resources: `ibmi-docs://ca
 - A failed command is returned as a tool error that names the first EVFEVENT error.
 - `ibmi.compile.listing` (read-only) fetches the same listing on its own: `objectName`, optional `userName`, `since` (IBM i timestamp) and `maxLines`.
 - `ibmi.diagnostics.parseEvfevent` parses EVFEVENT text (TIMESTAMP, PROCESSOR, FILEID, FILEEND, EXPANSION, ERROR records). Errors that the compiler reports against a temporary file such as `QTEMP/QSQLTEMP1` are mapped back to the original source line through the precompiler's EXPANSION records.
+
+## System Information
+- `ibmi.system.info` (read-only)
+
+Returns, in one call:
+- `os`: release (from `SYSIBMADM.ENV_SYS_INFO`), host name, CPUs, memory, plus partition and ASP figures from `QSYS2.SYSTEM_STATUS_INFO`.
+- `ptfGroups`: one row per PTF group from `QSYS2.GROUP_PTF_INFO` with the latest level known, its status and the latest installed level. Capped by `ptfGroupLimit` (default 100, max 1000) with `truncated`.
+- `authorities`: the current user's class, special authorities, group profiles and limited capabilities from `QSYS2.USER_INFO`.
+- `systemValues`: an allow-listed set of system values from `QSYS2.SYSTEM_VALUE_INFO` (security, national language, date/time, library list, model). `systemValues` picks a subset; names outside the allow-list are rejected.
+- `pase` and `tools`: `uname`, a few environment variables (PATH, HOME, SHELL, LANG, LC_ALL, TZ, QIBM_CCSID, QIBM_PASE_CCSID) and where pfgrep, openssl, git, bash, python3, node, java and mapepire-server are installed, gathered by one PASE command (`command -v`, then `/QOpenSys/pkgs/bin`).
+
+Pick parts with `sections` (`os`, `ptfGroups`, `authorities`, `systemValues`, `pase`, `tools`). A section that fails is reported under `errors` and the others are still returned.
+
+## Search by Change Date
+- `ibmi.search.changedLines` (read-only)
+
+Finds source lines whose `SRCDAT` falls between `from` and `to` (inclusive, `YYYY-MM-DD`; `to` defaults to today). `member` is a member name or a generic name with `*` (`ORD*`, `*ALL`, the default); `memberType` narrows a generic search. Each hit has the member, line number, sequence number, date and text.
+
+- `SRCDAT` stores `YYMMDD`. Years 40-99 are read as 1940-1999 and 00-39 as 2000-2039 (the IBM i two-digit year window). Lines with no date are never returned.
+- Each member is read with a `QTEMP` alias created in the same SQL job as the query.
+- `maxLines` (default 500, max 5000) and `maxMembers` (default 50, max 500) cap the work; `truncated` and `truncatedReason` say when either was hit. For a generic search, a member that cannot be read is listed under `errors`.
+
+## Library List Tidying
+- `ibmi.libl.move`: move a library to a 1-based `position`, or `direction` `up`/`down` by `steps` (default 1), or `top`/`bottom`.
+- `ibmi.libl.prune`: remove libraries that no longer exist (checked with `QSYS2.OBJECT_STATISTICS`). `dryRun` only reports. A missing current library is reported, not changed.
+- `ibmi.libl.runProfileCommand`: run a profile's `setLibraryListCommand` (the active profile by default, or `profileName`) and store the user library list and current library it produces, read back from `QSYS2.LIBRARY_LIST_INFO` in the same SQL job. `saveToProfile` also stores the result in the profile. Set the command with `ibmi.profiles.save` (`profile.setLibraryListCommand`). The command is checked against the CL command policy.
+
+All three update the stored connection settings the same way `ibmi.libl.set` does, need a writable connection, accept `approve` for guarded policies, and run `CHGLIBL`/`CHGCURLIB` when `applyToJob` is true.
