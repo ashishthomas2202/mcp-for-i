@@ -5,6 +5,15 @@ import { Tools } from "./Tools.js";
 import { IBMiContent } from "./IBMiContent.js";
 import { CommandData, CommandResult, ConnectionConfig, ConnectionData } from "./types.js";
 import { checkHostKey } from "./knownHosts.js";
+import {
+  DEFAULT_MAPEPIRE_PORT,
+  PersistentSqlJob,
+  SqlJobFactory,
+  SqlJobOpenRequest,
+  SqlRows,
+  isQualifiedJobName,
+  normalizeMapepireMode
+} from "./sqlJob.js";
 
 const LOCALE = "LC_ALL=EN_US.UTF-8";
 
@@ -19,11 +28,21 @@ export class IBMiClient {
   currentUser = "";
   currentConnectionName = "";
 
-  private config: ConnectionConfig;
+  /** Long-lived SQL job (Mapepire) shared by SQL and CL calls; see sqlJob.ts. */
+  readonly sqlJob: PersistentSqlJob;
 
-  constructor(config: ConnectionConfig) {
+  private config: ConnectionConfig;
+  private connection?: ConnectionData;
+
+  constructor(config: ConnectionConfig, options: { sqlJobFactory?: SqlJobFactory } = {}) {
     this.config = config;
     this.content = new IBMiContent(this);
+    this.sqlJob = new PersistentSqlJob({
+      getConfig: () => this.config,
+      getOpenRequest: () => this.sqlJobOpenRequest(),
+      factory: options.sqlJobFactory,
+      cancelStatement: jobName => this.cancelSqlInJob(jobName)
+    });
   }
 
   getConfig() {
@@ -86,6 +105,7 @@ export class IBMiClient {
       this.client = undefined;
       throw hostKeyError ?? err;
     }
+    this.connection = connection;
 
     await Promise.all([
       this.detectRemoteFeatures(),
@@ -94,6 +114,9 @@ export class IBMiClient {
   }
 
   async disconnect(): Promise<void> {
+    // Close the SQL job first: in single mode it runs on this SSH session.
+    await this.sqlJob.close().catch(() => undefined);
+    this.connection = undefined;
     if (this.client) {
       this.client.dispose();
       this.client = undefined;
@@ -149,7 +172,58 @@ export class IBMiClient {
     };
   }
 
-  async runSQL(statements: string): Promise<Tools.DB2Row[]> {
+  /**
+   * Runs SQL. Uses the connection's persistent Mapepire job when it is
+   * available (so library list changes and QTEMP carry over), otherwise a new
+   * QZDFMDB2 job. When `signal` aborts, a statement running in the persistent
+   * job is cancelled on the IBM i.
+   */
+  async runSQL(statements: string, options: { signal?: AbortSignal } = {}): Promise<SqlRows> {
+    const rows = await this.sqlJob.runSql(statements, options);
+    if (rows) return rows;
+    return this.runSqlQzdfmdb2(statements);
+  }
+
+  /**
+   * Runs a CL command where it affects later SQL and CL: in the persistent
+   * job when there is one, otherwise with `system` in a qsh job.
+   */
+  async runCL(command: string, options: { signal?: AbortSignal } = {}): Promise<CommandResult> {
+    try {
+      if (await this.sqlJob.runCl(command, options)) {
+        return { code: 0, signal: null, stdout: "", stderr: "", command };
+      }
+    } catch (err: any) {
+      return { code: 1, signal: null, stdout: "", stderr: err?.message || String(err), command };
+    }
+    // Single-quoted for qsh, so nothing in the command is expanded.
+    return this.sendQsh({ command: `system ${Tools.shellQuote(command)}` });
+  }
+
+  private sqlJobOpenRequest(): SqlJobOpenRequest | undefined {
+    if (!this.client || !this.connection) return undefined;
+    const port = Number(this.config.mapepirePort);
+    return {
+      host: this.connection.host,
+      username: this.connection.username,
+      password: this.connection.password,
+      ssh: this.client,
+      mode: normalizeMapepireMode(this.config.mapepireMode),
+      port: Number.isInteger(port) && port > 0 && port < 65536 ? port : DEFAULT_MAPEPIRE_PORT,
+      serverPath: this.config.mapepireServerPath || undefined,
+      javaPath: this.config.mapepireJavaPath || undefined,
+      probeTimeoutMs: 4000,
+      sendCommand: options => this.sendCommand(options)
+    };
+  }
+
+  /** QSYS2.CANCEL_SQL runs in a separate QZDFMDB2 job, since the target job is busy. */
+  private async cancelSqlInJob(jobName: string) {
+    if (!isQualifiedJobName(jobName)) throw new Error(`Invalid job name: ${jobName}`);
+    await this.runSqlQzdfmdb2(`CALL QSYS2.CANCEL_SQL('${jobName.toUpperCase()}')`);
+  }
+
+  async runSqlQzdfmdb2(statements: string): Promise<Tools.DB2Row[]> {
     const input = Tools.fixSQL(statements, true).trim();
     if (!input) return [];
     const ccsid = Number(this.config.sqlJobCcsid ?? 1208);

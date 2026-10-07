@@ -40,9 +40,17 @@ The local control plane (`mcp-for-i control`) only accepts requests from its own
   - remove the host's entry from `known_hosts.json`; the next connection trusts the key it sees.
 - A damaged `known_hosts.json` is never silently reset; connections fail until it is fixed or removed.
 
+## Mapepire TLS certificate
+
+- In `daemon` mode the persistent SQL job connects to the Mapepire server over TLS. Before any credentials are sent, the server's certificate chain is read. If it ends in a publicly trusted CA, the normal CA and host-name checks apply.
+- Otherwise (Mapepire's default self-signed certificate, or a private CA) the root certificate's `SHA256:...` fingerprint is stored per `host:port` under `certificates` in `known_hosts.json` on first use. Every later connection must present a chain that validates against that certificate and contains it; the host name is not compared, because the generated certificate rarely matches the name used to connect.
+- A changed certificate is refused like a changed SSH host key. Accept an expected change with `MCP_FOR_I_ACCEPT_NEW_HOSTKEY` (`host:port` of the Mapepire port, `host`, or the new fingerprint) or by removing the entry. With `sqlTransport: auto` a refused certificate makes SQL fall back to QZDFMDB2 over SSH; the reason is shown in `ibmi.session.status` (`sqlJob.unavailableReason`).
+- `ssh` mode runs over the already verified SSH session and uses no TLS.
+
 ## SQL handling
 
-- SQL text is sent to QZDFMDB2 on the SSH channel's standard input. It is never placed inside the shell command line.
+- SQL text is sent to QZDFMDB2 on the SSH channel's standard input. It is never placed inside the shell command line. With the persistent Mapepire job it is sent as a protocol message, and CL commands run through `QSYS2.QCMDEXC` with the command as a bound parameter.
+- The read-only and policy checks below run before SQL reaches either transport.
 - `ibmi.sql.query` accepts exactly one `SELECT`, `WITH` or `VALUES` statement (an optional trailing `;` is allowed). It rejects:
   - more than one statement;
   - lines starting with `@` (these run CL commands through QCMDEXC);

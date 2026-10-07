@@ -4,7 +4,8 @@ import path from "path";
 import { getConfigDir } from "../config/store.js";
 
 /**
- * Trust-on-first-use SSH host key store.
+ * Trust-on-first-use SSH host key store (also holds pinned TLS certificates
+ * for the Mapepire SQL server, see checkCertificate).
  *
  * Fingerprints are kept as OpenSSH-style SHA256 strings ("SHA256:<base64>")
  * per "host:port" in known_hosts.json in the mcp-for-i config directory.
@@ -19,9 +20,18 @@ export interface KnownHostEntry {
   updatedAt: string;
 }
 
+export interface KnownCertificateEntry {
+  fingerprint: string;
+  subject?: string;
+  addedAt: string;
+  updatedAt: string;
+}
+
 export interface KnownHostsFile {
   version: 1;
   hosts: Record<string, KnownHostEntry>;
+  /** TLS certificates trusted on first use (Mapepire), per "host:port". */
+  certificates?: Record<string, KnownCertificateEntry>;
 }
 
 export type HostKeyStatus = "trusted" | "added" | "replaced";
@@ -110,7 +120,8 @@ async function readKnownHosts(filePath: string): Promise<KnownHostsFile> {
     throw new Error(`Known hosts file ${filePath} is not valid JSON. Fix or remove it before connecting.`);
   }
   const hosts = parsed && typeof parsed.hosts === "object" && parsed.hosts ? parsed.hosts : {};
-  return { version: 1, hosts };
+  const certificates = parsed && typeof parsed.certificates === "object" && parsed.certificates ? parsed.certificates : undefined;
+  return certificates ? { version: 1, hosts, certificates } : { version: 1, hosts };
 }
 
 async function writeKnownHosts(filePath: string, data: KnownHostsFile) {
@@ -126,6 +137,12 @@ async function writeKnownHosts(filePath: string, data: KnownHostsFile) {
 }
 
 let queue: Promise<unknown> = Promise.resolve();
+
+function serialized<T>(run: () => Promise<T>): Promise<T> {
+  const result = queue.then(run, run);
+  queue = result.catch(() => undefined);
+  return result;
+}
 
 /**
  * Checks a presented host key against the store. Adds it on first use,
@@ -159,7 +176,74 @@ export function checkHostKey(options: HostKeyCheckOptions): Promise<{ status: Ho
     await writeKnownHosts(filePath, data);
     return { status: existing ? "replaced" as const : "added" as const, fingerprint };
   };
-  const result = queue.then(run, run);
-  queue = result.catch(() => undefined);
-  return result;
+  return serialized(run);
+}
+
+export class CertificateMismatchError extends Error {
+  constructor(
+    public readonly hostKey: string,
+    public readonly expected: string,
+    public readonly presented: string,
+    public readonly filePath: string
+  ) {
+    super(
+      `TLS certificate for ${hostKey} has changed. Stored ${expected}, server presented ${presented}. ` +
+      `This can mean a man-in-the-middle attack, so the connection was refused. ` +
+      `If the change is expected (for example the server certificate was renewed), ` +
+      `set ${ACCEPT_NEW_HOSTKEY_ENV}=${hostKey} (or =${presented}) and connect again, ` +
+      `or remove the "${hostKey}" entry under "certificates" in ${filePath}.`
+    );
+    this.name = "CertificateMismatchError";
+  }
+}
+
+/** SHA-256 fingerprint of a DER certificate, in the same "SHA256:<base64>" form as host keys. */
+export function certificateFingerprint(der: Buffer) {
+  return hostKeyFingerprint(der);
+}
+
+export interface CertificateCheckOptions {
+  host: string;
+  port: number;
+  /** DER bytes of the certificate to pin (the self-signed or private root). */
+  der: Buffer;
+  subject?: string;
+  filePath?: string;
+  acceptNew?: string;
+}
+
+/**
+ * Trust-on-first-use check for a TLS certificate, stored next to the SSH host
+ * keys. Same rules as checkHostKey: added on first use, replaced only when
+ * explicitly accepted, otherwise CertificateMismatchError.
+ */
+export function checkCertificate(options: CertificateCheckOptions): Promise<{ status: HostKeyStatus; fingerprint: string }> {
+  const run = async () => {
+    const filePath = options.filePath || getKnownHostsPath();
+    const acceptNew = options.acceptNew ?? process.env[ACCEPT_NEW_HOSTKEY_ENV];
+    const id = knownHostId(options.host, options.port);
+    const fingerprint = certificateFingerprint(options.der);
+    const data = await readKnownHosts(filePath);
+    const certificates = data.certificates || {};
+    const existing = certificates[id];
+    const now = new Date().toISOString();
+
+    if (existing && existing.fingerprint === fingerprint) {
+      return { status: "trusted" as const, fingerprint };
+    }
+    if (existing && !isNewHostKeyAccepted(acceptNew, options.host, options.port, fingerprint)) {
+      throw new CertificateMismatchError(id, existing.fingerprint, fingerprint, filePath);
+    }
+
+    certificates[id] = {
+      fingerprint,
+      ...(options.subject ? { subject: options.subject } : {}),
+      addedAt: existing ? existing.addedAt : now,
+      updatedAt: now
+    };
+    data.certificates = certificates;
+    await writeKnownHosts(filePath, data);
+    return { status: existing ? "replaced" as const : "added" as const, fingerprint };
+  };
+  return serialized(run);
 }

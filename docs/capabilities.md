@@ -24,6 +24,7 @@ Version context: `0.1.13` development codebase.
 - One-call session bootstrap with release, library-list, policy, transports, and supported fast-path capabilities.
 - Sliding inactivity timeout.
 - Heartbeat and reconnect behavior.
+- Persistent SQL job per connection (Mapepire, when installed on the IBM i): SQL, SQL-run CL, library list changes and the job log share one job across calls; falls back to a new QZDFMDB2 job per call when Mapepire is not available. Timed-out statements are cancelled on the IBM i. See [configuration](configuration.md#persistent-sql-job-mapepire) for `sqlTransport` and how to install Mapepire.
 
 ### 1.4 Agent-Safe Structured Results
 - Tool responses expose structured payloads for automation.
