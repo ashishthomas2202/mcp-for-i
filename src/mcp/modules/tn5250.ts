@@ -20,6 +20,9 @@ type Session = {
   client: Tn5250Client;
   createdAt: string;
   lastKey?: string;
+  /** Virtual device shown on the sign-on screen, used to end the job on disconnect. */
+  device?: string;
+  signedOn?: boolean;
 };
 
 const sessions = new Map<string, Session>();
@@ -159,8 +162,10 @@ async function handle(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.tn5250.disconnect": {
       const connectionName = getConnectionName(ctx, args);
+      const session = sessions.get(connectionName);
       const existed = closeSession(connectionName);
-      return json({ disconnected: existed, connectionName });
+      const endedJob = session?.signedOn && session.device ? await endDisconnectedJob(ctx, connectionName, session.device) : undefined;
+      return json({ disconnected: existed, connectionName, ...(endedJob ? { endedJob } : {}) });
     }
   }
   throw new Error(`Unknown tool: ${name}`);
@@ -212,6 +217,7 @@ async function connect(ctx: McpContext, args: any) {
 
   try {
     let settled = await client.waitForSettled(timeoutMs);
+    session.device = deviceFromScreen(client.screen) || deviceName;
     let signOn: Record<string, any> | undefined;
     if (password) {
       signOn = { method: client.autoSignOnOffered ? "telnet-environment" : "sign-on-screen" };
@@ -227,6 +233,7 @@ async function connect(ctx: McpContext, args: any) {
         signOn.method = "sign-on-screen";
       }
       signOn.stillOnSignOnScreen = Boolean(signOnFields(client.screen));
+      session.signedOn = !signOn.stillOnSignOnScreen;
     }
     return json({ ...sessionView(session), settled, ...(signOn ? { signOn } : {}) });
   } catch (err) {
@@ -418,6 +425,42 @@ function requireOpenSession(ctx: McpContext, args: any): Session {
     throw new Error(`TN5250 session for ${session.connectionName} is closed (${session.client.closeReason}). Call ibmi.tn5250.connect again.`);
   }
   return session;
+}
+
+/** The "Device:" value on a sign-on screen. */
+function deviceFromScreen(screen: Screen) {
+  for (const line of screen.renderRows()) {
+    const match = /\bDevice[ .]*:\s+([A-Z#@$][A-Z0-9#@$_]{0,9})\b/.exec(line);
+    if (match) return match[1];
+  }
+  return undefined;
+}
+
+/**
+ * Closing the socket leaves a signed-on job disconnected (DSC) until the system
+ * ends it. End our own job for that device right away; best effort.
+ */
+async function endDisconnectedJob(ctx: McpContext, connectionName: string, device: string) {
+  try {
+    const conn: any = await ctx.ensureActive(connectionName);
+    if (!/^[A-Z#@$][A-Z0-9#@$_]{0,9}$/.test(device)) return undefined;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      // Only a disconnected job of the signed-on user on that device.
+      const rows: any[] = await conn.runSQL(
+        `select job_name from table(qsys2.active_job_info(job_name_filter => '${device}')) x ` +
+        `where job_status = 'DSC' and job_name like '%/' concat current user concat '/%'`
+      );
+      const job = rows?.[0]?.JOB_NAME;
+      if (job && /^\d{6}\/[A-Z0-9#@$_]{1,10}\/[A-Z0-9#@$_]{1,10}$/.test(job)) {
+        const result = await conn.runCL(`ENDJOB JOB(${job}) OPTION(*IMMED)`);
+        return result?.code === 0 ? job : undefined;
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  } catch {
+    // the system ends disconnected jobs on its own (QDSCJOBITV)
+  }
+  return undefined;
 }
 
 function closeSession(connectionName: string) {
