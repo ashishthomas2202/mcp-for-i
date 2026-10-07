@@ -3,6 +3,8 @@ import { objectsModule } from "./objects.js";
 import { membersModule } from "./members.js";
 import { ifsOpsModule } from "./ifsOps.js";
 import { bulkMembersModule } from "./bulkMembers.js";
+import { compareModule } from "./compare.js";
+import { inspectModule } from "./inspect.js";
 
 /**
  * A group of tools that lives in its own file. getTools() appends every
@@ -15,7 +17,7 @@ export type ToolModule = {
 };
 
 // Feature modules register here, one import and one array entry each.
-export const toolModules: ToolModule[] = [objectsModule, membersModule, ifsOpsModule, bulkMembersModule];
+export const toolModules: ToolModule[] = [];
 
 export function findToolModule(name: string): ToolModule | undefined {
   return toolModules.find(module => module.tools.some(tool => tool.name === name));

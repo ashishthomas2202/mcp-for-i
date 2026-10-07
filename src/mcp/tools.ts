@@ -3682,19 +3682,19 @@ function normalizeJournalEntry(row: Record<string, unknown>) {
   };
 }
 
-function pickFirst(row: Record<string, unknown>, keys: string[]) {
+export function pickFirst(row: Record<string, unknown>, keys: string[]) {
   for (const key of keys) {
     if (typeof row[key] !== "undefined" && row[key] !== null) return row[key];
   }
   return undefined;
 }
 
-function toNullableNumber(value: unknown) {
+export function toNullableNumber(value: unknown) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 }
 
-function toNullableString(value: unknown) {
+export function toNullableString(value: unknown) {
   if (typeof value === "undefined" || value === null) return null;
   const text = String(value).trim();
   return text.length > 0 ? text : null;
@@ -4177,7 +4177,7 @@ async function readSystemFacts(conn: any): Promise<{ release?: string; effective
   return {};
 }
 
-function clampInteger(value: any, minimum: number, maximum: number, fallback: number) {
+export function clampInteger(value: any, minimum: number, maximum: number, fallback: number) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(minimum, Math.min(maximum, Math.floor(parsed)));
@@ -4255,7 +4255,7 @@ const IFS_READ_HARD_MAX_BYTES = 16 * 1024 * 1024;
 
 // Size of an IFS stream file from `ls -ldL`, or undefined when it can't be
 // determined (the download is then checked after the fact).
-async function statIfsFileSize(conn: any, remotePath: string): Promise<number | undefined> {
+export async function statIfsFileSize(conn: any, remotePath: string): Promise<number | undefined> {
   try {
     const res = await conn.sendCommand({ command: `ls -ldL ${Tools.escapePath(remotePath)}` });
     if (!res || res.code !== 0) return undefined;
@@ -4270,7 +4270,7 @@ async function statIfsFileSize(conn: any, remotePath: string): Promise<number | 
 
 // Decodes data as UTF-8 text, or returns undefined when it is binary (contains
 // NUL bytes or is not valid UTF-8).
-function decodeUtf8Text(data: Buffer): string | undefined {
+export function decodeUtf8Text(data: Buffer): string | undefined {
   if (data.includes(0)) return undefined;
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(data);
@@ -4313,7 +4313,7 @@ function requireSpoolJobFilter(value: unknown) {
   return raw.includes("/") ? requireJobName(raw) : requireIbmObjectName(raw, "jobName");
 }
 
-function requireObjectTypeValue(value: unknown, label: string) {
+export function requireObjectTypeValue(value: unknown, label: string) {
   const objectType = String(value || "").trim().toUpperCase();
   if (!/^\*[A-Z]{2,9}$/.test(objectType)) throw new Error(`Invalid ${label}: ${value}`);
   return objectType;
@@ -4401,7 +4401,7 @@ function getConnectionName(ctx: McpContext, args: any): string {
   return name;
 }
 
-function requireQsysName(conn: any, value: unknown, label: string) {
+export function requireQsysName(conn: any, value: unknown, label: string) {
   const raw = String(value || "").trim().toUpperCase();
   if (!raw) throw new Error(`${label} is required`);
   if (!conn.validQsysName(raw)) throw new Error(`Invalid ${label}: ${raw}`);
@@ -4879,7 +4879,7 @@ function isMissingColumnError(err: any, column: string) {
   return message.includes("42703") && message.includes(column.toUpperCase());
 }
 
-function requireIfsPath(value: unknown, label: string) {
+export function requireIfsPath(value: unknown, label: string) {
   const pathValue = String(value || "").trim();
   if (!pathValue.startsWith("/")) {
     throw new Error(`Invalid ${label}: must be an absolute IFS path`);
