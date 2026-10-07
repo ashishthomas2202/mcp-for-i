@@ -80,7 +80,9 @@ export namespace Search {
       }
     }
 
-    const before = clampCount(options?.before, 0, 50, 0);
+    // pfgrep only supports after-context (-A); before-context needs grep.
+    const requestedBefore = clampCount(options?.before, 0, 50, 0);
+    const before = pfgrep ? 0 : requestedBefore;
     const after = clampCount(options?.after, 0, 50, 0);
     const maxMatches = clampCount(options?.maxMatches, 1, MEMBER_SEARCH_MAX_MATCHES, MEMBER_SEARCH_DEFAULT_MAX_MATCHES);
     const contextFlags = [
@@ -88,7 +90,7 @@ export namespace Search {
       after ? `-A ${after}` : ""
     ].filter(Boolean).join(" ");
     // pfgrep documents -F (literal), -f - (patterns from stdin, one per line),
-    // -m (matches per member), -A/-B (context), -n, -H, -i and -r, all with
+    // -m (matches per member), -A (after-context; it has no -B), -n, -H, -i and -r, all with
     // grep semantics. Patterns go over stdin so terms never reach the shell.
     // -m stops each member early; one extra match per member reveals whether
     // the cap cut anything off. The total across members is bounded by head,
@@ -114,7 +116,12 @@ export namespace Search {
     }
 
     const outputLines = stdout.split("\n").filter(line => line.length > 0);
-    const parsed = parseMemberGrepOutput(stdout, maxMatches, readOnly);
+    // pfgrep prints after-context lines with ":" like matches, so tell them
+    // apart by whether the line contains one of the (literal) terms.
+    const isMatch = pfgrep && after > 0
+      ? (content: string) => terms.some(term => options?.caseSensitive ? content.includes(term) : content.toLowerCase().includes(term.toLowerCase()))
+      : undefined;
+    const parsed = parseMemberGrepOutput(stdout, maxMatches, readOnly, isMatch);
     let hits = parsed.hits;
 
     if (detailedMembers) {
@@ -124,6 +131,9 @@ export namespace Search {
       });
     }
 
+    const warnings: string[] = [];
+    if (pfgrep && requestedBefore > 0) warnings.push("pfgrep does not support before-context lines, so only after-context lines are returned.");
+    if (result.stderr) warnings.push(String(result.stderr).trim());
     const outputLimited = outputLines.length >= outputLineLimit;
     const truncated = parsed.truncated || outputLimited;
     return {
@@ -134,14 +144,14 @@ export namespace Search {
       maxMatches,
       truncated,
       ...(truncated ? { truncatedReason: parsed.truncated ? "max-matches" as const : "output-limit" as const } : {}),
-      ...(result.stderr ? { warnings: [String(result.stderr).trim()] } : {})
+      ...(warnings.length ? { warnings } : {})
     };
   }
 
   // Parses grep-style output where matching lines use "path:line:text" and
   // context lines use "path-line-text". Keeps at most maxMatches matches and
   // the context that belongs to them.
-  function parseMemberGrepOutput(output: string, maxMatches: number, readonly?: boolean) {
+  function parseMemberGrepOutput(output: string, maxMatches: number, readonly?: boolean, isMatch?: (content: string) => boolean) {
     const hits: SearchHit[] = [];
     let matchCount = 0;
     let truncated = false;
@@ -149,7 +159,7 @@ export namespace Search {
       if (!line || line === "--" || line.startsWith("Binary")) continue;
       const parsed = /^(.*?)([:-])(\d+)\2(.*)$/.exec(line);
       if (!parsed) continue;
-      const kind = parsed[2] === ":" ? "match" : "context";
+      const kind = parsed[2] === ":" && (!isMatch || isMatch(parsed[4])) ? "match" : "context";
       if (kind === "match") {
         if (matchCount >= maxMatches) {
           truncated = true;

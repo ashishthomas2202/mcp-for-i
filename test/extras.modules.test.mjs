@@ -162,7 +162,7 @@ test("SRCDAT century handling follows the 1940-2039 window", () => {
 
 test("changedLines builds a QTEMP alias query in one runSQL call", () => {
   const sql = buildChangedLinesSql("MYLIB", "QRPGLESRC", "ORDERS", 20250101, 20251231, 11);
-  assert.match(sql, /^create alias QTEMP\."MCP_[0-9A-F]+" for "MYLIB"\."QRPGLESRC"\("ORDERS"\);/);
+  assert.match(sql, /^create or replace alias QTEMP\."MCP_[0-9A-F]+" for "MYLIB"\."QRPGLESRC"\("ORDERS"\);/);
   assert.match(sql, /between 20250101 and 20251231/);
   assert.match(sql, /M\.SRCDAT >= 400000 then 19000000 \+ M\.SRCDAT else 20000000 \+ M\.SRCDAT/);
   assert.match(sql, /fetch first 11 rows only/);

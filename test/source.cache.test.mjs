@@ -16,7 +16,7 @@ function fakeClient(state) {
     upperCaseName: value => String(value).toUpperCase(),
     validQsysName: value => /^[A-Z][A-Z0-9]{0,9}$/.test(value),
     runSQL: async sql => {
-      if (/create alias/i.test(sql)) {
+      if (/create (or replace )?alias/i.test(sql)) {
         state.loads++;
         if (state.beforeLoad) await state.beforeLoad();
         return [memberRow(state.text, state.stamp)];

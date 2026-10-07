@@ -201,7 +201,7 @@ export async function readEvfeventMember(conn: any, library: string, member: str
   const mbr = requireQsysName(conn, member, "EVFEVENT member");
   try {
     const rows: Array<Record<string, unknown>> = await conn.runSQL(
-      `create alias QTEMP.MCP_EVFEVENT for "${lib}"."EVFEVENT"("${mbr}");\n` +
+      `create or replace alias QTEMP.MCP_EVFEVENT for "${lib}"."EVFEVENT"("${mbr}");\n` +
       `select * from QTEMP.MCP_EVFEVENT as E order by rrn(E)`
     );
     const lines = (rows || []).map(row => {

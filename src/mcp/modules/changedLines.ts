@@ -73,7 +73,7 @@ const SRCDAT_EXPRESSION =
 export function buildChangedLinesSql(library: string, sourceFile: string, member: string, from: number, to: number, limit: number) {
   const alias = `QTEMP."${makeAliasName(`${library}/${sourceFile}/${member}`)}"`;
   return (
-    `create alias ${alias} for "${library}"."${sourceFile}"("${member}");\n` +
+    `create or replace alias ${alias} for "${library}"."${sourceFile}"("${member}");\n` +
     "select X.LINE_NUMBER, X.SRCSEQ, X.FULL_DATE, X.SRCDTA from (" +
     `select row_number() over (order by rrn(M)) as LINE_NUMBER, M.SRCSEQ, ${SRCDAT_EXPRESSION} as FULL_DATE, M.SRCDTA ` +
     `from ${alias} as M) as X where X.FULL_DATE between ${from} and ${to} ` +

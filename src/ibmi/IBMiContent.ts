@@ -542,7 +542,7 @@ export class IBMiContent {
     const aliasPath = `QTEMP.\"${alias}\"`;
     const recordLength = await this.getRecordLength(undefined, lib, file);
     const rows = await this.ibmi.runSQL(
-      `create alias ${aliasPath} for \"${lib}\".\"${file}\"(\"${mbr}\");\n` +
+      `create or replace alias ${aliasPath} for \"${lib}\".\"${file}\"(\"${mbr}\");\n` +
       `select case when locate('40',hex(srcdat)) > 0 then 0 else srcdat end as SRCDAT, srcseq, srcdta ` +
       `from ${aliasPath} as M order by rrn(M)`
     );
@@ -591,7 +591,7 @@ export class IBMiContent {
 
     const tempTable = `QTEMP.NEWMEMBER`;
     const statements: string[] = [
-      `CREATE ALIAS ${aliasPath} FOR \"${lib}\".\"${file}\"(\"${mbr}\");`,
+      `CREATE OR REPLACE ALIAS ${aliasPath} FOR \"${lib}\".\"${file}\"(\"${mbr}\");`,
       `CREATE TABLE ${tempTable} LIKE \"${lib}\".\"${file}\";`
     ];
 
@@ -659,7 +659,7 @@ export class IBMiContent {
     const alias = makeAliasName(`${lib}/${file}/${mbr}`);
     const aliasPath = `QTEMP.\"${alias}\"`;
     const rows = await this.ibmi.runSQL(
-      `create alias ${aliasPath} for \"${lib}\".\"${file}\"(\"${mbr}\");\n` +
+      `create or replace alias ${aliasPath} for \"${lib}\".\"${file}\"(\"${mbr}\");\n` +
       `select case when locate('40',hex(M.srcdat)) > 0 then 0 else M.srcdat end as SRCDAT, M.srcseq, M.srcdta, ` +
       `P.SYSTEM_TABLE_MEMBER, P.SOURCE_TYPE, P.PARTITION_TEXT, P.NUMBER_ROWS, P.LAST_SOURCE_UPDATE_TIMESTAMP, T.ROW_LENGTH ` +
       `from ${aliasPath} as M cross join QSYS2.SYSPARTITIONSTAT P ` +

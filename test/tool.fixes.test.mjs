@@ -338,7 +338,7 @@ test("sql.query leaves queries that already limit rows unchanged", async () => {
 test("msgq.read returns newest messages first", async () => {
   const { conn, calls } = fakeConn();
   await handleTool(context(conn), "ibmi.msgq.read", { limit: 5 });
-  assert.match(calls.sql[0], /message_queue_info\(queue_library => 'QSYS', queue_name => 'QSYSOPR'\)\) order by message_timestamp desc fetch first 5 rows only/);
+  assert.match(calls.sql[0], /hex\(x\.message_key\) as message_key_hex from table\(qsys2\.message_queue_info\(queue_library => 'QSYS', queue_name => 'QSYSOPR'\)\) x order by message_timestamp desc fetch first 5 rows only/);
 });
 
 test("libraries.list turns a generic filter into LIKE", async () => {
@@ -369,7 +369,7 @@ test("spool.list filters by user, output queue and job in SQL", async () => {
   });
   assert.equal(
     calls.sql[0],
-    "select * from qsys2.output_queue_entries where user_name = 'DEV' and output_queue_name = 'QPRINT' and output_queue_library_name = 'QGPL' and job_name = '123456/DEV/ORDJOB' order by create_timestamp desc fetch first 20 rows only"
+    "select * from table(qsys2.spooled_file_info(user_name => 'DEV', job_name => '123456/DEV/ORDJOB')) x where output_queue = 'QPRINT' and output_queue_library = 'QGPL' order by creation_timestamp desc fetch first 20 rows only"
   );
   await handleTool(context(conn), "ibmi.spool.list", { jobName: "ORDJOB" });
   assert.match(calls.sql[1], /job_name like '%\/ORDJOB'/);

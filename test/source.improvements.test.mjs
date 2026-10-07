@@ -166,7 +166,7 @@ test("source-date reads create and consume a QTEMP alias in one SQL job", async 
   assert.equal(result.content, "first\nsecond");
   assert.equal(result.transport, "sql-member");
   assert.equal(statements.length, 1);
-  assert.match(statements[0], /create alias QTEMP\."MCP_/i);
+  assert.match(statements[0], /create or replace alias QTEMP\."MCP_/i);
   assert.match(statements[0], /from QTEMP\."MCP_.*" as M cross join/i);
   assert.match(statements[0], /order by rrn\(M\)/i);
   assert.equal(statements.some(sql => /ILEDITOR/i.test(sql)), false);
@@ -257,7 +257,7 @@ test("identical snapshot reads are coalesced and then served from the bounded ca
     upperCaseName: value => String(value).toUpperCase(),
     validQsysName: value => /^[A-Z][A-Z0-9]{0,9}$/.test(value),
     runSQL: async sql => {
-      if (!/create alias/i.test(sql)) metadataChecks++;
+      if (!/create (or replace )?alias/i.test(sql)) metadataChecks++;
       else sqlCalls++;
       await Promise.resolve();
       return [{

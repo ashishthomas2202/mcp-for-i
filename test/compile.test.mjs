@@ -216,7 +216,7 @@ test("actions.run compiles a member, reads EVFEVENT and returns errors by file",
   const qsh = calls.find(([kind]) => kind === "qsh");
   assert.ok(qsh[1].includes("system 'CRTBNDRPG PGM(DEVLIB/HELLO) SRCFILE(DEVLIB/QRPGLESRC) SRCMBR(HELLO) OPTION(*EVENTF) DBGVIEW(*SOURCE)'"), qsh[1]);
   const evfSql = calls.find(([kind, sql]) => kind === "sql" && /EVFEVENT/.test(sql));
-  assert.match(evfSql[1], /create alias QTEMP\.MCP_EVFEVENT for "DEVLIB"\."EVFEVENT"\("HELLO"\)/);
+  assert.match(evfSql[1], /create or replace alias QTEMP\.MCP_EVFEVENT for "DEVLIB"\."EVFEVENT"\("HELLO"\)/);
 });
 
 test("actions.run sets &EXT and &EXTL for members and refuses streamfile variables", async () => {

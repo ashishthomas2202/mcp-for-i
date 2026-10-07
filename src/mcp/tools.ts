@@ -3076,12 +3076,12 @@ async function queryMessageQueueEntries(conn: any, options: MessageQueueOptions)
   let rows: Array<Record<string, unknown>>;
   try {
     rows = await conn.runSQL(
-      `select * from table(qsys2.message_queue_info(queue_library => ${Tools.sqlString(options.library)}, queue_name => ${Tools.sqlString(options.messageQueue)})) ` +
+      `select x.*, hex(x.message_key) as message_key_hex from table(qsys2.message_queue_info(queue_library => ${Tools.sqlString(options.library)}, queue_name => ${Tools.sqlString(options.messageQueue)})) x ` +
       `order by message_timestamp desc fetch first ${options.limit} rows only`
     );
   } catch {
     rows = await conn.runSQL(
-      `select * from qsys2.message_queue_info where message_queue_name=${Tools.sqlString(options.messageQueue)} and message_queue_library=${Tools.sqlString(options.library)} ` +
+      `select x.*, hex(x.message_key) as message_key_hex from qsys2.message_queue_info x where message_queue_name=${Tools.sqlString(options.messageQueue)} and message_queue_library=${Tools.sqlString(options.library)} ` +
       `order by message_timestamp desc fetch first ${options.limit} rows only`
     );
   }
@@ -3114,10 +3114,27 @@ function buildSpoolWhereClause(options: SpoolQueryOptions) {
 async function querySpoolEntries(conn: any, options: SpoolQueryOptions) {
   const limit = options.limit;
   const where = buildSpoolWhereClause(options);
-  const queries = [
+  const queries: string[] = [];
+  // OUTPUT_QUEUE_ENTRIES scans every spooled file on the system before the
+  // WHERE applies, which can take minutes. SPOOLED_FILE_INFO filters by user
+  // or job inside the service, so use it first when one of those is given.
+  const qualifiedJob = options.jobName?.includes("/") ? options.jobName : undefined;
+  if (options.userName || qualifiedJob) {
+    const params = [
+      options.userName ? `user_name => ${Tools.sqlString(options.userName)}` : "",
+      qualifiedJob ? `job_name => ${Tools.sqlString(qualifiedJob)}` : ""
+    ].filter(Boolean).join(", ");
+    const filters = [
+      options.outputQueue ? `output_queue = ${Tools.sqlString(options.outputQueue)}` : "",
+      options.outputQueueLibrary ? `output_queue_library = ${Tools.sqlString(options.outputQueueLibrary)}` : "",
+      options.jobName && !qualifiedJob ? `job_name = ${Tools.sqlString(options.jobName)}` : ""
+    ].filter(Boolean);
+    queries.push(`select * from table(qsys2.spooled_file_info(${params})) x${filters.length ? ` where ${filters.join(" and ")}` : ""} order by creation_timestamp desc fetch first ${limit} rows only`);
+  }
+  queries.push(
     `select * from qsys2.output_queue_entries${where} order by create_timestamp desc fetch first ${limit} rows only`,
     `select * from qsys2.output_queue_entries${where} fetch first ${limit} rows only`
-  ];
+  );
   if (!where) {
     queries.push(
       `select * from table(qsys2.output_queue_entries()) fetch first ${limit} rows only`,
@@ -3140,7 +3157,8 @@ async function querySpoolEntries(conn: any, options: SpoolQueryOptions) {
 function normalizeMessageQueueEntry(row: Record<string, unknown>) {
   return {
     source: "msgq",
-    messageKey: toNullableString(pickFirst(row, ["MESSAGE_KEY", "MSGKEY"])),
+    // The raw key is binary; the hex form is what ibmi.msgq.reply accepts.
+    messageKey: toNullableString(pickFirst(row, ["MESSAGE_KEY_HEX", "MSGKEY"])),
     messageId: toNullableString(pickFirst(row, ["MESSAGE_ID", "MSGID"])),
     messageType: toNullableString(pickFirst(row, ["MESSAGE_TYPE", "MSGTYPE"])),
     severity: toNullableNumber(pickFirst(row, ["SEVERITY", "MSGSEV"])),
@@ -3309,7 +3327,7 @@ function normalizeDataAreaInfoRow(row: Record<string, unknown>) {
     type: toNullableString(pickFirst(row, ["DATA_AREA_TYPE", "OBJECT_TYPE"])),
     length: toNullableNumber(pickFirst(row, ["LENGTH", "DATA_AREA_LENGTH"])),
     decimalPositions: toNullableNumber(pickFirst(row, ["DECIMAL_POSITIONS"])),
-    value: toNullableString(pickFirst(row, ["CHARACTER_VALUE", "VALUE", "DECIMAL_VALUE"])),
+    value: toNullableString(pickFirst(row, ["DATA_AREA_VALUE", "CHARACTER_VALUE", "VALUE", "DECIMAL_VALUE"])),
     updatedAt: toNullableString(pickFirst(row, ["LAST_CHANGED_TIMESTAMP", "CHANGE_TIMESTAMP"]))
   };
 }
@@ -4392,7 +4410,7 @@ export function normalizeSpoolEntry(row: Record<string, unknown>) {
   return {
     ...row,
     source: "spool",
-    jobName: toNullableString(pickFirst(row, ["JOB_NAME", "JOB"])) || "",
+    jobName: toNullableString(pickFirst(row, ["QUALIFIED_JOB_NAME", "JOB_NAME", "JOB"])) || "",
     spooledFileName: toNullableString(pickFirst(row, ["SPOOLED_FILE_NAME", "SPOOLED_FILE", "SPLF_NAME"])) || "",
     spooledFileNumber: toNullableNumber(pickFirst(row, ["SPOOLED_FILE_NUMBER", "SPLF_NUMBER", "FILE_NUMBER"])),
     outputQueue: toNullableString(pickFirst(row, ["OUTPUT_QUEUE_NAME", "OUTQ_NAME", "OUTPUT_QUEUE"])) || "",
