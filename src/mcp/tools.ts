@@ -1825,10 +1825,8 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         currentLibrary: args.currentLibrary,
         libraryList: args.libraryList
       });
-      if (args.applyToJob) {
-        await applyLibraryList(active, args.libraryList, args.currentLibrary);
-      }
-      return result("OK");
+      const applied = args.applyToJob ? await applyLibraryList(active, args.libraryList, args.currentLibrary) : undefined;
+      return okApplied(applied);
     }
     case "ibmi.libl.add": {
       const name = getConnectionName(ctx, args);
@@ -1840,10 +1838,8 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const active = await ctx.ensureActive(name);
       enforceWritable(ctx, active, "qsys.write", args);
       await updateConnectionSettings(ctx, name, { libraryList: list });
-      if (args.applyToJob) {
-        await applyLibraryList(active, list, conn.settings?.currentLibrary);
-      }
-      return result("OK");
+      const applied = args.applyToJob ? await applyLibraryList(active, list, conn.settings?.currentLibrary) : undefined;
+      return okApplied(applied);
     }
     case "ibmi.libl.remove": {
       const name = getConnectionName(ctx, args);
@@ -1853,10 +1849,8 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const active = await ctx.ensureActive(name);
       enforceWritable(ctx, active, "qsys.write", args);
       await updateConnectionSettings(ctx, name, { libraryList: list });
-      if (args.applyToJob) {
-        await applyLibraryList(active, list, conn.settings?.currentLibrary);
-      }
-      return result("OK");
+      const applied = args.applyToJob ? await applyLibraryList(active, list, conn.settings?.currentLibrary) : undefined;
+      return okApplied(applied);
     }
     case "ibmi.libl.setCurrent": {
       const name = getConnectionName(ctx, args);
@@ -1864,10 +1858,8 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const active = await ctx.ensureActive(name);
       enforceWritable(ctx, active, "qsys.write", args);
       await updateConnectionSettings(ctx, name, { currentLibrary: lib });
-      if (args.applyToJob) {
-        await applyLibraryList(active, undefined, lib);
-      }
-      return result("OK");
+      const applied = args.applyToJob ? await applyLibraryList(active, undefined, lib) : undefined;
+      return okApplied(applied);
     }
     case "ibmi.libl.validate": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -1907,10 +1899,8 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         customVariables: profile.customVariables
       });
 
-      if (args.applyToJob) {
-        await applyLibraryList(active, profile.libraryList, profile.currentLibrary);
-      }
-      return result(`Profile ${args.name} activated`);
+      const applied = args.applyToJob ? await applyLibraryList(active, profile.libraryList, profile.currentLibrary) : undefined;
+      return okApplied(applied, `Profile ${args.name} activated`);
     }
     case "ibmi.resolve.path": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -2278,7 +2268,14 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.joblog.get": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const limit = clampNumber(args?.limit, 200, 1, 5000);
-      const rows = await conn.runSQL(`select message_id, message_text, severity, message_timestamp from table(qsys2.joblog_info('*')) order by message_timestamp desc fetch first ${limit} rows only`);
+      // MCH3401 "Cannot resolve to object PPTT" is logged by the database
+      // machinery on every statement on some systems; it would crowd out the
+      // messages from the user's own SQL and CL.
+      const rows = await conn.runSQL(
+        `select message_id, message_text, severity, message_timestamp from table(qsys2.joblog_info('*')) x ` +
+        `where not (coalesce(message_id, '') = 'MCH3401' and coalesce(message_text, '') like '%PPTT%') ` +
+        `order by message_timestamp desc fetch first ${limit} rows only`
+      );
       return json(rows.map(normalizeJoblogRow));
     }
     case "ibmi.spool.list": {
@@ -4100,7 +4097,20 @@ export async function updateConnectionSettings(ctx: McpContext, name: string, up
   }
 }
 
-export async function applyLibraryList(conn: any, libraryList?: string[], currentLibrary?: string) {
+/**
+ * applyToJob: puts the library list in effect now. A connected client applies
+ * its configured list (which the caller has just updated) to the persistent
+ * SQL job, or checks it for the per-call QZDFMDB2 and qsh jobs; libraries that
+ * do not exist are left out and reported in `warning` instead of failing.
+ */
+export async function applyLibraryList(conn: any, libraryList?: string[], currentLibrary?: string): Promise<{ warning?: string }> {
+  const names = [...(libraryList || []), ...(currentLibrary ? [currentLibrary] : [])].map(l => String(l).toUpperCase());
+  const invalid = names.find(l => !conn.validQsysName(l));
+  if (invalid) throw new Error(`Invalid library name: ${invalid}`);
+  if (typeof conn.applyConfiguredLibraryList === "function") {
+    const applied = await conn.applyConfiguredLibraryList();
+    return applied?.warning ? { warning: applied.warning } : {};
+  }
   if (libraryList && libraryList.length > 0) {
     const normalized = libraryList.map((l: string) => String(l).toUpperCase());
     const invalid = normalized.find((l: string) => !conn.validQsysName(l));
@@ -4123,6 +4133,12 @@ export async function applyLibraryList(conn: any, libraryList?: string[], curren
       requireCommandSuccess(await conn.sendQsh({ command: `system \"CHGCURLIB ${lib.replace(/\$/g, "\\$")}\"` }), "CHGCURLIB");
     }
   }
+  return {};
+}
+
+/** "OK", plus the library list warning from applyToJob when there is one. */
+function okApplied(applied?: { warning?: string }, text = "OK") {
+  return result(applied?.warning ? `${text}. Warning: ${applied.warning}` : text);
 }
 
 function stripUndefined(obj: Record<string, any>) {

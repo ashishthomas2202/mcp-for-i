@@ -5,6 +5,15 @@ import type { NodeSSH } from "node-ssh";
 import { Tools } from "./Tools.js";
 import { splitSqlStatements, isReadOnlySql } from "./sqlParse.js";
 import { checkCertificate, certificateFingerprint } from "./knownHosts.js";
+import {
+  desiredLibraryList,
+  existingLibrariesSql,
+  invalidNamesWarning,
+  libraryListCommand,
+  libraryNamesFromRows,
+  referencedLibraries,
+  resolveAgainstExisting
+} from "./libraryList.js";
 import type { CommandData, CommandResult, ConnectionConfig } from "./types.js";
 
 /**
@@ -16,6 +25,21 @@ import type { CommandData, CommandResult, ConnectionConfig } from "./types.js";
  * IBM i, one long-lived database job is opened lazily on the first SQL call and
  * reused until the connection closes. When Mapepire is not available the
  * client falls back to QZDFMDB2 (unless sqlTransport is "mapepire").
+ *
+ * Library list. Mapepire single mode (over SSH) starts with the in-process
+ * CLI technique: the JDBC properties are ignored (so SQL naming) and each SQL
+ * request runs on a new thread of the server job. On IBM i the library list
+ * belongs to the thread, so a CHGLIBL run as `CALL QSYS2.QCMDEXC` in a SQL
+ * request is gone when the request ends. The job is therefore switched to the
+ * TCP technique right after it starts (a database host server job, as in
+ * daemon mode), where the properties apply and the library list persists. If
+ * that is not possible the CLI technique is kept, and CL still lasts there
+ * when it is sent as a CL request (SQLJob.clcommand): those run on the
+ * dispatcher thread, whose library list later SQL threads inherit. So every
+ * CL command goes through clcommand, including `@` lines and literal
+ * `CALL QCMDEXC('...')` statements, and the connection's configured library
+ * list is applied that way before the first statement and again whenever the
+ * setting changes.
  */
 
 export type SqlTransportSetting = "auto" | "mapepire" | "qzdfmdb2";
@@ -68,13 +92,64 @@ export interface SqlJobHandle {
   /** Qualified IBM i job name (number/user/name), when the server reports it. */
   readonly jobName?: string;
   readonly mode: "daemon" | "ssh";
+  /**
+   * How the server reaches Db2: "tcp" is a database host server job
+   * (QZDASOINIT) that honours the JDBC properties; "cli" is the in-process CLI
+   * connection single mode starts with, which ignores them (SQL naming).
+   */
+  readonly technique?: "tcp" | "cli";
   isAlive(): boolean;
   /**
    * Runs one statement and fetches every row. When `signal` aborts, fetching
    * stops and the server-side cursor is closed.
    */
   run(sql: string, options: { parameters?: Array<string | number | null>; signal?: AbortSignal }): Promise<SqlJobStatementResult>;
+  /**
+   * Runs a CL command where its effect on the library list lasts (Mapepire's
+   * CL request). Without it, CL runs as CALL QSYS2.QCMDEXC through run().
+   */
+  runCl?(command: string, options: { signal?: AbortSignal }): Promise<SqlJobClResult>;
   close(): Promise<void>;
+}
+
+export interface SqlJobClMessage {
+  id?: string;
+  type?: string;
+  text: string;
+}
+
+export interface SqlJobClResult {
+  success: boolean;
+  /** Job log messages the command sent. */
+  messages: SqlJobClMessage[];
+}
+
+/** A CL command failed; the message carries its diagnostic and escape messages. */
+export class ClCommandError extends Tools.SqlError {
+  constructor(readonly command: string, readonly messages: SqlJobClMessage[]) {
+    super(clFailureText(command, messages));
+    this.name = "ClCommandError";
+    this.sqlstate = "38501";
+  }
+}
+
+function clFailureText(command: string, messages: SqlJobClMessage[]) {
+  const relevant = messages.filter(m => /^(ESC|DIAG)/i.test(m.type || ""));
+  const detail = (relevant.length ? relevant : messages).map(m => (m.id ? `${m.id}: ${m.text}` : m.text)).join(" ");
+  return `${command.trim().split(/\s+/)[0]} failed${detail ? `: ${detail}` : ""}`;
+}
+
+/** Messages from the server's own machinery that say nothing about the command. */
+export function isNoiseMessage(message: SqlJobClMessage) {
+  return message.id === "MCH3401" && /\bPPTT\b/.test(message.text);
+}
+
+const QCMDEXC_CALL = /^CALL\s+(?:(?:QSYS2|QSYS)\s*[./]\s*)?QCMDEXC\s*\(\s*'((?:[^']|'')*)'\s*(?:,\s*\d+(?:\.\d*)?\s*)?\)\s*$/i;
+
+/** The CL command of `CALL QSYS2.QCMDEXC('...')` with a literal, else undefined. */
+export function qcmdexcLiteral(statement: string): string | undefined {
+  const match = statement.trim().match(QCMDEXC_CALL);
+  return match ? match[1].replace(/''/g, "'") : undefined;
 }
 
 export interface SqlJobOpenRequest {
@@ -106,6 +181,7 @@ export interface SqlJobStatus {
   /** What SQL currently runs through. */
   active: "mapepire" | "qzdfmdb2" | "not-started";
   mode?: "daemon" | "ssh";
+  technique?: "tcp" | "cli";
   jobName?: string;
   /** Why the persistent job is not used for this connection (cached until reconnect). */
   unavailableReason?: string;
@@ -124,6 +200,8 @@ export interface PersistentSqlJobOptions {
   cancelGraceMs?: number;
   /** auto mode: how long a call waits for the job to open before using QZDFMDB2 for that call. */
   openWaitMs?: number;
+  /** Library list warning from the QZDFMDB2 path, shown when that path is in use. */
+  fallbackLibraryListWarning?: () => string | undefined;
 }
 
 export function normalizeSqlTransport(value: unknown): SqlTransportSetting {
@@ -153,6 +231,8 @@ export class PersistentSqlJob {
   private lastError?: string;
   private libraryListWarning?: string;
   private lastCancel?: string;
+  /** The configured library list last applied, and to which job. */
+  private appliedLibraryList?: { handle: SqlJobHandle; signature: string };
   private closed = false;
   private readonly factory: SqlJobFactory;
 
@@ -170,13 +250,16 @@ export class PersistentSqlJob {
     let active: SqlJobStatus["active"] = "not-started";
     if (transport === "qzdfmdb2" || (transport === "auto" && this.unavailableReason)) active = "qzdfmdb2";
     else if (live) active = "mapepire";
+    const libraryListWarning = active === "qzdfmdb2"
+      ? this.options.fallbackLibraryListWarning?.()
+      : this.libraryListWarning ?? this.options.fallbackLibraryListWarning?.();
     return {
       transport,
       active,
-      ...(live ? { mode: live.mode, jobName: live.jobName } : {}),
+      ...(live ? { mode: live.mode, ...(live.technique ? { technique: live.technique } : {}), jobName: live.jobName } : {}),
       ...(this.unavailableReason ? { unavailableReason: this.unavailableReason } : {}),
       ...(this.lastError ? { lastError: this.lastError } : {}),
-      ...(this.libraryListWarning ? { libraryListWarning: this.libraryListWarning } : {}),
+      ...(libraryListWarning ? { libraryListWarning } : {}),
       ...(this.lastCancel ? { lastCancel: this.lastCancel } : {})
     };
   }
@@ -194,27 +277,38 @@ export class PersistentSqlJob {
     const handle = await this.acquire();
     if (!handle) return undefined;
     try {
-      return await this.exclusive(options.signal, () => this.runAll(handle, statements, options.signal));
+      return await this.exclusive(options.signal, async () => {
+        await this.ensureLibraryList(handle);
+        return this.runAll(handle, statements, options.signal);
+      });
     } catch (err) {
       // The job died under a read: nothing was changed, so reopen and retry once.
       if (!handle.isAlive() && !options.signal?.aborted && isReadOnlySql(statements)) {
         await this.discard(handle);
         const next = await this.acquire();
         if (!next) return undefined;
-        return this.exclusive(options.signal, () => this.runAll(next, statements, options.signal));
+        return this.exclusive(options.signal, async () => {
+          await this.ensureLibraryList(next);
+          return this.runAll(next, statements, options.signal);
+        });
       }
       if (!handle.isAlive()) await this.discard(handle);
       throw err;
     }
   }
 
-  /** Runs a CL command in the persistent job. Returns false when the job is not used. */
-  async runCl(command: string, options: { signal?: AbortSignal } = {}): Promise<boolean> {
+  /**
+   * Runs a CL command in the persistent job. Returns undefined when the job is
+   * not used, otherwise the job log messages the command sent.
+   */
+  async runCl(command: string, options: { signal?: AbortSignal } = {}): Promise<SqlJobClMessage[] | undefined> {
     const handle = await this.acquire();
-    if (!handle) return false;
+    if (!handle) return undefined;
     try {
-      await this.exclusive(options.signal, () => this.runStatement(handle, "CALL QSYS2.QCMDEXC(?)", [command], options.signal));
-      return true;
+      return await this.exclusive(options.signal, async () => {
+        await this.ensureLibraryList(handle);
+        return this.execCl(handle, command, options.signal);
+      });
     } catch (err) {
       if (!handle.isAlive()) await this.discard(handle);
       throw err;
@@ -288,32 +382,75 @@ export class PersistentSqlJob {
     }
     this.handle = handle;
     this.unavailableReason = undefined;
-    await this.applyLibraryList(handle);
     return handle;
   }
 
-  /** Applies the connection's configured library list and current library to a new job. */
-  private async applyLibraryList(handle: SqlJobHandle) {
-    this.libraryListWarning = undefined;
-    const config = this.options.getConfig();
-    const valid = (name: string) => /^[A-Z#@$][A-Z0-9#@$._]{0,9}$/.test(name);
-    const libs = (config.libraryList || []).map(l => String(l).trim().toUpperCase()).filter(Boolean);
-    const curlib = String(config.currentLibrary || "").trim().toUpperCase();
-    const bad = [...libs, ...(curlib ? [curlib] : [])].filter(l => !valid(l));
-    if (bad.length > 0) {
-      this.libraryListWarning = `Library list not applied to the SQL job: invalid name(s) ${bad.join(", ")}`;
-      return;
-    }
-    const unique = libs.filter(Tools.distinct);
-    let command = "";
-    if (unique.length > 0) command = `CHGLIBL LIBL(${unique.join(" ")})${curlib ? ` CURLIB(${curlib})` : ""}`;
-    else if (curlib) command = `CHGCURLIB CURLIB(${curlib})`;
+  /**
+   * Applies the connection's configured library list again, even when it was
+   * applied before. Returns undefined when the persistent job is not used.
+   */
+  async reapplyLibraryList(): Promise<{ warning?: string } | undefined> {
+    const handle = await this.acquire();
+    if (!handle) return undefined;
+    return this.exclusive(undefined, async () => {
+      this.appliedLibraryList = undefined;
+      await this.ensureLibraryList(handle);
+      return this.libraryListWarning ? { warning: this.libraryListWarning } : {};
+    });
+  }
+
+  /**
+   * Puts the connection's configured library list and current library in
+   * effect in the job, unless that list was already applied to this job. Runs
+   * inside the queue. A failure never fails the caller's statement: missing
+   * libraries are left out and the reason is kept for the session status.
+   */
+  private async ensureLibraryList(handle: SqlJobHandle) {
+    const desired = desiredLibraryList(this.options.getConfig());
+    const applied = this.appliedLibraryList;
+    if (applied && applied.handle === handle && applied.signature === desired.signature) return;
+    // Recorded first, so a list that cannot be applied is not retried on every call.
+    this.appliedLibraryList = { handle, signature: desired.signature };
+    this.libraryListWarning = invalidNamesWarning(desired);
+    const command = libraryListCommand(desired.libraries, desired.currentLibrary);
     if (!command) return;
     try {
-      await this.exclusive(undefined, () => this.runStatement(handle, "CALL QSYS2.QCMDEXC(?)", [command]));
+      await this.execCl(handle, command);
+      return;
     } catch (err: any) {
-      this.libraryListWarning = `${command} failed in the SQL job: ${err?.message || String(err)}`;
+      if (!handle.isAlive()) throw err;
+      const firstError = err?.message || String(err);
+      try {
+        const names = referencedLibraries(desired);
+        const result = await this.runStatement(handle, existingLibrariesSql(names)).catch(err => {
+          if (!handle.isAlive()) throw err;
+          // Older releases do not know *ALLSIMPLE.
+          return this.runStatement(handle, existingLibrariesSql(names, false));
+        });
+        const resolved = resolveAgainstExisting(desired, libraryNamesFromRows(result.rows));
+        if (!resolved.warning) {
+          this.libraryListWarning = `${command} failed in the SQL job: ${firstError}`;
+          return;
+        }
+        if (resolved.command) await this.execCl(handle, resolved.command);
+        this.libraryListWarning = resolved.warning;
+      } catch (retryErr: any) {
+        if (!handle.isAlive()) throw retryErr;
+        this.libraryListWarning = `${command} failed in the SQL job: ${firstError}`;
+      }
     }
+  }
+
+  /** Runs CL so that its library list changes last (see the note at the top). */
+  private async execCl(handle: SqlJobHandle, command: string, signal?: AbortSignal): Promise<SqlJobClMessage[]> {
+    if (!handle.runCl) {
+      await this.runStatement(handle, "CALL QSYS2.QCMDEXC(?)", [command], signal);
+      return [];
+    }
+    const result = await this.withCancel(handle, handle.runCl(command, { signal }), signal);
+    const messages = (result.messages || []).filter(m => !isNoiseMessage(m));
+    if (!result.success) throw new ClCommandError(command, messages);
+    return messages;
   }
 
   private async discard(handle: SqlJobHandle) {
@@ -338,9 +475,12 @@ export class PersistentSqlJob {
     for (const statement of splitSqlStatements(statements)) {
       if (signal?.aborted) throw new Error("SQL statement cancelled");
       const isCl = statement.tokens.length === 1 && statement.tokens[0].type === "cl";
-      const result = isCl
-        ? await this.runStatement(handle, "CALL QSYS2.QCMDEXC(?)", [statement.tokens[0].value], signal)
-        : await this.runStatement(handle, statement.text, undefined, signal);
+      const clCommand = isCl ? statement.tokens[0].value : qcmdexcLiteral(statement.text);
+      if (clCommand !== undefined) {
+        await this.execCl(handle, clCommand, signal);
+        continue;
+      }
+      const result = await this.runStatement(handle, statement.text, undefined, signal);
       rows.push(...result.rows);
       if (typeof result.updateCount === "number" && result.updateCount >= 0) {
         updateCount = (updateCount ?? 0) + result.updateCount;
@@ -357,6 +497,11 @@ export class PersistentSqlJob {
       result => ({ rows: result.rows.map(row => normalizeRow(row, result.columns)), updateCount: result.updateCount }),
       err => { throw toSqlError(err, sql); }
     );
+    return this.withCancel(handle, work, signal);
+  }
+
+  /** When `signal` aborts while `work` runs, the statement is cancelled on the IBM i. */
+  private async withCancel<T>(handle: SqlJobHandle, work: Promise<T>, signal?: AbortSignal): Promise<T> {
     if (!signal) return work;
     if (signal.aborted) {
       void this.cancelInFlight(handle, work);
@@ -512,28 +657,69 @@ async function openSshJob(mapepire: MapepireModule, request: SqlJobOpenRequest):
   }
   const javaPath = await findRemoteFile(request, request.javaPath ? [request.javaPath] : JAVA_PATHS);
   if (!javaPath) throw new SqlJobUnavailableError("No Java runtime found for Mapepire single mode (set mapepireJavaPath)");
-  const job = mapepire.SQLJob.withConfig({
-    transport: "ssh-single",
-    sshSingle: {
-      exec: mapepire.createNodeSSHExec(request.ssh),
-      serverPath,
-      javaPath,
-      startupTimeout: 60000
+  const start = async () => {
+    const job = mapepire.SQLJob.withConfig({
+      transport: "ssh-single",
+      sshSingle: {
+        exec: mapepire.createNodeSSHExec(request.ssh),
+        serverPath,
+        javaPath,
+        startupTimeout: 60000
+      }
+    }, { ...JDBC_OPTIONS });
+    try {
+      await job.connect(undefined, "mcp-for-i");
+    } catch (err) {
+      await Promise.resolve(job.close()).catch(() => undefined);
+      throw err;
     }
-  }, { ...JDBC_OPTIONS });
-  try {
-    await job.connect(undefined, "mcp-for-i");
-  } catch (err) {
-    await Promise.resolve(job.close()).catch(() => undefined);
-    throw err;
-  }
-  return wrapMapepireJob(job, "ssh", () => {
+    return job;
+  };
+  const wrap = (job: any, technique: "tcp" | "cli") => wrapMapepireJob(job, "ssh", () => {
     try {
       return Boolean(job.getTransport()?.isConnected());
     } catch {
       return false;
     }
-  });
+  }, technique);
+
+  // Single mode connects with the in-process CLI technique, which ignores the
+  // JDBC properties (so SQL naming, and unqualified names do not use the
+  // library list) and runs each SQL request on its own thread, so library
+  // list changes do not last. Switch the server to the TCP technique: a
+  // database host server job on the same system, signed on as the same user,
+  // with system naming and a library list that persists.
+  const job = await start();
+  try {
+    const response: any = await job.send({
+      id: mapepire.SQLJob.getNewUniqueId(),
+      type: "connect",
+      technique: "tcp",
+      application: "mcp-for-i",
+      props: jdbcPropertiesString(JDBC_OPTIONS)
+    });
+    if (response?.success === true) {
+      if (typeof response.job === "string") job.id = response.job;
+      return wrap(job, "tcp");
+    }
+    throw new Error(response?.error || "connect failed");
+  } catch {
+    // The failed reconnect may have dropped the CLI connection: start again.
+    await Promise.resolve(job.close()).catch(() => undefined);
+  }
+  return wrap(await start(), "cli");
+}
+
+/** JDBC properties as Mapepire's connect request carries them. */
+export function jdbcPropertiesString(options: Record<string, string | string[]>) {
+  return Object.entries(options).map(([key, value]) => `${key}=${Array.isArray(value) ? value.join(",") : value}`).join(";");
+}
+
+/** Mapepire reports single-mode CLI jobs as number-user-name. */
+export function normalizeJobName(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value) return undefined;
+  const dashed = value.match(/^(\d{6})-([^-/]{1,10})-([^-/]{1,10})$/);
+  return dashed ? `${dashed[1]}/${dashed[2]}/${dashed[3]}` : value;
 }
 
 async function findRemoteFile(request: SqlJobOpenRequest, candidates: string[]) {
@@ -549,7 +735,7 @@ async function findRemoteFile(request: SqlJobOpenRequest, candidates: string[]) 
   }
 }
 
-function wrapMapepireJob(job: any, mode: "daemon" | "ssh", connected: () => boolean): SqlJobHandle {
+function wrapMapepireJob(job: any, mode: "daemon" | "ssh", connected: () => boolean, technique: "tcp" | "cli" = "tcp"): SqlJobHandle {
   // SQLJob.close() drops its response listeners, so requests still waiting on
   // the job would never settle. Track them and fail them on close.
   const pending = new Set<(err: Error) => void>();
@@ -572,10 +758,29 @@ function wrapMapepireJob(job: any, mode: "daemon" | "ssh", connected: () => bool
     return { rows, columns, updateCount: typeof updateCount === "number" ? updateCount : undefined };
   };
 
+  // A CL request answers with the job log messages the command sent, and
+  // success false when it failed; it does not reject.
+  const runClCommand = async (command: string): Promise<SqlJobClResult> => {
+    const query = job.clcommand(command);
+    const result = await query.execute(FETCH_SIZE);
+    if (result.has_results && !result.is_done) await Promise.resolve(query.close()).catch(() => undefined);
+    const rows: any[] = Array.isArray(result.data) ? result.data : [];
+    const messages: SqlJobClMessage[] = rows.map(row => ({
+      id: row.MESSAGE_ID ? String(row.MESSAGE_ID).trim() : undefined,
+      type: row.MESSAGE_TYPE ? String(row.MESSAGE_TYPE).trim() : undefined,
+      text: String(row.MESSAGE_TEXT ?? row.SUMMARY ?? "").trim()
+    }));
+    if (result.success === false && messages.length === 0 && result.error) {
+      messages.push({ type: "ESCAPE", text: String(result.error) });
+    }
+    return { success: result.success !== false, messages };
+  };
+
   return {
     mode,
+    technique,
     get jobName() {
-      return typeof job.id === "string" ? job.id : undefined;
+      return normalizeJobName(job.id);
     },
     isAlive() {
       if (closed) return false;
@@ -587,6 +792,13 @@ function wrapMapepireJob(job: any, mode: "daemon" | "ssh", connected: () => bool
       return new Promise((resolve, reject) => {
         pending.add(reject);
         runQuery(sql, options).then(resolve, reject).finally(() => pending.delete(reject));
+      });
+    },
+    runCl(command) {
+      if (closed) return Promise.reject(new Error("SQL job closed"));
+      return new Promise((resolve, reject) => {
+        pending.add(reject);
+        runClCommand(command).then(resolve, reject).finally(() => pending.delete(reject));
       });
     },
     async close() {

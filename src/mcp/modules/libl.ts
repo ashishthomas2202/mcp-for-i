@@ -60,8 +60,14 @@ async function move(ctx: McpContext, args: any) {
   const next = moveLibrary(list, library, { position: args?.position, direction: args?.direction, steps: args?.steps });
   enforceWritable(ctx, active, "qsys.write", args);
   await updateConnectionSettings(ctx, name, { libraryList: next });
-  if (args?.applyToJob) await applyLibraryList(active, next, currentLibrary);
-  return json({ library, from: list.indexOf(library) + 1, to: next.indexOf(library) + 1, libraryList: next });
+  const applied = args?.applyToJob ? await applyLibraryList(active, next, currentLibrary) : undefined;
+  return json({
+    library,
+    from: list.indexOf(library) + 1,
+    to: next.indexOf(library) + 1,
+    libraryList: next,
+    ...(applied?.warning ? { warning: applied.warning } : {})
+  });
 }
 
 /** Libraries in `names` that exist, checked with QSYS2.OBJECT_STATISTICS. */
@@ -93,10 +99,11 @@ async function prune(ctx: McpContext, args: any) {
   const kept = list.filter(lib => existing.has(lib));
   const currentLibraryMissing = Boolean(currentLibrary) && !existing.has(String(currentLibrary).toUpperCase());
   const dryRun = Boolean(args?.dryRun);
+  let applied: { warning?: string } | undefined;
   if (!dryRun && removed.length > 0) {
     enforceWritable(ctx, active, "qsys.write", args);
     await updateConnectionSettings(ctx, name, { libraryList: kept });
-    if (args?.applyToJob) await applyLibraryList(active, kept, currentLibraryMissing ? undefined : currentLibrary);
+    if (args?.applyToJob) applied = await applyLibraryList(active, kept, currentLibraryMissing ? undefined : currentLibrary);
   }
   return json({
     dryRun,
@@ -105,7 +112,8 @@ async function prune(ctx: McpContext, args: any) {
     libraryList: dryRun ? list : kept,
     ...(dryRun ? { wouldBecome: kept } : {}),
     currentLibrary: currentLibrary ?? null,
-    ...(currentLibraryMissing ? { warning: `Current library ${currentLibrary} does not exist; it was left unchanged. Use ibmi.libl.setCurrent.` } : {})
+    ...(currentLibraryMissing ? { warning: `Current library ${currentLibrary} does not exist; it was left unchanged. Use ibmi.libl.setCurrent.` } : {}),
+    ...(applied?.warning ? { applyWarning: applied.warning } : {})
   });
 }
 
@@ -153,8 +161,15 @@ async function runProfileCommand(ctx: McpContext, args: any) {
   if (args?.saveToProfile) {
     await ctx.store.saveProfile(name, { ...profile, libraryList, ...(currentLibrary ? { currentLibrary } : {}) });
   }
-  if (args?.applyToJob) await applyLibraryList(active, libraryList, currentLibrary);
-  return json({ profile: profileName, command, libraryList, currentLibrary: currentLibrary ?? null, savedToProfile: Boolean(args?.saveToProfile) });
+  const applied = args?.applyToJob ? await applyLibraryList(active, libraryList, currentLibrary) : undefined;
+  return json({
+    profile: profileName,
+    command,
+    libraryList,
+    currentLibrary: currentLibrary ?? null,
+    savedToProfile: Boolean(args?.saveToProfile),
+    ...(applied?.warning ? { warning: applied.warning } : {})
+  });
 }
 
 const COMMON_PROPERTIES = {
