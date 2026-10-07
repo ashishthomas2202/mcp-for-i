@@ -62,6 +62,11 @@ const SETTINGS_SCHEMA: JsonSchema = {
     autoClearTempData: { type: "boolean" },
     sourceFileCCSID: { type: "string" },
     sqlJobCcsid: { type: ["string", "number"] },
+    sqlTransport: { type: "string", enum: ["auto", "mapepire", "qzdfmdb2"] },
+    mapepireMode: { type: "string", enum: ["auto", "daemon", "ssh"] },
+    mapepirePort: { type: "number" },
+    mapepireServerPath: { type: "string" },
+    mapepireJavaPath: { type: "string" },
     enableSourceDates: { type: "boolean" },
     homeDirectory: { type: "string" },
     libraryList: { type: "array", items: { type: "string" } },
@@ -1492,7 +1497,11 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         ccsid: config.sqlJobCcsid ?? 1208,
         sourceFileCcsid: config.sourceFileCCSID || "*FILE",
         policy: ctx.getPolicy(args.connectionName),
-        transports: { sql: "QZDFMDB2", sourceRead: ["sql-member", "cpytostmf"] },
+        transports: {
+          sql: conn.sqlJob?.isOpen?.() ? "MAPEPIRE" : "QZDFMDB2",
+          sqlJob: conn.sqlJob?.status?.(),
+          sourceRead: ["sql-member", "cpytostmf"]
+        },
         remoteFeatures: conn.remoteFeatures,
         capabilities: {
           version: "1",
@@ -2214,11 +2223,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       // Ask for one row more than maxRows so truncation can be reported without
       // pulling the whole result set over the wire.
       const capped = applySqlRowCap(sql, maxRows + 1);
-      const rows = await withTimeout(
-        conn.runSQL(capped.sql),
-        timeoutMs,
-        `SQL query timed out after ${timeoutMs}ms`
-      );
+      const rows = await runSqlWithTimeout(conn, capped.sql, timeoutMs, `SQL query timed out after ${timeoutMs}ms`);
       const limited = rows.slice(0, maxRows);
       const firstPage = limited.slice(0, pageSize);
       const cursorInfo = ctx.createSqlCursor(limited, pageSize);
@@ -2255,11 +2260,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const statementType = getSqlStatementType(sql);
       const startedAt = Date.now();
       try {
-        const rows = await withTimeout(
-          conn.runSQL(sql),
-          timeoutMs,
-          `SQL execute timed out after ${timeoutMs}ms`
-        );
+        const rows = await runSqlWithTimeout(conn, sql, timeoutMs, `SQL execute timed out after ${timeoutMs}ms`);
         const executionMs = Date.now() - startedAt;
         const affectedRows = inferAffectedRows(rows);
         log("info", "audit.sql.execute", {
@@ -3054,11 +3055,7 @@ async function runClCommand(conn: any, command: string, environment: string, cwd
   }
 
   try {
-    await withTimeout(
-      conn.runSQL(`CALL QSYS2.QCMDEXC(${Tools.sqlString(command)})`),
-      timeoutMs,
-      `CL command timed out after ${timeoutMs}ms`
-    );
+    await runSqlWithTimeout(conn, `CALL QSYS2.QCMDEXC(${Tools.sqlString(command)})`, timeoutMs, `CL command timed out after ${timeoutMs}ms`);
     return { code: 0, signal: null, stdout: "", stderr: "", command };
   } catch (err: any) {
     return { code: 1, signal: null, stdout: "", stderr: err?.message || String(err), command };
@@ -4248,14 +4245,23 @@ async function applyLibraryList(conn: any, libraryList?: string[], currentLibrar
     const normalized = libraryList.map((l: string) => String(l).toUpperCase());
     const invalid = normalized.find((l: string) => !conn.validQsysName(l));
     if (invalid) throw new Error(`Invalid library name: ${invalid}`);
-    // '$' is escaped so names like $LIB are not expanded by qsh.
-    const libs = normalized.join(" ").replace(/\$/g, "\\$");
-    requireCommandSuccess(await conn.sendQsh({ command: `system \"CHGLIBL LIBL(${libs})\"` }), "CHGLIBL");
+    if (typeof conn.runCL === "function") {
+      // Runs in the persistent SQL job when there is one, so later SQL and CL see it.
+      requireCommandSuccess(await conn.runCL(`CHGLIBL LIBL(${normalized.join(" ")})`), "CHGLIBL");
+    } else {
+      // '$' is escaped so names like $LIB are not expanded by qsh.
+      const libs = normalized.join(" ").replace(/\$/g, "\\$");
+      requireCommandSuccess(await conn.sendQsh({ command: `system \"CHGLIBL LIBL(${libs})\"` }), "CHGLIBL");
+    }
   }
   if (currentLibrary) {
     const lib = String(currentLibrary).toUpperCase();
     if (!conn.validQsysName(lib)) throw new Error(`Invalid current library: ${lib}`);
-    requireCommandSuccess(await conn.sendQsh({ command: `system \"CHGCURLIB ${lib.replace(/\$/g, "\\$")}\"` }), "CHGCURLIB");
+    if (typeof conn.runCL === "function") {
+      requireCommandSuccess(await conn.runCL(`CHGCURLIB CURLIB(${lib})`), "CHGCURLIB");
+    } else {
+      requireCommandSuccess(await conn.sendQsh({ command: `system \"CHGCURLIB ${lib.replace(/\$/g, "\\$")}\"` }), "CHGCURLIB");
+    }
   }
 }
 
@@ -4536,6 +4542,29 @@ function clampNumber(value: unknown, fallback: number, min: number, max: number)
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
+/**
+ * Runs SQL with a time limit. When the limit is reached the call fails and the
+ * signal asks the client to cancel the statement in its persistent SQL job, so
+ * it does not keep running on the IBM i.
+ */
+async function runSqlWithTimeout(conn: any, sql: string, timeoutMs: number, timeoutMessage: string): Promise<any[]> {
+  const controller = new AbortController();
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      conn.runSQL(sql, { signal: controller.signal }),
+      new Promise<any[]>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          controller.abort();
+          reject(new Error(timeoutMessage));
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
+
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -4560,6 +4589,9 @@ function getRowColumns(rows: any[]) {
 }
 
 function inferAffectedRows(rows: any[]) {
+  // The persistent SQL job reports the update count of INSERT/UPDATE/DELETE.
+  const updateCount = (rows as any)?.updateCount;
+  if (typeof updateCount === "number" && Number.isFinite(updateCount)) return updateCount;
   if (!Array.isArray(rows) || rows.length === 0) return null;
   const candidateKeys = [
     "ROWS_AFFECTED",

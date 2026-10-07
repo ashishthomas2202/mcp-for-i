@@ -159,7 +159,9 @@ export class McpContext {
       lastValidatedAt: session.lastValidatedAt ? new Date(session.lastValidatedAt).toISOString() : undefined,
       expiresAt: new Date(session.expiresAt).toISOString(),
       idleSecondsRemaining: Math.max(0, Math.floor((session.expiresAt - now) / 1000)),
-      lastError: session.lastError
+      lastError: session.lastError,
+      // Persistent SQL job (Mapepire): open, fallen back to QZDFMDB2, or not started yet.
+      sqlJob: session.client.sqlJob?.status?.()
     };
   }
 
@@ -177,6 +179,10 @@ export class McpContext {
     await this.disconnect(target);
   }
 
+  /**
+   * Closes the session, including its persistent SQL job (IBMiClient.disconnect
+   * ends the Mapepire job before closing SSH).
+   */
   async disconnect(name?: string) {
     if (name) {
       const session = this.sessions.get(name);

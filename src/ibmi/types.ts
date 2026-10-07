@@ -65,6 +65,13 @@ export interface ConnectionConfig {
   autoClearTempData?: boolean;
   sourceFileCCSID?: string;
   sqlJobCcsid?: string | number;
+  /** How SQL runs: "auto" (Mapepire job when available, else QZDFMDB2), "mapepire" or "qzdfmdb2". */
+  sqlTransport?: "auto" | "mapepire" | "qzdfmdb2";
+  /** Mapepire connection: "auto", "daemon" (server on mapepirePort) or "ssh" (single mode over SSH). */
+  mapepireMode?: "auto" | "daemon" | "ssh";
+  mapepirePort?: number;
+  mapepireServerPath?: string;
+  mapepireJavaPath?: string;
   enableSourceDates?: boolean;
   homeDirectory?: string;
   libraryList?: string[];

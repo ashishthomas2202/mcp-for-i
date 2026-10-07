@@ -23,9 +23,52 @@ Default settings (editable in the config file):
 - `libraryList`: string[]
 - `currentLibrary`: string
 - `customVariables`: list of `{ name, value }`
+- `sqlTransport`: `auto` (default), `mapepire` or `qzdfmdb2`. How SQL and SQL-run CL are executed; see "Persistent SQL job (Mapepire)" below.
+- `mapepireMode`: `auto` (default), `daemon` or `ssh`.
+- `mapepirePort`: number (default `8076`), the Mapepire server port for `daemon` mode.
+- `mapepireServerPath`: path of `mapepire-server.jar` on the IBM i for `ssh` mode (default: `/QOpenSys/pkgs/lib/mapepire/mapepire-server.jar`, then `/opt/mapepire/lib/mapepire/mapepire-server.jar`).
+- `mapepireJavaPath`: Java for `ssh` mode (default: the newest of jdk21, jdk17, jdk11, jdk80 under `/QOpenSys/QIBM/ProdData/JavaVM`).
 - `allowedLocalRoots`: string[] (global settings only; see "Local file access" below)
 
 `tempLibrary` remains accepted for configuration compatibility. Source member reads and source-date writes now use job-local `QTEMP` objects and do not require a persistent `ILEDITOR` library.
+
+## Persistent SQL job (Mapepire)
+
+By default every SQL statement (and every CL command run through SQL) starts a new QZDFMDB2 job over SSH, so a library list change, the current library, QTEMP objects and the job log are gone by the next call. When [Mapepire](https://mapepire-ibmi.github.io/) is installed on the IBM i, mcp-for-i keeps one database job per connection instead:
+
+- The job is opened on the first SQL call of a session (not at connect time) and reused by `ibmi.sql.query`, `ibmi.sql.execute`, `ibmi.cl.run` (environment `ile`), `ibmi.joblog.get` and every other tool that runs SQL. Statements run one at a time in it.
+- When it opens, the connection's `libraryList` and `currentLibrary` (from the active profile or settings) are applied with `CHGLIBL`/`CHGCURLIB`. If that fails the job is still used and `ibmi.session.status` shows `sqlJob.libraryListWarning`.
+- `ibmi.libl.set`, `ibmi.libl.add`, `ibmi.libl.remove`, `ibmi.libl.setCurrent` and `ibmi.profiles.activate` with `applyToJob: true` run their CL in this job, so the change applies to later SQL and CL. Unqualified names resolve through the library list (system naming).
+- `ibmi.joblog.get` reads this job's log (`QSYS2.JOBLOG_INFO('*')`), so it shows the messages of earlier calls.
+- Commitment control is off (`transaction isolation: none`), as with QZDFMDB2.
+- When a `timeoutMs` is reached, the statement is cancelled on the IBM i with `QSYS2.CANCEL_SQL` (run from a separate QZDFMDB2 job). If it is still running 5 seconds later, the job is ended and a new one is opened on the next call (QTEMP and ad-hoc job changes are lost; the configured library list is applied again).
+- If the job ends (network drop, server restart), the next call opens a new one. A read-only statement that was interrupted this way is retried once; a write is not retried.
+- `ibmi.disconnect` and `ibmi.session.terminate` end the job. `ibmi.session.status` (field `sqlJob`) and `ibmi.session.bootstrap` (`transports.sqlJob`) show which transport is in use, the job name and the last error.
+- Tools that run CL through a qsh `system` command (for example some source and object helpers) still run in their own job.
+
+`sqlTransport`:
+- `auto` (default): use Mapepire when it can be reached, otherwise QZDFMDB2. The first failure is remembered for the session, so later calls go straight to QZDFMDB2 without waiting; reconnect to try again.
+- `mapepire`: always use Mapepire; SQL fails with the reason when it cannot be opened.
+- `qzdfmdb2`: never use Mapepire (the previous behaviour).
+
+`mapepireMode`:
+- `daemon`: connects to the Mapepire server (`mapepirePort`, default 8076) over TLS with the connection's user and password. Needs a password; key-only connections cannot use it.
+- `ssh`: starts `mapepire-server.jar` in single-user mode over the connection's existing SSH session (`java -jar ... --single`). Works with key-based logins and needs no open port or running service, only the JAR and Java on the IBM i. Startup takes a few seconds (one JVM per session). Nothing is uploaded to the IBM i.
+- `auto` (default): `daemon` when the connection has a password, falling back to `ssh` if the server is not reachable; `ssh` for key-only connections.
+
+The daemon's server certificate is trusted on first use: Mapepire generates a self-signed certificate, so its fingerprint is stored in `known_hosts.json` (under `certificates`) the first time and must match afterwards (see [security](security.md)). Certificates from a public CA are checked the normal way. Certificate errors are never ignored.
+
+### Installing Mapepire on the IBM i
+
+Mapepire is an open-source database server for IBM i. In short, from an SSH session with the IBM i open-source package manager (yum) installed, as a user allowed to install packages:
+
+```sh
+yum install mapepire-server        # installs /QOpenSys/pkgs/lib/mapepire/mapepire-server.jar
+# daemon mode only: run it as a service with Service Commander
+/QOpenSys/pkgs/bin/sc start mapepire
+```
+
+The daemon listens on port 8076 and needs Java 11 or later. For `ssh` mode the package install is enough; no service has to run. See the Mapepire documentation for running it at IPL, certificates and any port or exit-point rules at your site.
 
 ## Local file access
 

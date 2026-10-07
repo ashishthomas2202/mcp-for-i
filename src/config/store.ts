@@ -27,6 +27,11 @@ export type Settings = {
   autoClearTempData: boolean;
   sourceFileCCSID: string;
   sqlJobCcsid: number;
+  sqlTransport?: "auto" | "mapepire" | "qzdfmdb2";
+  mapepireMode?: "auto" | "daemon" | "ssh";
+  mapepirePort?: number;
+  mapepireServerPath?: string;
+  mapepireJavaPath?: string;
   enableSourceDates: boolean;
   homeDirectory: string;
   libraryList: string[];
