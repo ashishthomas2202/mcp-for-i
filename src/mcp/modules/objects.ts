@@ -1,7 +1,7 @@
 import type { McpContext } from "../context.js";
 import type { ToolModule } from "./index.js";
 import { checkClCommand, checkResourcePolicy } from "../policy.js";
-import { clampNumber, commandOutcome, enforceWritable, quoteClString, runClCommand, toolError } from "../tools.js";
+import { clampNumber, commandOutcome, enforceWritable, quoteClString, requireDangerousApproval, runClCommand, toolError } from "../tools.js";
 
 /**
  * Object and library operations (copy, move, rename, delete, describe).
@@ -247,7 +247,7 @@ const tools: ToolModule["tools"] = [
 async function handle(ctx: McpContext, name: string, args: any) {
   args = args || {};
   const conn = await ctx.ensureActive(args.connectionName);
-  enforceWritable(ctx, conn, "qsys.write", args);
+  await enforceWritable(ctx, conn, "qsys.write", args);
 
   switch (name) {
     case "ibmi.objects.copy": {
@@ -298,12 +298,15 @@ async function handle(ctx: McpContext, name: string, args: any) {
         if (isReservedLibraryName(library)) {
           throw new Error(`Refused: ${library} is a system library and cannot be deleted`);
         }
-        if (args.approve !== true) {
+        const guarded = ctx.getPolicy(args?.connectionName).profile === "guarded";
+        if (!guarded && args.approve !== true) {
           return toolError(`Deleting library ${library} needs approve=true and confirmName="${library}".`, { library });
         }
         if (String(args.confirmName ?? "").trim().toUpperCase() !== library) {
           return toolError(`confirmName must repeat the library name exactly (${library}) to delete it.`, { library });
         }
+        // Under guarded the person confirms this delete on its own, every time.
+        if (guarded) await requireDangerousApproval(ctx, "qsys.deleteLibrary", args, "");
         enforceLibraryPolicy(ctx, name, args, [library]);
         return commandOutcome(await runCheckedCl(ctx, conn, args, `DLTLIB LIB(${library})`, 600000));
       }

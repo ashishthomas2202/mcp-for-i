@@ -100,8 +100,8 @@ async function handle(ctx: McpContext, name: string, args: any) {
     : requireReadablePath(args.sourcePath, operation);
   refuseSameOrNested(source, destination, operation);
 
-  enforceWritable(ctx, conn, resolveIfsWriteOperation(destination), args);
-  if (name === "ibmi.ifs.move") enforceWritable(ctx, conn, "ifs.delete", args);
+  await enforceWritable(ctx, conn, resolveIfsWriteOperation(destination), args);
+  if (name === "ibmi.ifs.move") await enforceWritable(ctx, conn, "ifs.delete", args);
   enforcePathPolicy(ctx, name, args, [source, destination]);
 
   if (args.overwrite !== true && await pathExists(conn, destination)) {

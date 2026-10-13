@@ -367,3 +367,67 @@ export function assertSafeIfsTargetPath(value: unknown, operation: string, verb 
   }
   return normalized;
 }
+
+/**
+ * CL that starts a shell: QSH/STRQSH, or a CALL to one of the PASE or QShell
+ * entry programs. Matched anywhere in the text, so it also catches a shell
+ * nested in SBMJOB CMD(...) or a QCMDEXC string.
+ */
+const SHELL_IN_CL = /(?:^|[^A-Z0-9_$#@])(?:QSH|STRQSH|QP2SHELL2?|QP2TERM|QZSHSH|QZSHCHLD|QZSHQSHC)(?:[^A-Z0-9_$#@]|$)/i;
+
+/** True when CL text starts a PASE or QShell shell. */
+export function clStartsShell(command: string): boolean {
+  return SHELL_IN_CL.test(String(command || ""));
+}
+
+/**
+ * True when an operation runs shell text: a qsh/pase command, CL that starts
+ * a shell, or SQL whose embedded CL does (or can't be read).
+ */
+export function isShellOperation(args: any): boolean {
+  if (typeof args?.command === "string" && args.command.trim()) {
+    const environment = String(args.environment || "ile").toLowerCase();
+    if (environment !== "ile") return true;
+    if (clStartsShell(args.command)) return true;
+  }
+  if (typeof args?.sql === "string") {
+    const embedded = extractEmbeddedCl(args.sql);
+    if (embedded.unverifiable) return true;
+    if (embedded.commands.some(clStartsShell)) return true;
+  }
+  return false;
+}
+
+/**
+ * Connection fields an agent may not change through MCP tools. They decide
+ * how much the agent is allowed to do, so they are set in the web UI or in
+ * config.json by a person.
+ */
+export const PROTECTED_CONNECTION_SETTINGS = [
+  "readOnlyMode",
+  "tempDir",
+  "tempLibrary",
+  "autoClearTempData",
+  "mapepireMode",
+  "mapepirePort",
+  "mapepireServerPath",
+  "mapepireJavaPath"
+];
+
+/** Refuse policy and safety-setting changes made through connections.add/update. */
+export function assertAgentConnectionChangeAllowed(toolName: string, args: any) {
+  if (args && typeof args === "object" && args.policy !== undefined) {
+    throw new Error(
+      `${toolName} cannot set a connection's policy. Change the policy in the web UI (mcp-for-i control) or in config.json.`
+    );
+  }
+  const settings = args?.settings;
+  if (settings && typeof settings === "object") {
+    const blocked = PROTECTED_CONNECTION_SETTINGS.filter(key => settings[key] !== undefined);
+    if (blocked.length > 0) {
+      throw new Error(
+        `${toolName} cannot change ${blocked.join(", ")}. These settings control what the agent may do; change them in the web UI or in config.json.`
+      );
+    }
+  }
+}

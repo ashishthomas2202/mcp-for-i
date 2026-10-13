@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "async_hooks";
 import { McpContext } from "./context.js";
 import { findToolModule, notifyModulesOfDisconnect, toolModules } from "./modules/index.js";
 import { withAnnotations } from "./annotations.js";
@@ -15,7 +16,17 @@ import { checkReadOnlySql, getSqlStatementType as parseSqlStatementType } from "
 import { ConnectionPolicy } from "../config/store.js";
 import { ConnectionService } from "../controlplane/connectionService.js";
 import { log } from "./logger.js";
-import { assertSafeIfsDeletePath, checkClCommand, checkClCommands, checkResourcePolicy, checkShellCommand, checkSqlEmbeddedCl } from "./policy.js";
+import {
+  assertAgentConnectionChangeAllowed,
+  assertSafeIfsDeletePath,
+  checkClCommand,
+  checkClCommands,
+  checkResourcePolicy,
+  checkShellCommand,
+  checkSqlEmbeddedCl,
+  clStartsShell,
+  isShellOperation
+} from "./policy.js";
 import { configuredLocalRoots, LocalPathMode, resolveAllowedLocalPath } from "../security/localPaths.js";
 import { exportAuditRecords, listAuditRecords, purgeAuditRecords, verifyAuditChain } from "./audit.js";
 import { gitChangedFiles, normalizeDeployMethod, normalizeDeploySelection, sha256LocalFile, sha256RemoteFiles } from "./deployMethods.js";
@@ -89,20 +100,6 @@ const SETTINGS_SCHEMA: JsonSchema = {
     tn5250Port: { type: "number", description: "TN5250 telnet port (default 23, or 992 when tn5250Tls is true)." },
     tn5250Tls: { type: "boolean", description: "Use TLS for TN5250 sessions (default true when the port is 992)." },
     tn5250DeviceName: { type: "string", description: "Virtual device name requested for TN5250 sessions." }
-  }
-};
-
-const POLICY_SCHEMA: JsonSchema = {
-  type: "object",
-  properties: {
-    profile: { type: "string", enum: ["read-only", "guarded", "power-user"] },
-    requireApprovalFor: { type: "array", items: { type: "string" } },
-    allowCommands: { type: "array", items: { type: "string" } },
-    denyCommands: { type: "array", items: { type: "string" } },
-    allowLibraries: { type: "array", items: { type: "string" } },
-    denyLibraries: { type: "array", items: { type: "string" } },
-    allowPaths: { type: "array", items: { type: "string" } },
-    denyPaths: { type: "array", items: { type: "string" } }
   }
 };
 
@@ -212,7 +209,7 @@ export function getTools() {
     },
     {
       name: "ibmi.connections.add",
-      description: "Add a saved IBM i connection (credentials are managed via local control-plane UI).",
+      description: "Add a saved IBM i connection (credentials are managed via local control-plane UI). The policy and the safety settings (readOnlyMode, tempDir, tempLibrary, autoClearTempData, mapepire*) can only be set in the web UI or config.json.",
       inputSchema: {
         type: "object",
         properties: {
@@ -221,8 +218,7 @@ export function getTools() {
           port: { type: "number", default: 22 },
           username: { type: "string" },
           privateKeyPath: { type: "string" },
-          settings: SETTINGS_SCHEMA,
-          policy: POLICY_SCHEMA
+          settings: SETTINGS_SCHEMA
         },
         required: ["name", "host", "username"],
         additionalProperties: false
@@ -230,7 +226,7 @@ export function getTools() {
     },
     {
       name: "ibmi.connections.update",
-      description: "Update a saved IBM i connection (credentials are managed via local control-plane UI).",
+      description: "Update a saved IBM i connection (credentials are managed via local control-plane UI). The policy and the safety settings (readOnlyMode, tempDir, tempLibrary, autoClearTempData, mapepire*) can only be changed in the web UI or config.json.",
       inputSchema: {
         type: "object",
         properties: {
@@ -239,8 +235,7 @@ export function getTools() {
           port: { type: "number" },
           username: { type: "string" },
           privateKeyPath: { type: "string" },
-          settings: SETTINGS_SCHEMA,
-          policy: POLICY_SCHEMA
+          settings: SETTINGS_SCHEMA
         },
         required: ["name"],
         additionalProperties: false
@@ -1118,7 +1113,7 @@ export function getTools() {
           queue: { type: "string" },
           waitSeconds: { type: "number", default: 0, description: "Seconds to wait for an entry (0 to 60)." },
           remove: { type: "boolean", default: false },
-          approve: { type: "boolean", description: "Set true to approve guarded-policy operations (remove=true)." },
+          approve: { type: "boolean", description: "Only used when the connection's approvalMode is \"agent\" (remove=true). By default the user is asked to confirm." },
           connectionName: { type: "string" }
         },
         required: ["library", "queue"]
@@ -1401,7 +1396,13 @@ export function getTools() {
     .map(withAnnotations);
 }
 
-export async function handleTool(ctx: McpContext, name: string, args: any) {
+/** The outermost tool call being handled, so confirmation prompts can name it. */
+const toolCallStore = new AsyncLocalStorage<{ toolName: string }>();
+
+export async function handleTool(ctx: McpContext, name: string, args: any): Promise<any> {
+  if (!toolCallStore.getStore()) {
+    return toolCallStore.run({ toolName: name }, () => handleTool(ctx, name, args));
+  }
   const connections = new ConnectionService(ctx.store);
   await enforceResourcePolicy(ctx, name, args);
   const toolModule = findToolModule(name);
@@ -1477,11 +1478,13 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.connections.add": {
       rejectCredentialArgs(args, "ibmi.connections.add");
+      assertAgentConnectionChangeAllowed("ibmi.connections.add", args);
       await connections.add(args);
       return result(`Connection ${args.name} saved`);
     }
     case "ibmi.connections.update": {
       rejectCredentialArgs(args, "ibmi.connections.update");
+      assertAgentConnectionChangeAllowed("ibmi.connections.update", args);
       await connections.update(args.name, args);
       return result(`Connection ${args.name} updated`);
     }
@@ -1579,7 +1582,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.qsys.members.write": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const versionChecked = Boolean(args.expectedVersion || args.expectedSha256);
       let previous: MemberSnapshot | undefined;
       if (versionChecked) {
@@ -1597,31 +1600,31 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.qsys.members.create": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.createMember(args.library, args.sourceFile, args.member, args.srctype);
       return result("OK");
     }
     case "ibmi.qsys.members.rename": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.renameMember(args.library, args.sourceFile, args.member, args.newMember);
       return result("OK");
     }
     case "ibmi.qsys.members.delete": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.deleteMember(args.library, args.sourceFile, args.member);
       return result("OK");
     }
     case "ibmi.qsys.sourcefiles.create": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.createSourceFile(args.library, args.sourceFile, args.rcdlen || 112);
       return result("OK");
     }
     case "ibmi.qsys.libraries.create": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.createLibrary(args.library);
       return result("OK");
     }
@@ -1659,20 +1662,20 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.ifs.write": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const op = resolveIfsWriteOperation(args.path);
-      enforceWritable(ctx, conn, op, args);
+      await enforceWritable(ctx, conn, op, args);
       await conn.content.writeStreamfileRaw(args.path, args.content);
       return result("OK");
     }
     case "ibmi.ifs.mkdir": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const op = resolveIfsWriteOperation(args.path);
-      enforceWritable(ctx, conn, op, args);
+      await enforceWritable(ctx, conn, op, args);
       requireCommandSuccess(await conn.sendCommand({ command: `mkdir -p ${Tools.escapePath(args.path)}` }), "mkdir");
       return result("OK");
     }
     case "ibmi.ifs.delete": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "ifs.delete", args);
+      await enforceWritable(ctx, conn, "ifs.delete", args);
       const deletePath = assertSafeIfsDeletePath(args.path);
       if (args.recursive) {
         // A recursive delete removes a whole tree, so it must be deep enough and confirmed.
@@ -1690,7 +1693,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.ifs.upload": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const op = resolveIfsWriteOperation(args.remotePath);
-      enforceWritable(ctx, conn, op, args);
+      await enforceWritable(ctx, conn, op, args);
       const localPath = await guardLocalPath(ctx, args.localPath, "read");
       await conn.client!.putFile(localPath, args.remotePath);
       return result("OK");
@@ -1837,7 +1840,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.libl.set": {
       const name = getConnectionName(ctx, args);
       const active = await ctx.ensureActive(name);
-      enforceWritable(ctx, active, "qsys.write", args);
+      await enforceWritable(ctx, active, "qsys.write", args);
       await updateConnectionSettings(ctx, name, {
         currentLibrary: args.currentLibrary,
         libraryList: args.libraryList
@@ -1853,7 +1856,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const lib = String(args.library).toUpperCase();
       if (!list.includes(lib)) list.push(lib);
       const active = await ctx.ensureActive(name);
-      enforceWritable(ctx, active, "qsys.write", args);
+      await enforceWritable(ctx, active, "qsys.write", args);
       await updateConnectionSettings(ctx, name, { libraryList: list });
       const applied = args.applyToJob ? await applyLibraryList(active, list, conn.settings?.currentLibrary) : undefined;
       return okApplied(applied);
@@ -1864,7 +1867,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       if (!conn) throw new Error(`Connection ${name} not found`);
       const list = (conn.settings?.libraryList || []).filter(l => l !== String(args.library).toUpperCase());
       const active = await ctx.ensureActive(name);
-      enforceWritable(ctx, active, "qsys.write", args);
+      await enforceWritable(ctx, active, "qsys.write", args);
       await updateConnectionSettings(ctx, name, { libraryList: list });
       const applied = args.applyToJob ? await applyLibraryList(active, list, conn.settings?.currentLibrary) : undefined;
       return okApplied(applied);
@@ -1873,7 +1876,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const name = getConnectionName(ctx, args);
       const lib = String(args.library).toUpperCase();
       const active = await ctx.ensureActive(name);
-      enforceWritable(ctx, active, "qsys.write", args);
+      await enforceWritable(ctx, active, "qsys.write", args);
       await updateConnectionSettings(ctx, name, { currentLibrary: lib });
       const applied = args.applyToJob ? await applyLibraryList(active, undefined, lib) : undefined;
       return okApplied(applied);
@@ -1907,7 +1910,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const profile = (connInfo.profiles || []).find(p => p.name === args.name);
       if (!profile) throw new Error(`Profile ${args.name} not found`);
       const active = await ctx.ensureActive(name);
-      enforceWritable(ctx, active, "qsys.write", args);
+      await enforceWritable(ctx, active, "qsys.write", args);
 
       await ctx.store.setCurrentProfile(name, args.name);
       await updateConnectionSettings(ctx, name, {
@@ -1938,14 +1941,14 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.deploy.uploadDirectory": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "deploy.sync", args);
+      await enforceWritable(ctx, conn, "deploy.sync", args);
       const localPath = await guardLocalPath(ctx, args.localPath, "read");
       await conn.client!.putDirectory(localPath, args.remotePath, { recursive: true, concurrency: 5 });
       return result("OK");
     }
     case "ibmi.deploy.uploadFiles": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "deploy.sync", args);
+      await enforceWritable(ctx, conn, "deploy.sync", args);
       const remoteDir = String(args.remoteDirectory);
       const localFiles: string[] = [];
       for (const file of args.localFiles || []) {
@@ -1960,7 +1963,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.deploy.setCcsid": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "deploy.sync", args);
+      await enforceWritable(ctx, conn, "deploy.sync", args);
       const setccsid = conn.remoteFeatures.setccsid;
       if (!setccsid) throw new Error("setccsid not available on remote system");
       const ccsid = args.ccsid || "1208";
@@ -2028,7 +2031,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.debug.startService": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const submitOptions = `JOBQ(QSYS/QUSRNOMAX) JOBD(QSYS/QSYSJOBD) OUTQ(QUSRSYS/QDBGSRV) USER(QDBGSRV)`;
       const cmd = `QSYS/SBMJOB JOB(QDBGSRV) SYSLIBL(*SYSVAL) CURLIB(*USRPRF) INLLIBL(*JOBD) ${submitOptions} CMD(QSH CMD('/QIBM/ProdData/IBMiDebugService/bin/startDebugService.sh'))`;
       const res = await conn.sendQsh({ command: `system \"${cmd}\"` });
@@ -2036,7 +2039,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.debug.stopService": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const res = await conn.sendCommand({ command: `/QIBM/ProdData/IBMiDebugService/bin/stopDebugService.sh` });
       return commandOutcome({ ok: res.code === 0, ...res });
     }
@@ -2051,7 +2054,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.deploy.sync": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "deploy.sync", args);
+      await enforceWritable(ctx, conn, "deploy.sync", args);
       const localPath = await guardLocalPath(ctx, args.localPath, "read");
       const remotePath = String(args.remotePath);
       const method = normalizeDeployMethod(args.method);
@@ -2225,7 +2228,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.sql.execute": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "sql.write", args);
+      await enforceWritable(ctx, conn, "sql.write", args);
       const sql = String(args.sql);
       const timeoutMs = clampNumber(args?.timeoutMs, 45000, 1000, 300000);
       const statementType = getSqlStatementType(sql);
@@ -2263,7 +2266,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.cl.run": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "cl.run", args);
+      await enforceWritable(ctx, conn, "cl.run", args);
       const command = String(args.command || "");
       if (!command.trim()) throw new Error("command is required");
       const environment = String(args.environment || "ile");
@@ -2322,28 +2325,28 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.spool.hold": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const command = buildSpoolCommand("HLDSPLF", args);
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
       return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.spool.release": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const command = buildSpoolCommand("RLSSPLF", args);
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
       return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.spool.delete": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const command = buildSpoolCommand("DLTSPLF", args);
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
       return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.spool.move": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const baseCommand = buildSpoolCommand("CHGSPLFA", args);
       const outQueueLibrary = requireIbmObjectName(args.outQueueLibrary, "outQueueLibrary");
       const outQueue = requireIbmObjectName(args.outQueue, "outQueue");
@@ -2364,7 +2367,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.jobs.hold": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const jobName = requireJobName(args.jobName);
       const hold = Boolean(args?.holdOnJobQueue) ? "*JOBQ" : "*NO";
       const command = `HLDJOB JOB(${jobName}) HOLD(${hold})`;
@@ -2373,7 +2376,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.jobs.release": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const jobName = requireJobName(args.jobName);
       const command = `RLSJOB JOB(${jobName})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
@@ -2381,7 +2384,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.jobs.end": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const jobName = requireJobName(args.jobName);
       const option = String(args?.option || "*CNTRLD").toUpperCase();
       if (option !== "*CNTRLD" && option !== "*IMMED") {
@@ -2411,7 +2414,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.subsystems.start": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const subsystemDescription = requireQualifiedObject(args.subsystemDescription, "subsystemDescription");
       const command = `STRSBS SBSD(${subsystemDescription.library}/${subsystemDescription.object})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
@@ -2419,7 +2422,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.subsystems.end": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const subsystem = requireIbmObjectName(args.subsystem, "subsystem");
       const option = String(args?.option || "*CNTRLD").toUpperCase();
       if (option !== "*CNTRLD" && option !== "*IMMED") {
@@ -2440,7 +2443,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.msgq.send": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const library = requireIbmObjectName(args?.library || "QSYS", "library");
       const messageQueue = requireIbmObjectName(args?.messageQueue || "QSYSOPR", "messageQueue");
       const messageType = String(args?.messageType || "*INFO").toUpperCase();
@@ -2461,7 +2464,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.msgq.reply": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const library = requireIbmObjectName(args?.library || "QSYS", "library");
       const messageQueue = requireIbmObjectName(args?.messageQueue || "QSYSOPR", "messageQueue");
       const messageKey = requireMessageKey(args.messageKey);
@@ -2494,7 +2497,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.dataqueue.send": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const library = requireIbmObjectName(args.library, "library");
       const queue = requireIbmObjectName(args.queue, "queue");
       const message = String(args.message || "");
@@ -2535,7 +2538,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       // Peek by default. Removing an entry changes the queue, so it goes
       // through the same write gate as the other write tools.
       const remove = args?.remove === true;
-      if (remove) enforceWritable(ctx, conn, "qsys.write", args);
+      if (remove) await enforceWritable(ctx, conn, "qsys.write", args);
       const rows = await queryDataQueueEntries(conn, { library, queue, waitSeconds, remove });
       return json(rows);
     }
@@ -2548,7 +2551,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.dataarea.write": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const library = requireIbmObjectName(args.library, "library");
       const dataArea = requireIbmObjectName(args.dataArea, "dataArea");
       const value = String(args.value ?? "");
@@ -2593,8 +2596,8 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return json(exported);
     }
     case "ibmi.audit.purge": {
-      if (!Boolean(args?.dryRun) && !Boolean(args?.approve)) {
-        throw new Error("ibmi.audit.purge requires approve=true unless dryRun=true.");
+      if (!Boolean(args?.dryRun)) {
+        await requireDangerousApproval(ctx, "audit.purge", args, "ibmi.audit.purge requires approve=true unless dryRun=true.");
       }
       const purged = await purgeAuditRecords({
         before: String(args.before),
@@ -2669,7 +2672,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.journal.receiver.create": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const lib = requireIbmObjectName(args.library, "library");
       const rcv = requireIbmObjectName(args.receiver, "receiver");
       const threshold = clampNumber(args?.threshold, 1000000, 1, 1000000000);
@@ -2683,7 +2686,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.journal.create": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const lib = requireIbmObjectName(args.library, "library");
       const jrn = requireIbmObjectName(args.journal, "journal");
       const rcvLib = requireIbmObjectName(args.receiverLibrary, "receiverLibrary");
@@ -2698,7 +2701,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.journal.receiver.change": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const jrnLib = requireIbmObjectName(args.journalLibrary, "journalLibrary");
       const jrn = requireIbmObjectName(args.journal, "journal");
       const rcvLib = requireIbmObjectName(args.receiverLibrary, "receiverLibrary");
@@ -2713,7 +2716,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.journal.startPf": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const lib = requireIbmObjectName(args.library, "library");
       const file = requireIbmObjectName(args.file, "file");
       const jrnLib = requireIbmObjectName(args.journalLibrary, "journalLibrary");
@@ -2732,7 +2735,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.journal.endPf": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const lib = requireIbmObjectName(args.library, "library");
       const file = requireIbmObjectName(args.file, "file");
       const command = `ENDJRNPF FILE(${lib}/${file})`;
@@ -2745,7 +2748,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.journal.startIfs": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const objectType = requireIfsJournalObjectType(args?.objectType);
       const journalLibrary = requireIbmObjectName(args.journalLibrary, "journalLibrary");
       const journal = requireIbmObjectName(args.journal, "journal");
@@ -2760,7 +2763,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.journal.endIfs": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const objectType = requireIfsJournalObjectType(args?.objectType);
       const objectPath = requireIfsPath(args.path, "path");
       const command = `ENDJRNOBJ OBJ((${quoteClString(objectPath)} ${objectType}))`;
@@ -2780,8 +2783,13 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       // The schema documents dryRun as defaulting to true; only an explicit
       // dryRun=false may delete receivers.
       const dryRun = args?.dryRun === undefined || args?.dryRun === null ? true : Boolean(args.dryRun);
-      if (!dryRun && !Boolean(args?.approve)) {
-        throw new Error("ibmi.journal.receivers.retention requires approve=true unless dryRun=true.");
+      if (!dryRun) {
+        await requireDangerousApproval(
+          ctx,
+          "journal.receivers.delete",
+          args,
+          "ibmi.journal.receivers.retention requires approve=true unless dryRun=true."
+        );
       }
 
       const plan = await planJournalReceiverRetention(conn, {
@@ -2801,7 +2809,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         });
       }
 
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const deleted: Array<{ receiverLibrary: string; receiver: string; ok: boolean; error?: string }> = [];
       for (const candidate of candidates) {
         const command = `DLTJRNRCV JRNRCV(${candidate.receiverLibrary}/${candidate.receiver}) DLTOPT(*IGNINQMSG)`;
@@ -4569,12 +4577,12 @@ function isReadOnlySql(sql: string) {
   return checkReadOnlySql(sql).readOnly;
 }
 
-export function enforceWritable(ctx: McpContext, conn: any, operation: string, args: any) {
+export async function enforceWritable(ctx: McpContext, conn: any, operation: string, args: any) {
   if (conn.getConfig().readOnlyMode) throw new Error("Connection is in read-only mode");
-  enforcePolicyOperation(ctx, operation, args);
+  await enforcePolicyOperation(ctx, operation, args);
 }
 
-function enforcePolicyOperation(ctx: McpContext, operation: string, args: any) {
+async function enforcePolicyOperation(ctx: McpContext, operation: string, args: any) {
   const policy = ctx.getPolicy(args?.connectionName);
   if (policy.profile === "read-only") {
     throw new Error(`Blocked by policy (${policy.profile}): ${operation}`);
@@ -4583,9 +4591,92 @@ function enforcePolicyOperation(ctx: McpContext, operation: string, args: any) {
   if (deniedReason) {
     throw new Error(`Blocked by policy: ${operation} (${deniedReason})`);
   }
-  if (requiresApproval(policy, operation) && !Boolean(args?.approve)) {
-    throw new Error(`Operation '${operation}' requires approve=true under '${policy.profile}' policy.`);
+  if (policy.profile !== "guarded") return;
+  // Shell text can do anything the profile can, so under guarded it always
+  // needs the person's say, whatever requireApprovalFor lists.
+  if (isShellOperation(args)) {
+    await requireConfirmation(ctx, policy, "shell.run", args, false);
+  } else if (requiresApproval(policy, operation)) {
+    await requireConfirmation(ctx, policy, operation, args, operation !== "ifs.delete");
   }
+}
+
+/**
+ * Get the person's approval for a guarded operation. With approvalMode
+ * "prompt" (the default) the MCP client asks them; the agent's approve flag
+ * counts for nothing. With "agent", approve=true is enough.
+ */
+export async function requireConfirmation(
+  ctx: McpContext,
+  policy: ConnectionPolicy,
+  operation: string,
+  args: any,
+  allowSession: boolean
+) {
+  if (policy.approvalMode === "agent") {
+    if (!Boolean(args?.approve)) {
+      throw new Error(`Operation '${operation}' requires approve=true under '${policy.profile}' policy.`);
+    }
+    return;
+  }
+  const connectionName = String(args?.connectionName || ctx.activeName || "");
+  const sessionKey = `${connectionName}\u0000${operation}`;
+  if (allowSession && ctx.sessionApprovals?.has(sessionKey)) return;
+
+  const unsupported = new Error(
+    `Operation '${operation}' needs the user's confirmation, but this MCP client cannot show confirmation prompts. ` +
+    "Ask the user to run it from a client that supports MCP elicitation, or to set this connection's approval mode " +
+    "to \"agent\" in config.json (approve=true is then accepted)."
+  );
+  if (!ctx.confirm) throw unsupported;
+  const answer = await ctx.confirm({
+    operation,
+    connectionName,
+    toolName: toolCallStore.getStore()?.toolName,
+    details: describeOperation(args),
+    allowSession
+  });
+  if (answer === "unsupported") throw unsupported;
+  if (!answer.allowed) {
+    throw new Error(`Operation '${operation}' was not confirmed by the user, so it did not run.`);
+  }
+  if (allowSession && answer.forSession) ctx.sessionApprovals?.add(sessionKey);
+}
+
+/**
+ * Approval for operations that always need it, whatever requireApprovalFor
+ * lists: under guarded the person is asked (no session allowance); other
+ * profiles keep the agent's approve=true.
+ */
+export async function requireDangerousApproval(ctx: McpContext, operation: string, args: any, approveMessage: string) {
+  const policy = ctx.getPolicy(args?.connectionName);
+  if (policy.profile === "guarded") {
+    await requireConfirmation(ctx, policy, operation, args, false);
+    return;
+  }
+  if (!Boolean(args?.approve)) throw new Error(approveMessage);
+}
+
+const DESCRIBED_ARG_KEYS = [
+  "command", "environment", "cwd", "sql",
+  "library", "file", "sourceFile", "member", "object", "type", "objectType", "name", "newName",
+  "path", "remotePath", "remoteDirectory", "targetPath", "localPath", "recursive", "confirmPath",
+  "deleteExtraRemote", "libraryList", "currentLibrary", "remove",
+  "confirmName", "journalLibrary", "journal", "retentionDays", "maxDeletes", "before"
+];
+
+/** Short plain-text lines describing the arguments that decide what runs. */
+export function describeOperation(args: any): string[] {
+  const lines: string[] = [];
+  if (!args || typeof args !== "object") return lines;
+  for (const key of DESCRIBED_ARG_KEYS) {
+    const value = args[key];
+    if (value === undefined || value === null || value === "") continue;
+    let text = typeof value === "string" ? value : JSON.stringify(value);
+    if (text.length > 600) text = `${text.substring(0, 600)}... (${text.length} characters)`;
+    lines.push(`${key}: ${text}`);
+  }
+  return lines;
 }
 
 function isMissingColumnError(err: any, column: string) {
@@ -4828,10 +4919,14 @@ async function enforceResourcePolicy(ctx: McpContext, toolName: string, args: an
 export function actionCommandGuard(ctx: McpContext, environment: string | undefined, args: any) {
   return async (expanded: string) => {
     const policy = ctx.getPolicy(args?.connectionName);
-    const reason = (environment || "ile") === "ile"
+    const env = environment || "ile";
+    const reason = env === "ile"
       ? checkClCommands(policy, expanded)
       : checkShellCommand(policy, expanded);
     if (reason) throw new Error(`Blocked by policy: actions.run (${reason})`);
+    if (policy.profile === "guarded" && (env !== "ile" || clStartsShell(expanded))) {
+      await requireConfirmation(ctx, policy, "shell.run", { ...args, command: expanded, environment: env }, false);
+    }
     return expanded;
   };
 }
@@ -4901,7 +4996,7 @@ function withGuardedApprovalHint(tool: any) {
   if (!schema.properties.approve) {
     schema.properties.approve = {
       type: "boolean",
-      description: "Set true to approve guarded-policy operations."
+      description: "Only used when the connection's approvalMode is \"agent\". By default the user is asked to confirm guarded operations and this flag is ignored."
     };
   }
   return { ...tool, inputSchema: schema };

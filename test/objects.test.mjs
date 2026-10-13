@@ -182,7 +182,13 @@ test("object tools respect read-only mode, policy approval, denyCommands and lib
 
   const guarded = fakeConn();
   const guardedPolicy = { profile: "guarded", requireApprovalFor: ["qsys.write"] };
-  await assert.rejects(handleTool(context(guarded.conn, guardedPolicy), "ibmi.objects.delete", args), /approve=true/);
+  // The agent's own approve flag no longer counts: nobody could be asked, so it is refused.
+  await assert.rejects(handleTool(context(guarded.conn, guardedPolicy), "ibmi.objects.delete", { ...args, approve: true }), /cannot show confirmation prompts/);
+  assert.equal(guarded.calls.sql.length, 0);
+  await assert.rejects(
+    handleTool(context(guarded.conn, { ...guardedPolicy, approvalMode: "agent" }), "ibmi.objects.delete", args),
+    /approve=true/
+  );
 
   const denied = fakeConn();
   await assert.rejects(

@@ -358,7 +358,7 @@ async function uploadChanged(ctx: McpContext, args: any) {
   const memberFilter = Array.isArray(args.members) && args.members.length > 0
     ? new Set<string>(args.members.map((value: unknown) => qsysName(conn, value, "member")))
     : undefined;
-  if (!dryRun) enforceWritable(ctx, conn, "qsys.write", args);
+  if (!dryRun) await enforceWritable(ctx, conn, "qsys.write", args);
 
   const { manifest, existed: manifestExisted } = await readManifest(ctx, root);
   const skipped: Array<{ path: string; reason: string }> = [];

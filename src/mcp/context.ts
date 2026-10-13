@@ -29,6 +29,23 @@ type SqlCursorState = {
   expiresAt: number;
 };
 
+/** What the person is asked to confirm before a guarded operation runs. */
+export type ConfirmationRequest = {
+  operation: string;
+  connectionName: string;
+  toolName?: string;
+  /** Plain-text lines describing exactly what will run. */
+  details: string[];
+  /** Whether "allow for the rest of this session" may be offered. */
+  allowSession: boolean;
+};
+
+export type ConfirmationAnswer =
+  | { allowed: boolean; forSession?: boolean }
+  | "unsupported";
+
+export type ConfirmHandler = (request: ConfirmationRequest) => Promise<ConfirmationAnswer>;
+
 const DEFAULT_SESSION_IDLE_MS = 30 * 60 * 1000;
 const DEFAULT_SESSION_PING_MS = 15 * 1000;
 const DEFAULT_CURSOR_TTL_MS = 5 * 60 * 1000;
@@ -37,6 +54,13 @@ const DEFAULT_RECONNECT_ATTEMPTS = 2;
 export class McpContext {
   store = new ConfigStore();
   activeName?: string;
+  /**
+   * Asks the person to confirm a guarded operation. Set by the server from
+   * the MCP client's elicitation support; unset means nobody can be asked.
+   */
+  confirm?: ConfirmHandler;
+  /** Operations the person allowed for the rest of this session, keyed by connection and operation. */
+  readonly sessionApprovals = new Set<string>();
   private sessions = new Map<string, SessionEntry>();
   private cursors = new Map<string, SqlCursorState>();
   private connectLocks = new Map<string, Promise<IBMiClient>>();

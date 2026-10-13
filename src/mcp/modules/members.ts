@@ -118,7 +118,7 @@ async function memberAttributes(conn: any, library: string, sourceFile: string, 
 async function handle(ctx: McpContext, name: string, args: any) {
   args = args || {};
   const conn = await ctx.ensureActive(args.connectionName);
-  enforceWritable(ctx, conn, "qsys.write", args);
+  await enforceWritable(ctx, conn, "qsys.write", args);
   const library = requireName(args.library, "library");
   const sourceFile = requireName(args.sourceFile, "sourceFile");
   const member = requireName(args.member, "member");

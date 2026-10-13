@@ -22,7 +22,7 @@ Cleanup: <what must be removed>
 
 ## 2) Tool Invocation Style
 - Call one preflight read before first write.
-- For guarded writes include `approve: true`.
+- Guarded writes wait for the user to confirm them; `approve: true` only counts with `approvalMode: "agent"`.
 - Prefer structured identifiers (`library`, `sourceFile`, `member`) over raw CL when dedicated tools exist.
 
 ## 3) Response Parsing

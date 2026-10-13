@@ -14,8 +14,9 @@ Goal: execute IBM i work with minimal guesswork, minimal retries, and predictabl
 Default to lowest level that can complete the task.
 
 ### 1.2 Approval Rule
-- For any write/destructive tool, include `approve: true`.
-- If guarded policy blocks action, do not improvise around policy; rerun with explicit approval.
+- Under the guarded policy the user confirms write/destructive operations in the MCP client; you cannot approve them yourself.
+- `approve: true` only counts when the connection's `approvalMode` is `"agent"`.
+- If the user declines, stop and ask what they want instead. Do not retry or route around the policy.
 
 ### 1.3 Verification Tiers (Avoid Over-Testing)
 - `Tier A` (default): pre-check + one post-check on touched objects only.
@@ -118,11 +119,12 @@ For IFS targets:
 ## 7) Error Handling Matrix
 
 ### 7.1 Guarded Policy
-Error:
-- `requires approve=true under 'guarded' policy`
+Errors:
+- `was not confirmed by the user`: stop, tell the user what you were trying to do, and ask how to proceed.
+- `cannot show confirmation prompts`: tell the user the client can't confirm guarded operations; they can use a client with MCP elicitation or set `approvalMode: "agent"` in config.json.
+- `requires approve=true under 'guarded' policy` (only with `approvalMode: "agent"`): rerun with `approve: true` if the user asked for the change.
 Action:
-1. rerun with `approve: true`
-2. do not bypass via alternate command patterns
+- do not bypass via alternate command patterns
 
 ### 7.2 Object Listing Compatibility
 Errors:

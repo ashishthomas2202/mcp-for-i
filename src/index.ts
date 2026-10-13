@@ -13,6 +13,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { getTools, handleTool } from "./mcp/tools.js";
 import { McpContext } from "./mcp/context.js";
+import { createElicitationConfirm } from "./mcp/confirm.js";
 import { log } from "./mcp/logger.js";
 import { redactSecrets, redactSecretsInText } from "./security/redact.js";
 import { validateToolInput } from "./mcp/validation.js";
@@ -49,6 +50,7 @@ const server = new Server(
 );
 
 const ctx = new McpContext();
+ctx.confirm = createElicitationConfirm(server);
 const tools = getTools();
 const toolMap = new Map(tools.map(tool => [tool.name, tool]));
 

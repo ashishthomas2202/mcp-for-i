@@ -9,8 +9,16 @@ import { withFileLock } from "../util/fileLock.js";
 
 export type PolicyProfile = "read-only" | "guarded" | "power-user";
 
+/**
+ * How guarded operations are approved. "prompt" (default) asks the person
+ * through the MCP client. "agent" accepts approve=true from the agent, for
+ * clients that cannot show prompts.
+ */
+export type ApprovalMode = "prompt" | "agent";
+
 export type ConnectionPolicy = {
   profile: PolicyProfile;
+  approvalMode?: ApprovalMode;
   requireApprovalFor?: string[];
   allowCommands?: string[];
   denyCommands?: string[];
@@ -522,6 +530,7 @@ function normalizePolicy(value: unknown): ConnectionPolicy | undefined {
   if (!Array.isArray(policy.denyLibraries)) delete policy.denyLibraries;
   if (!Array.isArray(policy.allowPaths)) delete policy.allowPaths;
   if (!Array.isArray(policy.denyPaths)) delete policy.denyPaths;
+  if (policy.approvalMode !== "prompt" && policy.approvalMode !== "agent") delete policy.approvalMode;
   return policy;
 }
 

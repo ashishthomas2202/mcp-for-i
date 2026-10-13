@@ -129,6 +129,11 @@ Policy lists (all optional, matched case-insensitively):
 - `denyPaths` / `allowPaths`: absolute IFS paths. An entry covers the path and everything below it; `*` matches within one path segment. With `allowPaths` set, relative paths are refused. Remote symlinks are not resolved.
 - Deny entries always win over allow entries.
 
+Approvals under `guarded`:
+- `requireApprovalFor`: operations that ask the user first (default `["sql.write", "cl.run", "deploy.sync", "ifs.delete", "qsys.write"]`).
+- `approvalMode`: `"prompt"` (default) asks the user through the MCP client and ignores the agent's `approve` flag. `"agent"` accepts `approve: true` from the agent instead, for clients that can't show prompts.
+- The policy can only be changed in the web UI or in this file, not by the agent.
+
 Example:
 ```json
 "policy": {

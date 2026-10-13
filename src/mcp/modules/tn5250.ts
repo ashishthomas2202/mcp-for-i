@@ -195,7 +195,7 @@ async function connect(ctx: McpContext, args: any) {
   let password: string | undefined;
   if (args.signOn) {
     const conn = await ctx.ensureActive(connectionName);
-    enforceWritable(ctx, conn, "tn5250.signOn", { ...args, connectionName });
+    await enforceWritable(ctx, conn, "tn5250.signOn", { ...args, connectionName });
     password = await tn5250Deps.getPassword(connectionName);
     if (!password) throw new Error(`No stored password for ${connectionName}; signOn needs the connection's saved password`);
   }
@@ -311,9 +311,9 @@ async function sendKeys(ctx: McpContext, args: any) {
     const commands = aid !== undefined && !AID_WITHOUT_DATA.has(aid) ? commandLineEntries(screen) : [];
     if (commands.length > 0) {
       // Text on a command line is run as CL by the host, so it gets the cl.run checks.
-      for (const command of commands) enforceWritable(ctx, conn, "cl.run", { ...gateArgs, command, environment: "ile" });
+      for (const command of commands) await enforceWritable(ctx, conn, "cl.run", { ...gateArgs, command, environment: "ile" });
     } else {
-      enforceWritable(ctx, conn, "tn5250.sendKeys", gateArgs);
+      await enforceWritable(ctx, conn, "tn5250.sendKeys", gateArgs);
     }
     client.sendKey(aidKey);
     session.lastKey = aidKey;

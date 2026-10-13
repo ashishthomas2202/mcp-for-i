@@ -393,7 +393,7 @@ function formatCommandOutput(command: string, result: any) {
 /** ibmi.actions.run: run an action against a member or streamfile and collect its errors. */
 export async function runActionTool(ctx: McpContext, args: any) {
   const conn: any = await ctx.ensureActive(args?.connectionName);
-  enforceWritable(ctx, conn, "qsys.write", args);
+  await enforceWritable(ctx, conn, "qsys.write", args);
   const action: Action | undefined = await resolveAction(ctx, args);
   if (!action) throw new Error("Action not found");
 

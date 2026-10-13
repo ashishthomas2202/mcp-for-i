@@ -14,7 +14,7 @@ Version context: `0.1.13` development codebase.
 
 ### 1.2 Runtime Safety and Policy Guardrails
 - Strict tool input schemas (`additionalProperties: false`) with runtime validation.
-- Guarded approval model (`approve=true`) for sensitive operations.
+- Guarded approval model: the user confirms sensitive operations in the MCP client.
 - Read-only mode enforcement.
 - Validation for critical identifiers (QSYS names, journaling object names, etc.).
 
@@ -221,8 +221,8 @@ A real TN5250 client: connects to the saved connection's host on port 23 (or 992
 ## 3) High-Value Behaviors Users Often Miss
 
 ### 3.1 Guarded Approvals
-- Many destructive/risky tools accept `approve=true`.
-- In guarded policy, write operations may be blocked until approved.
+- In guarded policy, risky operations wait for the user to confirm them in the MCP client; the agent cannot approve them itself.
+- With `approvalMode: "agent"` (for clients without prompts), `approve=true` from the agent is accepted instead.
 
 ### 3.2 Audit Data Lifecycle
 - Verify chain integrity with `ibmi.audit.verify`.

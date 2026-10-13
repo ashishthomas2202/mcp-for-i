@@ -58,7 +58,7 @@ async function move(ctx: McpContext, args: any) {
   const library = requireLibraryName(active, args?.library);
   const { list, currentLibrary } = await storedLibraryList(ctx, name, active);
   const next = moveLibrary(list, library, { position: args?.position, direction: args?.direction, steps: args?.steps });
-  enforceWritable(ctx, active, "qsys.write", args);
+  await enforceWritable(ctx, active, "qsys.write", args);
   await updateConnectionSettings(ctx, name, { libraryList: next });
   const applied = args?.applyToJob ? await applyLibraryList(active, next, currentLibrary) : undefined;
   return json({
@@ -101,7 +101,7 @@ async function prune(ctx: McpContext, args: any) {
   const dryRun = Boolean(args?.dryRun);
   let applied: { warning?: string } | undefined;
   if (!dryRun && removed.length > 0) {
-    enforceWritable(ctx, active, "qsys.write", args);
+    await enforceWritable(ctx, active, "qsys.write", args);
     await updateConnectionSettings(ctx, name, { libraryList: kept });
     if (args?.applyToJob) applied = await applyLibraryList(active, kept, currentLibraryMissing ? undefined : currentLibrary);
   }
@@ -145,8 +145,8 @@ async function runProfileCommand(ctx: McpContext, args: any) {
   if (command.startsWith("?") || /[\r\n]/.test(command)) throw new Error("setLibraryListCommand must be a single CL command without prompting");
 
   // The command runs as CL, so CL command policy applies; storing the result is a settings write.
-  enforceWritable(ctx, active, "cl.run", { ...args, command });
-  enforceWritable(ctx, active, "qsys.write", args);
+  await enforceWritable(ctx, active, "cl.run", { ...args, command });
+  await enforceWritable(ctx, active, "qsys.write", args);
 
   // Run the command and read the resulting library list in the same database job.
   const rows = await active.runSQL(

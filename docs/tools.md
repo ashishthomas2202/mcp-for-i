@@ -152,7 +152,7 @@ The documentation catalog is also exposed through MCP resources: `ibmi-docs://ca
 
 ### SQL / CL Notes
 - `ibmi.sql.query` supports cursor paging (`cursor`), `pageSize`, `maxRows`, `timeoutMs`, and optional `includeMetadata`.
-- `ibmi.sql.execute` supports guarded writes with `approve=true` and optional `timeoutMs`.
+- `ibmi.sql.execute` asks the user before writes under the guarded policy and supports optional `timeoutMs`.
 - `ibmi.cl.run` supports `ile`, `qsh`, or `pase` execution with optional `timeoutMs`.
 - Tool responses include structured envelopes (`structuredContent`) for machine-safe agent parsing.
 
@@ -202,7 +202,7 @@ The documentation catalog is also exposed through MCP resources: `ibmi-docs://ca
 - Tool calls are recorded in a tamper-evident local audit chain.
 - `ibmi.audit.verify` validates hash continuity and head hash state.
 - `ibmi.audit.export` supports `jsonl`, `json`, and `csv` output.
-- `ibmi.audit.purge` supports `dryRun`; destructive purge requires `approve=true`.
+- `ibmi.audit.purge` supports `dryRun`; destructive purge asks the user under guarded (other profiles: `approve=true`).
 
 ## Journaling
 - `ibmi.journal.objects.list`
@@ -220,7 +220,7 @@ The documentation catalog is also exposed through MCP resources: `ibmi-docs://ca
 ### Journaling Notes
 - `ibmi.journal.entries.query` supports advanced filters (`journalCode`, `entryType`, `userName`, `jobName`, `programName`) and normalizes key fields.
 - `ibmi.qaudjrn.events.query` targets `QSYS/QAUDJRN` for security/compliance event review.
-- `ibmi.journal.receivers.retention` supports `dryRun`; destructive cleanup requires `approve=true`.
+- `ibmi.journal.receivers.retention` supports `dryRun`; destructive cleanup asks the user under guarded (other profiles: `approve=true`).
 
 ## Compliance
 - `ibmi.compliance.report.generate`
@@ -248,7 +248,7 @@ These tools drive a real 5250 display session over telnet (RFC 1205 / RFC 2877 /
 - **sendKeys** types `text` at the cursor (optionally after moving it with `cursorRow`/`cursorCol`), then presses `keys`: local keys `Tab`, `BackTab`, `Home`, `Reset`, `EraseEOF`, `FieldExit`, and at most one AID key, last: `Enter`, `F1`-`F24`, `PageUp`/`PageDown` (Roll Down/Up), `Clear`, `Help`, `Print`, `Attn`, `SysReq`. After an AID key it waits up to `timeoutMs` for the host to unlock the keyboard and returns the new screen with `settled`. If an error message has inhibited input, `Reset` is pressed automatically (`autoReset: true`).
 - **waitFor** waits for `text` to appear on any row and/or for the keyboard to unlock (`keyboardUnlocked`, default true when no text is given). An input-inhibited error state also counts as unlocked, because the host is waiting for the operator.
 - **snapshot** returns `plainText` plus the structured screen. **disconnect** closes the session; `ibmi.disconnect` and `ibmi.session.terminate` close it too.
-- **Write gate**: every AID key goes through the write gate. Read-only connections (`readOnlyMode` or the `read-only` policy) refuse all AID keys, including Enter and `signOn`, so they can only open and read the first screen. When a recognised command line (`===>`) holds text, pressing a data-sending AID key is checked as `cl.run` with that text (command policy, and approval under the default guarded policy); any other AID key is checked as `tn5250.sendKeys` (add it to `requireApprovalFor` to require `approve=true`).
+- **Write gate**: every AID key goes through the write gate. Read-only connections (`readOnlyMode` or the `read-only` policy) refuse all AID keys, including Enter and `signOn`, so they can only open and read the first screen. When a recognised command line (`===>`) holds text, pressing a data-sending AID key is checked as `cl.run` with that text (command policy, and approval under the default guarded policy); any other AID key is checked as `tn5250.sendKeys` (add it to `requireApprovalFor` to ask the user first).
 - Text typed into hidden fields is replaced by `***REDACTED***` in the server log and the audit record.
 - Supported: TN5250 negotiation (TERMINAL-TYPE, BINARY, EOR, NEW-ENVIRON with DEVNAME, KBDTYPE, CODEPAGE and CHARSET), TLS with certificate pinning, Write To Display (SOH, SBA, SF with field format words, IC/MC, RA, EA, TD), Clear Unit (and Alternate for 27x132), Clear Format Table, Write Error Code, Read Input Fields / Read MDT Fields / Read Immediate / Read Screen, Save/Restore Screen, Roll and the 5250 Query. Text uses CCSID 37. Windows, pull-down menus and other Write To Display Structured Field constructs are skipped (their text still shows where the host writes it as plain data); a warning is listed in `warnings`.
 
@@ -256,7 +256,7 @@ These tools drive a real 5250 display session over telnet (RFC 1205 / RFC 2877 /
 - `ibmi.objects.copy` - `CRTDUPOBJ` to `toLibrary` (default: same library) as `newObject` (default: same name); `data=true` adds `DATA(*YES)` for `*FILE`.
 - `ibmi.objects.move` - `MOVOBJ` to `toLibrary`.
 - `ibmi.objects.rename` - `RNMOBJ` to `newObject`.
-- `ibmi.objects.delete` - runs the delete command for the type (`DLTPGM`, `DLTSRVPGM`, `DLTF`, `DLTDTAARA`, ...). `objectType: "*LIB"` deletes the library named in `library` with `DLTLIB` and needs `approve=true` plus `confirmName` repeating the library name.
+- `ibmi.objects.delete` - runs the delete command for the type (`DLTPGM`, `DLTSRVPGM`, `DLTF`, `DLTDTAARA`, ...). `objectType: "*LIB"` deletes the library named in `library` with `DLTLIB` and needs `confirmName` repeating the library name; under guarded the user confirms every library delete (other profiles: `approve=true`).
 - `ibmi.objects.changeDescription` - `CHGOBJD TEXT(...)`; an empty `text` sets `*BLANK`.
 - `ibmi.libraries.copy` - `CPYLIB FROMLIB TOLIB CRTLIB(*YES|*NO) DATA(*YES|*NO)`; `createLibrary` and `data` default to true; `timeoutMs` defaults to 10 minutes.
 - `ibmi.qsys.members.copy` - `CPYSRCF ... MBROPT(*REPLACE)` to `toLibrary`/`toSourceFile`/`toMember` (each defaults to the source value). Refuses an existing target member unless `replace=true`.
@@ -266,7 +266,7 @@ These tools drive a real 5250 display session over telnet (RFC 1205 / RFC 2877 /
 - `ibmi.ifs.move` - `mv`.
 
 ### Object, Member and IFS Operation Notes
-- All of these tools change the system: they are refused in read-only mode and by the read-only policy profile, and need `approve=true` when the guarded profile lists their operation (`qsys.write`; IFS tools use `ifs.write` or `qsys.write` for the destination, and `ibmi.ifs.move` also `ifs.delete`).
+- All of these tools change the system: they are refused in read-only mode and by the read-only policy profile, and ask the user first when the guarded profile lists their operation (`qsys.write`; IFS tools use `ifs.write` or `qsys.write` for the destination, and `ibmi.ifs.move` also `ifs.delete`).
 - Supported object types: `*PGM`, `*SRVPGM`, `*MODULE`, `*FILE`, `*DTAARA`, `*DTAQ`, `*CMD`, `*MSGF`, `*MENU`, `*PNLGRP`, `*BNDDIR`, `*JOBD`, `*OUTQ`, `*USRSPC`, `*USRIDX`, `*USRQ`, `*SQLPKG`, `*QRYDFN`, `*JRN`, `*JRNRCV`, `*SBSD`, `*CLS`, `*TBL` (plus `*LIB` for delete).
 - Names are validated and uppercased; text is limited to 50 characters, quoted for CL, and may not contain control characters.
 - Objects in IBM system libraries (`QSYS*`, `QUSRSYS`, `QRECOVERY`, `QSPL`, `QRPLOBJ`, `QHLPSYS`, `QDOC`, `QSRV`, `SYSIBM`, `SYSIBMADM`, `SYSPROC`, `SYSTOOLS`, `SYSCAT`, `SYSFUN`, `SYSSTAT`, `#*`) are never changed, moved, deleted or copied into. Deleting a library and copying into a library (`CPYLIB` target) also refuse every `Q*` name, including `QGPL` and `QTEMP`.
@@ -283,7 +283,7 @@ These tools drive a real 5250 display session over telnet (RFC 1205 / RFC 2877 /
 - A manifest `.mcp-for-i-members.json` in `localPath` records each member's source type, `version`, `sha256` and last-change timestamp.
 - Re-running `downloadAll` keeps local files edited since the last download (reported in `skipped`) unless `overwrite: true`.
 - `uploadChanged` walks the tree under `localPath` (filter with `library`, `sourceFile`, `members`). Files whose content still matches the manifest are skipped without contacting the IBM i. A member that changed on the IBM i since download, or exists remotely without a manifest entry, is reported in `conflicts` and not written unless `force: true`. Missing members are created with SRCTYPE from the manifest or the file extension (`createMissing`, default true).
-- `uploadChanged` honors the write gate (read-only mode, policy, `approve`), `denyLibraries`/`allowLibraries` for every library in the tree, and `dryRun`. Written members are dropped from the member snapshot cache and the manifest is updated with their new version.
+- `uploadChanged` honors the write gate (read-only mode, policy, user confirmation), `denyLibraries`/`allowLibraries` for every library in the tree, and `dryRun`. Written members are dropped from the member snapshot cache and the manifest is updated with their new version.
 - Line endings are normalized to LF before hashing and upload.
 
 ## Compare
@@ -360,4 +360,4 @@ Finds source lines whose `SRCDAT` falls between `from` and `to` (inclusive, `YYY
 - `ibmi.libl.prune`: remove libraries that no longer exist (checked with `QSYS2.OBJECT_STATISTICS`). `dryRun` only reports. A missing current library is reported, not changed.
 - `ibmi.libl.runProfileCommand`: run a profile's `setLibraryListCommand` (the active profile by default, or `profileName`) and store the user library list and current library it produces, read back from `QSYS2.LIBRARY_LIST_INFO` in the same SQL job. `saveToProfile` also stores the result in the profile. Set the command with `ibmi.profiles.save` (`profile.setLibraryListCommand`). The command is checked against the CL command policy.
 
-All three update the stored connection settings the same way `ibmi.libl.set` does, need a writable connection, accept `approve` for guarded policies, and run `CHGLIBL`/`CHGCURLIB` when `applyToJob` is true.
+All three update the stored connection settings the same way `ibmi.libl.set` does, need a writable connection, ask the user first under guarded policies, and run `CHGLIBL`/`CHGCURLIB` when `applyToJob` is true.
