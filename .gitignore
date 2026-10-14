@@ -3,3 +3,7 @@ node_modules/
 dist/
 *.log
 skills.backup-*/
+.presentation-build/
+presentation-output/
+AGENTS.md
+plan.md

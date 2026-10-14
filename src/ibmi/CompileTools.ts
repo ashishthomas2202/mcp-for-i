@@ -77,7 +77,7 @@ export namespace CompileTools {
           commandResult = await connection.sendQsh({
             command: [
               ...(options.noLibList ? [] : buildLiblistCommands(connection, ileSetup)),
-              ...commands.map(cmd => `system \"${IBMiClient.escapeForShell(cmd)}\"`)
+              ...commands.map(cmd => `system ${quoteForShell(cmd)}`)
             ].join(` && `),
             directory: cwd
           });
@@ -94,6 +94,23 @@ export namespace CompileTools {
       stdout: "",
       stderr: "Command execution failed. (No command)"
     };
+  }
+
+  /**
+   * Validate a streamfile path used as an action target. The path is
+   * substituted into CL and shell commands, so quotes, shell metacharacters
+   * and control characters are refused.
+   */
+  export function validateStreamfilePath(value: unknown): string {
+    const target = String(value ?? "");
+    if (!target.trim()) throw new Error("targetPath is required for streamfile actions");
+    if (!target.startsWith("/")) throw new Error("targetPath must be an absolute IFS path");
+    if (/[\u0000-\u001f\u007f]/.test(target)) throw new Error("targetPath must not contain control characters");
+    if (/['"`$\\;|&<>]/.test(target)) {
+      throw new Error("targetPath must not contain quotes, backticks, '$', backslash, ';', '|', '&', '<' or '>'");
+    }
+    if (target.split("/").some(segment => segment === "..")) throw new Error("targetPath must not contain '..'");
+    return target;
   }
 
   function buildLibraryList(config: ILELibrarySettings): string[] {
@@ -129,4 +146,12 @@ function assertLibraryName(connection: IBMiClient, value: string, context: strin
     throw new Error(`Invalid ${context}: ${value}`);
   }
   return normalized;
+}
+
+/**
+ * Quote a value as a single POSIX shell word. Inside single quotes nothing is
+ * expanded, so `"`, backticks and `$` cannot break out of `system '...'`.
+ */
+export function quoteForShell(value: string) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }

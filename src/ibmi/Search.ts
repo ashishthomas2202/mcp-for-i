@@ -16,7 +16,31 @@ export namespace Search {
     };
   }
 
-  export async function searchMembers(connection: IBMiClient, library: string, sourceFile: string, searchTerm: string, members: string | IBMiMember[], readOnly?: boolean): Promise<SearchResults> {
+  export async function searchMembers(connection: IBMiClient, library: string, sourceFile: string, searchTerm: string, members: string | Array<string | IBMiMember>, readOnly?: boolean): Promise<SearchResults> {
+    return searchMembersTerms(connection, library, sourceFile, [searchTerm], members, readOnly);
+  }
+
+  export const MEMBER_SEARCH_DEFAULT_MAX_MATCHES = 100;
+  export const MEMBER_SEARCH_MAX_MATCHES = 1_000;
+
+  export type MemberSearchResults = SearchResults & {
+    terms: string[];
+    matchCount: number;
+    maxMatches: number;
+    truncated: boolean;
+    truncatedReason?: "max-matches" | "output-limit";
+    warnings?: string[];
+  };
+
+  export async function searchMembersTerms(
+    connection: IBMiClient,
+    library: string,
+    sourceFile: string,
+    searchTerms: string[],
+    members: string | Array<string | IBMiMember>,
+    readOnly?: boolean,
+    options?: { caseSensitive?: boolean; before?: number; after?: number; maxMatches?: number }
+  ): Promise<MemberSearchResults> {
     const lib = String(library || "").trim().toUpperCase();
     const src = String(sourceFile || "").trim().toUpperCase();
     if (!connection.validQsysName(lib)) {
@@ -26,6 +50,10 @@ export namespace Search {
       throw new Error(`Invalid source file: ${sourceFile}`);
     }
 
+    const terms = searchTerms.map(term => String(term || "")).filter(term => term.length > 0);
+    if (terms.length < 1 || terms.length > 20) throw new Error("Provide between 1 and 20 search terms");
+    if (terms.some(term => term.includes("\n") || term.includes("\r"))) throw new Error("Search terms may not contain newlines");
+
     let detailedMembers: IBMiMember[] | undefined;
     let memberFilter: string | undefined;
 
@@ -34,47 +62,131 @@ export namespace Search {
       if (!isSafeMemberToken(members)) {
         throw new Error(`Invalid members filter: ${members}`);
       }
-      memberFilter = `${members}.MBR`;
+      memberFilter = memberGlobToken(members);
     } else if (Array.isArray(members)) {
+      const normalizedMembers = members.map(member => typeof member === "string"
+        ? { library: lib, file: src, name: member, extension: "" }
+        : member);
       if (members.length > 1000) {
-        detailedMembers = members;
+        detailedMembers = normalizedMembers;
         memberFilter = "*.MBR";
       } else {
-        members.forEach(member => {
+        normalizedMembers.forEach(member => {
           if (!isSafeMemberToken(member.name)) {
             throw new Error(`Invalid member name in filter: ${member.name}`);
           }
         });
-        memberFilter = members.map(member => `${member.name}.MBR`).join(` `);
+        memberFilter = normalizedMembers.map(member => memberGlobToken(member.name)).join(` `);
       }
     }
 
-    const command = pfgrep
-      ? `${pfgrep} -inHr -F "${sanitizeSearchTerm(searchTerm)}" ${memberFilter}`
-      : `/usr/bin/grep -inHR -F "${sanitizeSearchTerm(searchTerm)}" ${memberFilter}`;
+    // pfgrep only supports after-context (-A); before-context needs grep.
+    const requestedBefore = clampCount(options?.before, 0, 50, 0);
+    const before = pfgrep ? 0 : requestedBefore;
+    const after = clampCount(options?.after, 0, 50, 0);
+    const maxMatches = clampCount(options?.maxMatches, 1, MEMBER_SEARCH_MAX_MATCHES, MEMBER_SEARCH_DEFAULT_MAX_MATCHES);
+    const contextFlags = [
+      before ? `-B ${before}` : "",
+      after ? `-A ${after}` : ""
+    ].filter(Boolean).join(" ");
+    // pfgrep documents -F (literal), -f - (patterns from stdin, one per line),
+    // -m (matches per member), -A (after-context; it has no -B), -n, -H, -i and -r, all with
+    // grep semantics. Patterns go over stdin so terms never reach the shell.
+    // -m stops each member early; one extra match per member reveals whether
+    // the cap cut anything off. The total across members is bounded by head,
+    // which ends the grep as soon as enough lines have been produced.
+    const flags = `-F -m ${maxMatches + 1} -f -`;
+    const modeFlags = options?.caseSensitive ? "-nHr" : "-inHr";
+    const outputLineLimit = (maxMatches + 1) * (before + after + 2);
+    const grep = connection.remoteFeatures.grep || "/usr/bin/grep";
+    const searchCommand = pfgrep
+      ? `${pfgrep} ${modeFlags} ${contextFlags} ${flags} ${memberFilter}`
+      : `${grep} ${options?.caseSensitive ? "-nHR" : "-inHR"} ${contextFlags} ${flags} ${memberFilter}`;
+    const command = `${searchCommand.replace(/\s+/g, " ")} | /QOpenSys/usr/bin/head -n ${outputLineLimit}`;
 
     const result: CommandResult = await connection.sendCommand({
       command,
-      directory: `/QSYS.LIB/${lib}.LIB/${src}.FILE`
+      directory: `/QSYS.LIB/${lib}.LIB/${src}.FILE`,
+      stdin: terms.join("\n")
     });
 
-    if (!result.stderr) {
-      let hits = parseGrepOutput(result.stdout || '', readOnly);
-
-      if (detailedMembers) {
-        hits = hits.filter(hit => {
-          const hitMember = parseHitPath(hit);
-          return detailedMembers!.some(member => member.name === hitMember.name && member.library === hitMember.library && member.file === hitMember.file);
-        });
-      }
-
-      return { term: searchTerm, hits };
+    const stdout = result.stdout || "";
+    if (result.stderr && !stdout.trim()) {
+      throw new Error(result.stderr || "Search failed");
     }
 
-    throw new Error(result.stderr || "Search failed");
+    const outputLines = stdout.split("\n").filter(line => line.length > 0);
+    // pfgrep prints after-context lines with ":" like matches, so tell them
+    // apart by whether the line contains one of the (literal) terms.
+    const isMatch = pfgrep && after > 0
+      ? (content: string) => terms.some(term => options?.caseSensitive ? content.includes(term) : content.toLowerCase().includes(term.toLowerCase()))
+      : undefined;
+    const parsed = parseMemberGrepOutput(stdout, maxMatches, readOnly, isMatch);
+    let hits = parsed.hits;
+
+    if (detailedMembers) {
+      hits = hits.filter(hit => {
+        const hitMember = parseHitPath(hit);
+        return detailedMembers!.some(member => member.name === hitMember.name && member.library === hitMember.library && member.file === hitMember.file);
+      });
+    }
+
+    const warnings: string[] = [];
+    if (pfgrep && requestedBefore > 0) warnings.push("pfgrep does not support before-context lines, so only after-context lines are returned.");
+    if (result.stderr) warnings.push(String(result.stderr).trim());
+    const outputLimited = outputLines.length >= outputLineLimit;
+    const truncated = parsed.truncated || outputLimited;
+    return {
+      term: terms[0]!,
+      terms,
+      hits,
+      matchCount: parsed.matchCount,
+      maxMatches,
+      truncated,
+      ...(truncated ? { truncatedReason: parsed.truncated ? "max-matches" as const : "output-limit" as const } : {}),
+      ...(warnings.length ? { warnings } : {})
+    };
   }
 
-  export async function searchIFS(connection: IBMiClient, path: string, searchTerm: string): Promise<SearchResults | undefined> {
+  // Parses grep-style output where matching lines use "path:line:text" and
+  // context lines use "path-line-text". Keeps at most maxMatches matches and
+  // the context that belongs to them.
+  function parseMemberGrepOutput(output: string, maxMatches: number, readonly?: boolean, isMatch?: (content: string) => boolean) {
+    const hits: SearchHit[] = [];
+    let matchCount = 0;
+    let truncated = false;
+    for (const line of output.split("\n")) {
+      if (!line || line === "--" || line.startsWith("Binary")) continue;
+      const parsed = /^(.*?)([:-])(\d+)\2(.*)$/.exec(line);
+      if (!parsed) continue;
+      const kind = parsed[2] === ":" && (!isMatch || isMatch(parsed[4])) ? "match" : "context";
+      if (kind === "match") {
+        if (matchCount >= maxMatches) {
+          truncated = true;
+          break;
+        }
+        matchCount++;
+      }
+      const path = parsed[1];
+      let hit = hits.find(entry => entry.path === path);
+      if (!hit) {
+        hit = { path, lines: [], readonly };
+        hits.push(hit);
+      }
+      hit.lines.push({ number: Number(parsed[3]), content: parsed[4], kind });
+    }
+    return { hits, matchCount, truncated };
+  }
+
+  function clampCount(value: unknown, minimum: number, maximum: number, fallback: number) {
+    const parsed = Number(value);
+    if (value === undefined || value === null || !Number.isFinite(parsed)) return fallback;
+    return Math.max(minimum, Math.min(maximum, Math.floor(parsed)));
+  }
+
+  export type IfsSearchResults = SearchResults & { exitCode: number; warnings?: string[] };
+
+  export async function searchIFS(connection: IBMiClient, path: string, searchTerm: string): Promise<IfsSearchResults> {
     const grep = connection.remoteFeatures.grep;
     if (!grep) throw new Error("Grep must be installed on the remote system.");
 
@@ -83,16 +195,16 @@ export namespace Search {
       stdin: searchTerm
     });
 
-    if (grepRes.code === 0) {
-      return { term: searchTerm, hits: parseGrepOutput(grepRes.stdout) };
-    }
-    // grep returns exit code 1 when no matches are found
-    if (grepRes.code === 1 && !grepRes.stderr) {
-      return { term: searchTerm, hits: [] };
-    }
+    // grep exits 1 when nothing matched and 2 when any file or directory could
+    // not be read, even if other files matched. Keep whatever was printed and
+    // report the problems as warnings instead of discarding every hit.
+    return withIfsWarnings(
+      { term: searchTerm, hits: parseGrepOutput(grepRes.stdout || ""), exitCode: grepRes.code ?? 0 },
+      grepRes.stderr
+    );
   }
 
-  export async function findIFS(connection: IBMiClient, path: string, findTerm: string): Promise<SearchResults | undefined> {
+  export async function findIFS(connection: IBMiClient, path: string, findTerm: string): Promise<IfsSearchResults> {
     const find = connection.remoteFeatures.find;
     if (!find) throw new Error("Find must be installed on the remote system.");
 
@@ -100,19 +212,41 @@ export namespace Search {
       command: `${find} ${Tools.escapePath(path)} -type f -iname ${Tools.shellQuote(`*${findTerm}*`)} -print`
     });
 
-    if (findRes.code === 0) {
-      if (findRes.stdout) {
-        return { term: findTerm, hits: parseFindOutput(findRes.stdout) };
+    // find exits 1 when a single directory is unreadable; the paths it did
+    // print are still valid results.
+    return withIfsWarnings(
+      { term: findTerm, hits: parseFindOutput(findRes.stdout || ""), exitCode: findRes.code ?? 0 },
+      findRes.stderr
+    );
+  }
+
+  const MAX_IFS_WARNINGS = 50;
+
+  function withIfsWarnings(results: IfsSearchResults, stderr?: string): IfsSearchResults {
+    const lines = String(stderr || "")
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line => line.length > 0);
+    if (lines.length > 0) {
+      const warnings = lines.slice(0, MAX_IFS_WARNINGS);
+      if (lines.length > MAX_IFS_WARNINGS) {
+        warnings.push(`${lines.length - MAX_IFS_WARNINGS} more warning line(s) omitted`);
       }
-      return { term: findTerm, hits: [] };
+      results.warnings = warnings;
     }
+    return results;
   }
 
   function parseFindOutput(output: string, readonly?: boolean, pathTransformer?: (path: string) => string): SearchHit[] {
     const results: SearchHit[] = [];
-    for (const line of output.split('\n')) {
+    const seen = new Set<string>();
+    for (const rawLine of output.split('\n')) {
+      const line = rawLine.replace(/\r$/, "");
+      if (!line.trim()) continue;
       const path = pathTransformer?.(line) || line;
-      results.push(results.find(r => r.path === path) || { path, readonly, lines: [] });
+      if (seen.has(path)) continue;
+      seen.add(path);
+      results.push({ path, readonly, lines: [] });
     }
     return results;
   }
@@ -120,38 +254,32 @@ export namespace Search {
   function parseGrepOutput(output: string, readonly?: boolean, pathTransformer?: (path: string) => string): SearchHit[] {
     const results: SearchHit[] = [];
     for (const line of output.split('\n')) {
-      if (line && !line.startsWith(`Binary`)) {
-        const parts = line.split(`:`);
-        const path = pathTransformer?.(parts[0]) || parts[0];
+      if (line && line !== "--" && !line.startsWith(`Binary`)) {
+        const parsed = /^(.*?)([:-])(\d+)\2(.*)$/.exec(line);
+        if (!parsed) continue;
+        const path = pathTransformer?.(parsed[1]) || parsed[1];
         let result = results.find(r => r.path === path);
         if (!result) {
           result = { path, lines: [], readonly };
           results.push(result);
         }
-        const contentIndex = nthIndex(line, `:`, 2);
-        if (contentIndex >= 0) {
-          const curContent = line.substring(contentIndex + 1);
-          result.lines.push({ number: Number(parts[1]), content: curContent });
-        }
+        result.lines.push({ number: Number(parsed[3]), content: parsed[4] });
       }
     }
     return results;
   }
 
-  function sanitizeSearchTerm(searchTerm: string): string {
-    return searchTerm.replace(/\\/g, `\\\\`).replace(/"/g, `\\"`);
-  }
-
   function isSafeMemberToken(name: string) {
-    return /^[A-Za-z0-9_*#]+$/.test(name);
+    // IBM i names may contain $, # and @ (and . or _ after the first
+    // character); '*' is kept for generic filters such as ABC*.
+    return /^[A-Za-z0-9_.*#@$]{1,11}$/.test(name);
   }
 
-  function nthIndex(aString: string, pattern: string, n: number) {
-    let index = -1;
-    while (n-- && index++ < aString.length) {
-      index = aString.indexOf(pattern, index);
-      if (index < 0) break;
-    }
-    return index;
+  // Builds the shell word for a member glob. A leading '#' would start a shell
+  // comment and '$' would expand a variable, so both are escaped; '*' stays
+  // unescaped so generic names still expand.
+  function memberGlobToken(name: string) {
+    return `${name.replace(/[#$]/g, c => `\\${c}`)}.MBR`;
   }
+
 }

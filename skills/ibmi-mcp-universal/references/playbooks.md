@@ -38,8 +38,8 @@
 4. Apply retention in controlled mode (`dryRun: true`, then approved execution).
 
 ## 7) TN5250 Interactive Flow
-1. `ibmi.tn5250.connect`.
-2. `ibmi.tn5250.readScreen` / `snapshot`.
-3. `ibmi.tn5250.setField` + `sendKeys`.
-4. `ibmi.tn5250.waitFor` until expected state.
+1. `ibmi.tn5250.connect` (`signOn: true` signs on with the stored credentials).
+2. `ibmi.tn5250.readScreen` / `snapshot`: read `text` rows and `fields` (ids like `r6c53`; hidden fields never show their content).
+3. `ibmi.tn5250.setField` (or `sendKeys` with `text`), then `sendKeys` with one AID key such as `Enter` or `F3`. AID keys are refused on read-only connections; text on a `===>` command line is checked like `ibmi.cl.run`.
+4. `ibmi.tn5250.waitFor` until expected text or the keyboard unlocks.
 5. `ibmi.tn5250.disconnect`.

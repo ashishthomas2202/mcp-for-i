@@ -2,7 +2,7 @@
 
 This document summarizes what `mcp-for-i` can do today across the MCP server and local control-plane workflow.
 
-Version context: `0.1.8` codebase.
+Version context: `0.2.0`.
 
 ## 1) Platform Capabilities
 
@@ -14,20 +14,22 @@ Version context: `0.1.8` codebase.
 
 ### 1.2 Runtime Safety and Policy Guardrails
 - Strict tool input schemas (`additionalProperties: false`) with runtime validation.
-- Guarded approval model (`approve=true`) for sensitive operations.
+- Guarded approval model: the user confirms sensitive operations in the MCP client.
 - Read-only mode enforcement.
 - Validation for critical identifiers (QSYS names, journaling object names, etc.).
 
 ### 1.3 Session Lifecycle
 - Multi-session tracking.
 - Session status/list/keepalive/terminate operations.
+- One-call session bootstrap with release, library-list, policy, transports, and supported fast-path capabilities.
 - Sliding inactivity timeout.
 - Heartbeat and reconnect behavior.
+- Persistent SQL job per connection (Mapepire, when installed on the IBM i): SQL, SQL-run CL, library list changes and the job log share one job across calls; falls back to a new QZDFMDB2 job per call when Mapepire is not available. Timed-out statements are cancelled on the IBM i. See [configuration](configuration.md#persistent-sql-job-mapepire) for `sqlTransport` and how to install Mapepire.
 
 ### 1.4 Agent-Safe Structured Results
 - Tool responses expose structured payloads for automation.
 - SQL/CL/diagnostic outputs normalized where applicable.
-- TN5250 state model includes machine-readable fields/history.
+- TN5250 screens are returned as text rows plus machine-readable fields (position, label, protected/hidden flags); hidden field contents are never returned.
 
 ### 1.5 Auditing and Compliance Foundations
 - Tamper-evident hash-chain audit record for tool calls.
@@ -51,6 +53,7 @@ Version context: `0.1.8` codebase.
 - `ibmi.session.status`
 - `ibmi.session.keepalive`
 - `ibmi.session.terminate`
+- `ibmi.session.bootstrap`
 - `ibmi.connections.list`
 - `ibmi.connections.add`
 - `ibmi.connections.update`
@@ -66,8 +69,14 @@ Version context: `0.1.8` codebase.
 - `ibmi.qsys.members.create`
 - `ibmi.qsys.members.rename`
 - `ibmi.qsys.members.delete`
+- `ibmi.qsys.members.copy`
+- `ibmi.qsys.members.changeText`
+- `ibmi.qsys.members.changeType`
 - `ibmi.qsys.sourcefiles.create`
 - `ibmi.qsys.libraries.create`
+- `ibmi.objects.copy`, `ibmi.objects.move`, `ibmi.objects.rename`, `ibmi.objects.delete`, `ibmi.objects.changeDescription`
+- `ibmi.libraries.copy`
+- Legacy-compatible member list/read responses plus opt-in filtered paging, ranged reads, metadata, version/hash checks, caching, and complete fallback reads.
 
 ### IFS Operations
 - `ibmi.ifs.list`
@@ -75,18 +84,31 @@ Version context: `0.1.8` codebase.
 - `ibmi.ifs.write`
 - `ibmi.ifs.mkdir`
 - `ibmi.ifs.delete`
+- `ibmi.ifs.copy`
+- `ibmi.ifs.move`
 - `ibmi.ifs.upload`
 - `ibmi.ifs.download`
 
 ### Search and Resolution
 - `ibmi.search.members`
+- `ibmi.source.resolve`
+- `ibmi.source.inspect`
 - `ibmi.search.ifs`
 - `ibmi.find.ifs`
+- `ibmi.search.changedLines`
 - `ibmi.resolve.path`
+
+### System Information
+- `ibmi.system.info`
+
+### Official IBM i Documentation
+- `ibmi.docs.search`
+- `ibmi.docs.open` (any `https://www.ibm.com/docs/` page)
+- MCP resources at `ibmi-docs://catalog` and `ibmi-docs://topic/{ref}`
 
 ### Actions, Filters, Profiles, Library List
 - `ibmi.actions.list`
-- `ibmi.actions.run`
+- `ibmi.actions.run` (compiles members or streamfiles and returns EVFEVENT errors by file; see docs/tools.md "Compile and errors")
 - `ibmi.actions.save`
 - `ibmi.actions.delete`
 - `ibmi.filters.list`
@@ -102,9 +124,22 @@ Version context: `0.1.8` codebase.
 - `ibmi.libl.remove`
 - `ibmi.libl.setCurrent`
 - `ibmi.libl.validate`
+- `ibmi.libl.move`
+- `ibmi.libl.prune`
+- `ibmi.libl.runProfileCommand`
 - `ibmi.ifs.shortcuts.list`
 - `ibmi.ifs.shortcuts.add`
 - `ibmi.ifs.shortcuts.delete`
+
+### Compare and Inspection
+- `ibmi.compare.text`
+- `ibmi.objects.describe`
+- `ibmi.members.describe`
+- `ibmi.ifs.stat`
+- `ibmi.programs.info`
+- `ibmi.objects.whereUsed`
+- `ibmi.tables.describe`
+- `ibmi.routines.describe`
 
 ### Deploy and File Sync
 - `ibmi.deploy.compare`
@@ -112,12 +147,18 @@ Version context: `0.1.8` codebase.
 - `ibmi.deploy.uploadDirectory`
 - `ibmi.deploy.uploadFiles`
 - `ibmi.deploy.setCcsid`
+- `ibmi.deploy.sync` methods: `all`, `changed` (SHA-256), `gitChanged`, `selection`
+
+### Bulk Source Members
+- `ibmi.members.downloadAll`
+- `ibmi.members.uploadChanged`
 
 ### SQL, CL, Diagnostics, Spool, Debug
 - `ibmi.sql.query`
 - `ibmi.sql.execute`
 - `ibmi.cl.run`
 - `ibmi.diagnostics.parseEvfevent`
+- `ibmi.compile.listing`
 - `ibmi.joblog.get`
 - `ibmi.spool.list`
 - `ibmi.spool.read`
@@ -166,7 +207,9 @@ Version context: `0.1.8` codebase.
 - `ibmi.journal.endIfs`
 - `ibmi.journal.receivers.retention`
 
-### TN5250 Command Session
+### TN5250 (5250 green-screen sessions)
+A real TN5250 client: connects to the saved connection's host on port 23 (or 992 with TLS), reads the actual screen and fields, fills fields and presses keys (Enter, F1-F24, PageUp/PageDown, Clear, Help, Attn, SysReq). Optional sign-on uses the stored credentials. AID keys go through the write gate: read-only connections cannot press them, and text on a `===>` command line is checked against the command policy. See [tools](tools.md#tn5250-notes) for details and limits.
+
 - `ibmi.tn5250.connect`
 - `ibmi.tn5250.readScreen`
 - `ibmi.tn5250.setField`
@@ -178,8 +221,8 @@ Version context: `0.1.8` codebase.
 ## 3) High-Value Behaviors Users Often Miss
 
 ### 3.1 Guarded Approvals
-- Many destructive/risky tools accept `approve=true`.
-- In guarded policy, write operations may be blocked until approved.
+- In guarded policy, risky operations wait for the user to confirm them in the MCP client; the agent cannot approve them itself.
+- With `approvalMode: "agent"` (for clients without prompts), `approve=true` from the agent is accepted instead.
 
 ### 3.2 Audit Data Lifecycle
 - Verify chain integrity with `ibmi.audit.verify`.

@@ -29,6 +29,23 @@ type SqlCursorState = {
   expiresAt: number;
 };
 
+/** What the person is asked to confirm before a guarded operation runs. */
+export type ConfirmationRequest = {
+  operation: string;
+  connectionName: string;
+  toolName?: string;
+  /** Plain-text lines describing exactly what will run. */
+  details: string[];
+  /** Whether "allow for the rest of this session" may be offered. */
+  allowSession: boolean;
+};
+
+export type ConfirmationAnswer =
+  | { allowed: boolean; forSession?: boolean }
+  | "unsupported";
+
+export type ConfirmHandler = (request: ConfirmationRequest) => Promise<ConfirmationAnswer>;
+
 const DEFAULT_SESSION_IDLE_MS = 30 * 60 * 1000;
 const DEFAULT_SESSION_PING_MS = 15 * 1000;
 const DEFAULT_CURSOR_TTL_MS = 5 * 60 * 1000;
@@ -37,6 +54,13 @@ const DEFAULT_RECONNECT_ATTEMPTS = 2;
 export class McpContext {
   store = new ConfigStore();
   activeName?: string;
+  /**
+   * Asks the person to confirm a guarded operation. Set by the server from
+   * the MCP client's elicitation support; unset means nobody can be asked.
+   */
+  confirm?: ConfirmHandler;
+  /** Operations the person allowed for the rest of this session, keyed by connection and operation. */
+  readonly sessionApprovals = new Set<string>();
   private sessions = new Map<string, SessionEntry>();
   private cursors = new Map<string, SqlCursorState>();
   private connectLocks = new Map<string, Promise<IBMiClient>>();
@@ -92,7 +116,9 @@ export class McpContext {
 
   async ensureActive(name?: string): Promise<IBMiClient> {
     const sessionName = name || this.activeName;
-    if (!sessionName) throw new Error("Not connected");
+    if (!sessionName) {
+      throw new Error("No active connection. Call ibmi.connect or pass connectionName.");
+    }
 
     if (!this.sessions.has(sessionName)) {
       await this.connectByName(sessionName);
@@ -101,6 +127,23 @@ export class McpContext {
     await this.ensureSessionHealthy(sessionName);
     this.touchSession(sessionName);
     return this.sessions.get(sessionName)!.client;
+  }
+
+  /**
+   * Policy for a connection, read from the stored connection when no session
+   * is open yet, so checks that run before connecting still see it.
+   */
+  async resolvePolicy(name?: string): Promise<ConnectionPolicy> {
+    const sessionName = name || this.activeName;
+    if (!sessionName) return defaultPolicy();
+    const session = this.sessions.get(sessionName);
+    if (session) return session.policy;
+    try {
+      const stored = await this.store.getConnection(sessionName);
+      return normalizePolicy(stored?.policy);
+    } catch {
+      return defaultPolicy();
+    }
   }
 
   getPolicy(name?: string): ConnectionPolicy {
@@ -140,7 +183,9 @@ export class McpContext {
       lastValidatedAt: session.lastValidatedAt ? new Date(session.lastValidatedAt).toISOString() : undefined,
       expiresAt: new Date(session.expiresAt).toISOString(),
       idleSecondsRemaining: Math.max(0, Math.floor((session.expiresAt - now) / 1000)),
-      lastError: session.lastError
+      lastError: session.lastError,
+      // Persistent SQL job (Mapepire): open, fallen back to QZDFMDB2, or not started yet.
+      sqlJob: session.client.sqlJob?.status?.()
     };
   }
 
@@ -158,6 +203,10 @@ export class McpContext {
     await this.disconnect(target);
   }
 
+  /**
+   * Closes the session, including its persistent SQL job (IBMiClient.disconnect
+   * ends the Mapepire job before closing SSH).
+   */
   async disconnect(name?: string) {
     if (name) {
       const session = this.sessions.get(name);
@@ -171,7 +220,9 @@ export class McpContext {
       }
       this.sessions.delete(name);
       if (this.activeName === name) {
-        this.activeName = this.sessions.keys().next().value;
+        // Never fall back to another open session: later calls without
+        // connectionName must not silently target a different system.
+        this.activeName = undefined;
       }
       await this.persistSessionState(true);
       return;
@@ -222,7 +273,10 @@ export class McpContext {
     const stored = await this.store.getConnection(name);
     if (!stored) throw new Error(`Unknown connection: ${name}`);
 
-    const password = await getPassword(name);
+    // Key-based connections must still work when the keychain is unavailable.
+    const password = stored.privateKeyPath
+      ? await getPassword(name).catch(() => undefined)
+      : await getPassword(name);
     const connection: ConnectionData = {
       name: stored.name,
       host: stored.host,

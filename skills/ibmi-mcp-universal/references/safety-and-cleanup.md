@@ -3,7 +3,7 @@
 ## Guardrails
 - Use read-first workflow before write operations.
 - Treat all destructive tools as guarded operations.
-- Always pass `approve: true` intentionally (never implicitly assume).
+- Expect the user to confirm guarded operations; a declined confirmation means stop, not retry.
 - Avoid production object edits unless explicitly requested.
 - Keep task scope narrow: one library/path/object set per task.
 

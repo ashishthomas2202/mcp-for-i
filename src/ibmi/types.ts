@@ -65,7 +65,18 @@ export interface ConnectionConfig {
   autoClearTempData?: boolean;
   sourceFileCCSID?: string;
   sqlJobCcsid?: string | number;
+  /** How SQL runs: "auto" (Mapepire job when available, else QZDFMDB2), "mapepire" or "qzdfmdb2". */
+  sqlTransport?: "auto" | "mapepire" | "qzdfmdb2";
+  /** Mapepire connection: "auto", "daemon" (server on mapepirePort) or "ssh" (single mode over SSH). */
+  mapepireMode?: "auto" | "daemon" | "ssh";
+  mapepirePort?: number;
+  mapepireServerPath?: string;
+  mapepireJavaPath?: string;
   enableSourceDates?: boolean;
+  /** Largest member (UTF-8 bytes) a full read returns; 0 disables the cap. */
+  sourceReadMaxBytes?: number;
+  /** Largest member (lines) a full read returns; 0 disables the cap. */
+  sourceReadMaxLines?: number;
   homeDirectory?: string;
   libraryList?: string[];
   currentLibrary?: string;
@@ -77,6 +88,9 @@ export interface ConnectionConfig {
   sessionIdleMinutes?: number;
   sessionPingSeconds?: number;
   sessionReconnectAttempts?: number;
+  tn5250Port?: number;
+  tn5250Tls?: boolean;
+  tn5250DeviceName?: string;
 }
 
 export interface ObjectFilter {
@@ -144,4 +158,5 @@ export type SearchHit = {
 export type SearchHitLine = {
   number: number;
   content: string;
+  kind?: "match" | "context";
 };

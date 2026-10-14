@@ -119,7 +119,7 @@ test("tool schemas reject unknown arguments by default", () => {
   assert.ok(errors.some(msg => msg.includes("$.unexpected is not allowed")));
 });
 
-test("ibmi.connections.add validates nested settings and policy", () => {
+test("ibmi.connections.add validates nested settings and does not take a policy", () => {
   const tool = getTools().find(t => t.name === "ibmi.connections.add");
   assert.ok(tool, "ibmi.connections.add tool is missing");
 
@@ -128,15 +128,19 @@ test("ibmi.connections.add validates nested settings and policy", () => {
     host: "dev400.company.com",
     username: "DEVUSER",
     settings: {
-      tempLibrary: "ILEDITOR",
+      currentLibrary: "DEVLIB",
       sessionReconnectAttempts: 2
-    },
-    policy: {
-      profile: "guarded",
-      requireApprovalFor: ["sql.write", "deploy.sync"]
     }
   });
   assert.equal(valid.length, 0);
+
+  const withPolicy = validateToolInput(tool.inputSchema, {
+    name: "DEV400",
+    host: "dev400.company.com",
+    username: "DEVUSER",
+    policy: { profile: "power-user" }
+  });
+  assert.ok(withPolicy.length > 0, "policy must not be accepted from the agent");
 
   const invalidSettings = validateToolInput(tool.inputSchema, {
     name: "DEV400",

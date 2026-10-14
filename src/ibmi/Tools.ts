@@ -1,4 +1,5 @@
 import path from "path";
+import { rewriteSqlForQzdfmdb2 } from "./sqlParse.js";
 
 export namespace Tools {
   export class SqlError extends Error {
@@ -195,18 +196,13 @@ export namespace Tools {
     return { library: parts[0], name: parts[1] };
   }
 
+  /**
+   * Prepares SQL for QZDFMDB2: lines starting with `@` become QCMDEXC calls and,
+   * with removeComments, `--` comments are dropped. Quote-aware: `--` inside a
+   * string literal, delimited identifier or block comment is kept.
+   */
   export function fixSQL(statement: string, removeComments = false): string {
-    let statements = statement.split("\n").map(line => {
-      if (line.startsWith('@')) {
-        line = `Call QSYS2.QCMDEXC('${line.substring(1, line.endsWith(";") ? line.length - 1 : undefined).replaceAll("'", "''")}');`;
-      }
-      return line.replaceAll("--", "\n--");
-    }).join(`\n`);
-
-    if (removeComments) {
-      statements = statements.split(`\n`).filter(l => !l.trim().startsWith(`--`)).join(`\n`);
-    }
-    return statements;
+    return rewriteSqlForQzdfmdb2(statement, removeComments);
   }
 
   export function upperCaseName(value: string) {

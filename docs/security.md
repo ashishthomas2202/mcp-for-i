@@ -7,10 +7,95 @@
   - Linux Node uses Linux Secret Service.
   - WSL Node is Linux and uses the WSL distro's Linux Secret Service, not Windows Credential Manager.
 - Keychain availability is checked as an actual read operation, not only as a module import.
-- If keychain is unavailable or a keychain operation fails, credentials are stored in memory for the current process only.
+- In the default `auto` mode, if the keychain is unavailable or a keychain operation fails, credentials are stored in memory for the current process only.
+- With `MCP_FOR_I_CREDENTIAL_STORE=keychain`, there is no in-memory fallback: saving, reading or deleting a password fails with an error when the keychain is unavailable.
 - In WSL, `keytar` uses the Linux Secret Service inside the distro. It does not automatically use Windows Credential Manager. For persistent credentials in WSL, configure Linux libsecret/Secret Service, use SSH keys, or run MCP-for-i from Windows.
 - Set `MCP_FOR_I_CREDENTIAL_STORE=session` to force process-only password storage.
-- Passwords are never written to the config file.
-- `readOnlyMode` prevents write operations on members/IFS.
+- Passwords are never written to the config file. Plaintext passwords found in older config files are moved to the keychain and removed from the file only after the keychain confirms the save; without a persistent keychain they are left in place (with a warning) rather than lost.
+- The config file is written atomically with owner-only permissions, never overwritten after a failed read, and updated under a cross-process lock.
+- `readOnlyMode` refuses every tool that changes the system: member and IFS writes, `ibmi.sql.execute`, `ibmi.cl.run`, every AID key of `ibmi.tn5250.sendKeys` (and `ibmi.tn5250.connect` with `signOn`), `ibmi.actions.run`, and destructive data-queue receives.
 - Connection policies support `read-only`, `guarded`, and `power-user` modes.
-- Guarded mode requires `approve: true` for configured risky operations.
+- Guarded mode asks the user before the operations listed in `requireApprovalFor` run. The prompt is shown by the MCP client (MCP elicitation) and lists the tool, the connection and the arguments that decide what runs. The agent's own `approve: true` counts for nothing here. The user can decline, accept once, or accept that kind of operation on that connection until the server restarts.
+- If the client cannot show prompts, guarded operations are refused. To use such a client, set the connection's `policy.approvalMode` to `"agent"` in config.json; `approve: true` from the agent is then accepted, as in earlier versions.
+- Under guarded, these always ask the user, whatever `requireApprovalFor` lists, and are never covered by an "until restart" answer: shell commands (`ibmi.cl.run` with `qsh`/`pase`, CL that starts a shell such as `QSH`, `STRQSH` or `CALL QP2SHELL`, SQL whose `QCMDEXC` starts a shell or can't be read, and `ibmi.actions.run` actions that run shell text), library deletes, `ibmi.audit.purge`, and journal receiver deletes. IFS deletes ask whenever `ifs.delete` is listed (it is by default) and are also never covered by an "until restart" answer.
+- The agent cannot change a connection's policy or its safety settings (`readOnlyMode`, `tempDir`, `tempLibrary`, `autoClearTempData`, `mapepire*`) through `ibmi.connections.add`/`update`. Those are changed in the web UI or in config.json.
+- Command, library and IFS path allow/deny lists are enforced. CL command names are normalized (trimmed, uppercased, library qualifier removed) before matching, and the command lists also apply to the expanded command of `ibmi.actions.run` and to CL embedded in SQL (`@` lines and `QCMDEXC`). See [configuration](configuration.md) for the exact rules.
+- `ibmi.tn5250.*` is a real 5250 terminal session. A 5250 screen does not say what an Enter key will do: it might run a CL command, update a file in an application, or sign off. So the controls are coarse:
+  - `readOnlyMode` (and the `read-only` policy) blocks sending any AID key at all (Enter, F-keys, PageUp/PageDown, Clear, Help, Attn, SysReq) and `signOn`. A read-only connection can only open a session and read the first screen.
+  - `denyCommands` / `allowCommands` only apply to text on a recognised command line (an input field labelled `===>`, as on IBM i menus and the command entry display). That text is checked as `cl.run`, which also asks the user under the default guarded policy. Commands reached any other way (menu options, prompt screens, application programs, F-keys) are not checked. Treat the policy as a guard against obvious mistakes, not a sandbox; use IBM i object authority and a limited user profile for real restrictions.
+  - Other AID keys are checked as the `tn5250.sendKeys` operation; add it to `requireApprovalFor` to ask the user before every key press. Keys typed into a shell that is already open on the screen are not seen as shell commands.
+- TN5250 passwords come only from the connection's stored password (`signOn`, or `setField` with `useStoredPassword`). Over TLS the password is offered with RFC 4777 auto sign-on (plain-text password inside the TLS channel); on plain telnet it is typed into the sign-on screen and travels unencrypted, as with any 5250 emulator. Use port 992 (TLS) wherever possible.
+- Anything typed into a hidden (non-display) 5250 field is redacted from the log and the audit record, and readScreen/snapshot never return hidden field contents.
+
+## Control plane
+
+The local control plane (`mcp-for-i control`) only accepts requests from its own Web UI and CLI:
+
+- A random per-install token is created on first start and stored next to the config file as `controlplane.token` (owner-only file mode where the platform supports it). Every `/api` call must send it in the `X-MCP-For-I-Token` header. The Web UI gets it in the page it is served; the CLI reads it from the file. Delete the file and restart the control plane to rotate it.
+- `GET /api/health` answers without the token so launchers can check liveness, but it only returns `{ ok, service }` unless the token is sent.
+- The `Host` header must be `localhost`, `127.0.0.1` or `[::1]` with the control-plane port (blocks DNS rebinding), and a cross-origin `Origin` header is rejected.
+- Request bodies must be `application/json` and at most 1 MB (larger bodies get `413`).
+- Changing a saved connection's host, port or username requires entering its password again in the same request, so a stored password cannot be redirected to another server. Adding a connection never overwrites an existing one.
+- Skills updates only accept `https://`, `ssh://` or `user@host:path` repository URLs and branch names that follow git's ref-name rules.
+- Update and service jobs return `202` right away; poll `GET /api/runtime/status` for progress.
+
+## SSH host key verification
+
+- The first time a host is connected, its SSH host key fingerprint (OpenSSH `SHA256:...` format) is stored per `host:port` in `known_hosts.json` in the mcp-for-i config directory (the folder that holds `config.json`: `%APPDATA%\mcp-for-i` on Windows, `~/Library/Application Support/mcp-for-i` on macOS, `$XDG_CONFIG_HOME/mcp-for-i` or `~/.config/mcp-for-i` on Linux).
+- On every later connection the presented key must match. If it does not, the connection is refused with an error showing the stored and presented fingerprints. This can mean a man-in-the-middle attack.
+- To accept a key change that you expect (system rebuilt, SSH keys regenerated), compare the new fingerprint with the one on the IBM i (run `ssh-keygen -lf` on the host key `.pub` file in the OpenSSH `etc` directory there), then either:
+  - set `MCP_FOR_I_ACCEPT_NEW_HOSTKEY` for one start of the server and connect again, then unset it. Accepted values, comma separated: `host:port` or `host` (that host only), the new `SHA256:...` fingerprint (only that key), or `1`/`true` (any host; avoid this); or
+  - remove the host's entry from `known_hosts.json`; the next connection trusts the key it sees.
+- A damaged `known_hosts.json` is never silently reset; connections fail until it is fixed or removed.
+
+## Mapepire TLS certificate
+
+- In `daemon` mode the persistent SQL job connects to the Mapepire server over TLS. Before any credentials are sent, the server's certificate chain is read. If it ends in a publicly trusted CA, the normal CA and host-name checks apply.
+- Otherwise (Mapepire's default self-signed certificate, or a private CA) the root certificate's `SHA256:...` fingerprint is stored per `host:port` under `certificates` in `known_hosts.json` on first use. Every later connection must present a chain that validates against that certificate and contains it; the host name is not compared, because the generated certificate rarely matches the name used to connect.
+- A changed certificate is refused like a changed SSH host key. Accept an expected change with `MCP_FOR_I_ACCEPT_NEW_HOSTKEY` (`host:port` of the Mapepire port, `host`, or the new fingerprint) or by removing the entry. With `sqlTransport: auto` a refused certificate makes SQL fall back to QZDFMDB2 over SSH; the reason is shown in `ibmi.session.status` (`sqlJob.unavailableReason`).
+- `ssh` mode runs over the already verified SSH session and uses no TLS.
+
+## TN5250 TLS certificates
+
+- A TN5250 TLS certificate that chains to a trusted CA and matches the host name is accepted.
+- Any other certificate (typically the self-signed certificate of the IBM i Telnet server) is trusted on first use: its SHA-256 fingerprint is pinned per `host:port` in `known_tls_certs.json` in the mcp-for-i config directory, and a different certificate later is refused.
+- To accept an expected change (certificate renewed), set `MCP_FOR_I_ACCEPT_NEW_TLSCERT` the same way as `MCP_FOR_I_ACCEPT_NEW_HOSTKEY` (`host:port`, `host`, the new `SHA256:...` fingerprint, or `1`), or remove the entry from `known_tls_certs.json`.
+
+## SQL handling
+
+- SQL text is sent to QZDFMDB2 on the SSH channel's standard input. It is never placed inside the shell command line. With the persistent Mapepire job it is sent as a protocol message, and CL commands run through `QSYS2.QCMDEXC` with the command as a bound parameter.
+- The read-only and policy checks below run before SQL reaches either transport.
+- `ibmi.sql.query` accepts exactly one `SELECT`, `WITH` or `VALUES` statement (an optional trailing `;` is allowed). It rejects:
+  - more than one statement;
+  - lines starting with `@` (these run CL commands through QCMDEXC);
+  - any reference to `QCMDEXC`;
+  - data-change table references such as `FINAL TABLE (INSERT ...)`, `NEW TABLE (UPDATE ...)` and `OLD TABLE (DELETE ...)`;
+  - unterminated strings or comments, and a `;` inside a string or comment (QZDFMDB2 splits statements on `;` itself).
+- The check is lexical. A `SELECT` can still call a user-defined function that changes data; use object authority and a read-only connection profile to restrict that.
+
+## Local file access
+
+Tools that touch files on your PC only accept paths inside the allowed local roots (default: the working directory and your home directory). Paths are fully resolved, including `..` and symlinks, before the check. Credential stores such as `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/*/credentials`, the mcp-for-i config directory and (on Windows) `%APPDATA%` are always refused. Set `MCP_FOR_I_ALLOWED_LOCAL_ROOTS` or `settings.allowedLocalRoots` to narrow or change the roots. Files inside a directory passed to `ibmi.deploy.uploadDirectory` are uploaded as they are found; keep symlinks to outside locations out of deploy folders.
+
+## IFS deletes
+
+`ibmi.ifs.delete` refuses empty or relative paths, paths containing `..` or wildcards, `/`, any top-level directory, `/QSYS.LIB/<lib>.LIB`, second-level directories under `/QOpenSys` and `/QIBM`, and IBM product and system library locations.
+
+It also refuses user home directories (`/home/<user>`). A recursive delete must name a path at least three levels deep (for example `/home/USER/work`) and repeat it in `confirmPath`, because `rm -rf` on a home or project folder cannot be undone.
+
+## Shell quoting
+
+Action commands in the `ile` environment are passed to `system` as a single-quoted shell word, so quotes, backticks and `$` in a command or target path cannot start another shell command. Streamfile action targets must be absolute IFS paths without quotes, backticks, `$`, backslashes, `;`, `|`, `&`, `<`, `>` or control characters.
+
+## Secret redaction
+
+Logs and audit records redact secrets by key name (case-insensitive substring match on `password`, `passwd`, `pwd`, `secret`, `token`, `apikey`, `privatekey`, `passphrase`, `authorization` and similar) and inside values: CL parameters such as `PASSWORD(...)`, `PWD(...)`, `NEWPWD(...)` and `CURPWD(...)`, SQL `PASSWORD '...'`, `SET ENCRYPTION PASSWORD` and `USING '...'`, command-line flags like `--password=...`, `key=value` pairs and `Bearer` tokens.
+
+## Audit log integrity
+- Every tool call is appended to a hash chain. New records (`version: 2`) carry a sequence number and are signed with HMAC-SHA256 using a per-install key (`tool-audit.key`, owner-only permissions), so the chain cannot be recomputed without the key.
+- A signed anchor file records the first record hash, the last sequence number and the last hash. `ibmi.audit.verify` uses it to detect records removed from the start or the end of the log, sequence gaps, edited records, and a modified or missing anchor. If the anchor has to be rebuilt, the rebuild is recorded and keeps being reported by verify.
+- Records written by older versions (`version: 1`, unkeyed) are verified with the old algorithm and reported as a `legacy` segment. An unkeyed record after keyed records is reported as a failure.
+- Appends, purges and verification take a lock file, and the previous hash is read from the log under that lock, so several MCP processes extend one chain. A failed append is reported to the caller and does not stop later appends.
+- Purges run inside the same lock and keep the remaining records unchanged; the anchor is moved to the new first record.
+- `ibmi.audit.list` and `ibmi.audit.export` skip unparseable lines and return their count as `skippedLines`; verify reports them as failures.
+- The key file protects against edits by anyone who cannot read it. A local user or process with access to the key can still rewrite the log; copy exports to separate storage for stronger guarantees.

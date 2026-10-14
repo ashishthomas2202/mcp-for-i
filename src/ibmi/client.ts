@@ -4,9 +4,29 @@ import path from "path";
 import { Tools } from "./Tools.js";
 import { IBMiContent } from "./IBMiContent.js";
 import { CommandData, CommandResult, ConnectionConfig, ConnectionData } from "./types.js";
+import { checkHostKey } from "./knownHosts.js";
+import {
+  DEFAULT_MAPEPIRE_PORT,
+  PersistentSqlJob,
+  SqlJobFactory,
+  SqlJobOpenRequest,
+  SqlRows,
+  isQualifiedJobName,
+  normalizeMapepireMode
+} from "./sqlJob.js";
+import {
+  ResolvedLibraryList,
+  desiredLibraryList,
+  existingLibrariesSql,
+  invalidNamesWarning,
+  libraryListCommand,
+  libraryNamesFromRows,
+  qshLibraryListPrefix,
+  referencedLibraries,
+  resolveAgainstExisting
+} from "./libraryList.js";
 
 const LOCALE = "LC_ALL=EN_US.UTF-8";
-const SQL_HEREDOC_TAG = "__MCP_FOR_I_SQL__";
 
 export class IBMiClient {
   client?: NodeSSH;
@@ -19,11 +39,27 @@ export class IBMiClient {
   currentUser = "";
   currentConnectionName = "";
 
-  private config: ConnectionConfig;
+  /** Long-lived SQL job (Mapepire) shared by SQL and CL calls; see sqlJob.ts. */
+  readonly sqlJob: PersistentSqlJob;
 
-  constructor(config: ConnectionConfig) {
+  private config: ConnectionConfig;
+  private connection?: ConnectionData;
+  /**
+   * The configured library list checked for QZDFMDB2 and qsh jobs, which start
+   * fresh on every call; re-checked when the setting changes.
+   */
+  private fallbackLibraryList?: { signature: string; resolved: ResolvedLibraryList };
+
+  constructor(config: ConnectionConfig, options: { sqlJobFactory?: SqlJobFactory } = {}) {
     this.config = config;
     this.content = new IBMiContent(this);
+    this.sqlJob = new PersistentSqlJob({
+      getConfig: () => this.config,
+      getOpenRequest: () => this.sqlJobOpenRequest(),
+      factory: options.sqlJobFactory,
+      cancelStatement: jobName => this.cancelSqlInJob(jobName),
+      fallbackLibraryListWarning: () => this.fallbackLibraryList?.resolved.warning
+    });
   }
 
   getConfig() {
@@ -58,22 +94,47 @@ export class IBMiClient {
     this.currentConnectionName = connection.name;
 
     this.client = new NodeSSH();
-    await this.client.connect({
-      host: connection.host,
-      port: connection.port,
-      username: connection.username,
-      password: connection.password,
-      privateKey: connection.privateKeyPath ? await fs.readFile(connection.privateKeyPath, "utf8") : undefined,
-      keepaliveInterval: connection.keepaliveInterval,
-      readyTimeout: connection.readyTimeout,
-      debug: connection.sshDebug ? (msg: string) => process.stderr.write(`[ssh] ${msg}\n`) : undefined
-    });
+    // Trust on first use: the host key is recorded on the first connection and
+    // must match on every later one (see docs/security.md).
+    let hostKeyError: Error | undefined;
+    const hostVerifier = (key: Buffer, verify: (valid: boolean) => void) => {
+      checkHostKey({ host: connection.host, port: connection.port, key })
+        .then(() => verify(true))
+        .catch((err: Error) => {
+          hostKeyError = err;
+          verify(false);
+        });
+    };
+    try {
+      await this.client.connect({
+        host: connection.host,
+        port: connection.port,
+        username: connection.username,
+        password: connection.password,
+        privateKey: connection.privateKeyPath ? await fs.readFile(connection.privateKeyPath, "utf8") : undefined,
+        keepaliveInterval: connection.keepaliveInterval,
+        readyTimeout: connection.readyTimeout,
+        hostVerifier,
+        debug: connection.sshDebug ? (msg: string) => process.stderr.write(`[ssh] ${msg}\n`) : undefined
+      });
+    } catch (err) {
+      this.client.dispose();
+      this.client = undefined;
+      throw hostKeyError ?? err;
+    }
+    this.connection = connection;
 
-    await this.detectRemoteFeatures();
-    await this.loadDefaultLibraryList();
+    await Promise.all([
+      this.detectRemoteFeatures(),
+      this.loadDefaultLibraryList()
+    ]);
   }
 
   async disconnect(): Promise<void> {
+    // Close the SQL job first: in single mode it runs on this SSH session.
+    await this.sqlJob.close().catch(() => undefined);
+    this.connection = undefined;
+    this.fallbackLibraryList = undefined;
     if (this.client) {
       this.client.dispose();
       this.client = undefined;
@@ -129,19 +190,154 @@ export class IBMiClient {
     };
   }
 
-  async runSQL(statements: string): Promise<Tools.DB2Row[]> {
+  /**
+   * Runs SQL. Uses the connection's persistent Mapepire job when it is
+   * available (so library list changes and QTEMP carry over), otherwise a new
+   * QZDFMDB2 job. Either way the connection's configured library list and
+   * current library are in effect. When `signal` aborts, a statement running
+   * in the persistent job is cancelled on the IBM i.
+   */
+  async runSQL(statements: string, options: { signal?: AbortSignal } = {}): Promise<SqlRows> {
+    const rows = await this.sqlJob.runSql(statements, options);
+    if (rows) return rows;
+    return this.runSqlQzdfmdb2(statements);
+  }
+
+  /**
+   * Runs a CL command where it affects later SQL and CL: in the persistent
+   * job when there is one, otherwise with `system` in a qsh job.
+   */
+  async runCL(command: string, options: { signal?: AbortSignal } = {}): Promise<CommandResult> {
+    try {
+      const messages = await this.sqlJob.runCl(command, options);
+      if (messages) {
+        const stdout = messages.map(m => (m.id ? `${m.id}: ${m.text}` : m.text)).join("\n");
+        return { code: 0, signal: null, stdout, stderr: "", command };
+      }
+    } catch (err: any) {
+      return { code: 1, signal: null, stdout: "", stderr: err?.message || String(err), command };
+    }
+    // A new job: the qsh liblist builtin sets the configured library list,
+    // which the job `system` starts inherits. Single-quoted for qsh, so
+    // nothing in the command is expanded.
+    const resolved = await this.resolveFallbackLibraryList();
+    const prefix = resolved ? qshLibraryListPrefix(resolved, this.defaultUserLibraries) : "";
+    const run = `system ${Tools.shellQuote(command)}`;
+    return this.sendQsh({ command: prefix ? `${prefix}; ${run}` : run });
+  }
+
+  /**
+   * Puts the configured library list in effect now (ibmi.libl.* applyToJob).
+   * In the persistent job it is applied immediately; QZDFMDB2 and qsh jobs
+   * start fresh, so there it is checked now and applied on every call.
+   */
+  async applyConfiguredLibraryList(): Promise<{ applied: "job" | "per-call"; warning?: string }> {
+    const result = await this.sqlJob.reapplyLibraryList();
+    if (result) return { applied: "job", ...(result.warning ? { warning: result.warning } : {}) };
+    this.fallbackLibraryList = undefined;
+    const resolved = await this.resolveFallbackLibraryList();
+    return { applied: "per-call", ...(resolved?.warning ? { warning: resolved.warning } : {}) };
+  }
+
+  /**
+   * The configured library list as it can be applied in a new job. Checked
+   * once per setting value by running the CHGLIBL in a QZDFMDB2 job; when it
+   * fails (CHGLIBL fails entirely when one library is missing) the libraries
+   * that do not exist are left out, so a bad entry cannot fail every batch.
+   */
+  private async resolveFallbackLibraryList(): Promise<ResolvedLibraryList | undefined> {
+    const desired = desiredLibraryList(this.config);
+    const cached = this.fallbackLibraryList;
+    if (cached && cached.signature === desired.signature) return cached.resolved;
+    const full = libraryListCommand(desired.libraries, desired.currentLibrary);
+    const invalid = invalidNamesWarning(desired);
+    let resolved: ResolvedLibraryList = {
+      command: full,
+      libraries: desired.libraries,
+      currentLibrary: desired.currentLibrary,
+      ...(invalid ? { warning: invalid } : {})
+    };
+    if (full) {
+      try {
+        await this.runQzdfmdb2Batch(`@${full}`);
+      } catch (firstErr: any) {
+        if (!this.client) return undefined;
+        const firstError = firstErr?.message || String(firstErr);
+        try {
+          const names = referencedLibraries(desired);
+          let rows: Tools.DB2Row[];
+          try {
+            rows = await this.runQzdfmdb2Batch(existingLibrariesSql(names));
+          } catch {
+            // Older releases do not know *ALLSIMPLE.
+            rows = await this.runQzdfmdb2Batch(existingLibrariesSql(names, false));
+          }
+          resolved = resolveAgainstExisting(desired, libraryNamesFromRows(rows));
+          if (resolved.command) await this.runQzdfmdb2Batch(`@${resolved.command}`);
+          if (!resolved.warning) resolved.warning = `${full} failed: ${firstError}`;
+        } catch (err: any) {
+          if (!this.client) return undefined;
+          resolved = { libraries: [], warning: `Configured library list not applied: ${full} failed: ${firstError}` };
+        }
+      }
+    }
+    this.fallbackLibraryList = { signature: desired.signature, resolved };
+    return resolved;
+  }
+
+  private sqlJobOpenRequest(): SqlJobOpenRequest | undefined {
+    if (!this.client || !this.connection) return undefined;
+    const port = Number(this.config.mapepirePort);
+    return {
+      host: this.connection.host,
+      username: this.connection.username,
+      password: this.connection.password,
+      ssh: this.client,
+      mode: normalizeMapepireMode(this.config.mapepireMode),
+      port: Number.isInteger(port) && port > 0 && port < 65536 ? port : DEFAULT_MAPEPIRE_PORT,
+      serverPath: this.config.mapepireServerPath || undefined,
+      javaPath: this.config.mapepireJavaPath || undefined,
+      probeTimeoutMs: 4000,
+      sendCommand: options => this.sendCommand(options)
+    };
+  }
+
+  /** QSYS2.CANCEL_SQL runs in a separate QZDFMDB2 job, since the target job is busy. */
+  private async cancelSqlInJob(jobName: string) {
+    if (!isQualifiedJobName(jobName)) throw new Error(`Invalid job name: ${jobName}`);
+    await this.runQzdfmdb2Batch(`CALL QSYS2.CANCEL_SQL('${jobName.toUpperCase()}')`);
+  }
+
+  /**
+   * Runs SQL in a new QZDFMDB2 job. The configured library list is set first,
+   * in the same job, by a leading CHGLIBL (libraries that do not exist are
+   * left out so it cannot fail the batch).
+   */
+  async runSqlQzdfmdb2(statements: string): Promise<Tools.DB2Row[]> {
+    if (!Tools.fixSQL(statements, true).trim()) return [];
+    const resolved = await this.resolveFallbackLibraryList();
+    const command = resolved?.command;
+    return this.runQzdfmdb2Batch(command ? `@${command}\n${statements}` : statements);
+  }
+
+  /** Runs SQL in a new QZDFMDB2 job as it is (no library list). */
+  private async runQzdfmdb2Batch(statements: string): Promise<Tools.DB2Row[]> {
     const input = Tools.fixSQL(statements, true).trim();
     if (!input) return [];
-    const ccsid = this.config.sqlJobCcsid ?? 1208;
-    const command = [
-      `system "CHGJOB CCSID(${ccsid})"`,
-      `cat <<'${SQL_HEREDOC_TAG}' | system "call QSYS/QZDFMDB2 PARM('-d' '-i' '-t')"`,
-      input,
-      SQL_HEREDOC_TAG
-    ].join("\n");
+    const ccsid = Number(this.config.sqlJobCcsid ?? 1208);
+    if (!Number.isInteger(ccsid) || ccsid < 1 || ccsid > 65535) {
+      throw new Error(`Invalid sqlJobCcsid: ${this.config.sqlJobCcsid}`);
+    }
+    // The SQL text is never part of the shell command: it goes to QZDFMDB2 on
+    // the SSH channel's stdin. CHGJOB reads /dev/null so it cannot consume it.
+    const script = [
+      `system "CHGJOB CCSID(${ccsid})" </dev/null`,
+      `system "call QSYS/QZDFMDB2 PARM('-d' '-i' '-t')"`
+    ].join("; ");
 
-    const output = await this.sendQsh({
-      command,
+    const output = await this.sendCommand({
+      command: `${LOCALE} /QOpenSys/usr/bin/qsh -c ${Tools.shellQuote(script)}`,
+      stdin: `${input}\n`,
       env: { QIBM_PASE_CCSID: String(ccsid) }
     });
 
@@ -235,13 +431,18 @@ export class IBMiClient {
       ls: ["/QOpenSys/pkgs/bin/ls", "/usr/bin/ls"]
     };
 
-    for (const [name, paths] of Object.entries(featurePaths)) {
-      for (const p of paths) {
-        const res = await this.sendCommand({ command: `test -x ${p} && echo ${p}` });
-        if (res.stdout.trim()) {
-          this.remoteFeatures[name] = p;
-          break;
-        }
+    const discoveryCommand = Object.entries(featurePaths).map(([name, paths]) =>
+      `for p in ${paths.map(Tools.shellQuote).join(" ")}; do ` +
+      `if [ -x "$p" ]; then printf '%s=%s\\n' ${Tools.shellQuote(name)} "$p"; break; fi; done`
+    ).join("; ");
+    const result = await this.sendCommand({ command: discoveryCommand });
+    for (const line of result.stdout.split(/\r?\n/)) {
+      const separator = line.indexOf("=");
+      if (separator <= 0) continue;
+      const name = line.slice(0, separator);
+      const featurePath = line.slice(separator + 1);
+      if (Object.hasOwn(featurePaths, name) && featurePath) {
+        this.remoteFeatures[name] = featurePath;
       }
     }
 

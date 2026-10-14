@@ -23,7 +23,7 @@ Read these references as needed:
 
 ## Core Rules
 - Prefer explicit `connectionName` in calls after connecting.
-- Assume guarded policy by default; include `approve: true` for write/destructive operations.
+- Assume guarded policy by default: the user confirms write/destructive operations in their client. If they decline, stop and ask; never retry around it.
 - Use read/verify before write whenever possible.
 - Use unique temporary names (`MCPQ<5digits>`, `/tmp/mcp-for-i-<timestamp>`).
 - Capture exact error text and fix that class of issue before retrying.

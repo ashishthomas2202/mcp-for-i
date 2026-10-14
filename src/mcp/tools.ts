@@ -1,13 +1,35 @@
+import { AsyncLocalStorage } from "async_hooks";
 import { McpContext } from "./context.js";
+import { findToolModule, notifyModulesOfDisconnect, toolModules } from "./modules/index.js";
+import { withAnnotations } from "./annotations.js";
+import { runActionTool } from "./modules/compile.js";
+import { parseEvfevent } from "../ibmi/evfevent.js";
 import { LocalLanguageActions } from "../ibmi/LocalLanguageActions.js";
 import { CompileTools } from "../ibmi/CompileTools.js";
 import { Search } from "../ibmi/Search.js";
+import { ibmDocs } from "../ibmi/IbmDocs.js";
+import { MemberSnapshot } from "../ibmi/IBMiContent.js";
+import { detectSourceLanguage, inspectSource } from "../ibmi/sourceInspect.js";
 import { Action } from "../ibmi/types.js";
 import { Tools } from "../ibmi/Tools.js";
+import { checkReadOnlySql, getSqlStatementType as parseSqlStatementType } from "../ibmi/sqlParse.js";
 import { ConnectionPolicy } from "../config/store.js";
 import { ConnectionService } from "../controlplane/connectionService.js";
 import { log } from "./logger.js";
+import {
+  assertAgentConnectionChangeAllowed,
+  assertSafeIfsDeletePath,
+  checkClCommand,
+  checkClCommands,
+  checkResourcePolicy,
+  checkShellCommand,
+  checkSqlEmbeddedCl,
+  clStartsShell,
+  isShellOperation
+} from "./policy.js";
+import { configuredLocalRoots, LocalPathMode, resolveAllowedLocalPath } from "../security/localPaths.js";
 import { exportAuditRecords, listAuditRecords, purgeAuditRecords, verifyAuditChain } from "./audit.js";
+import { gitChangedFiles, normalizeDeployMethod, normalizeDeploySelection, sha256LocalFile, sha256RemoteFiles } from "./deployMethods.js";
 import fs from "fs/promises";
 import path from "path";
 import crypto from "crypto";
@@ -56,7 +78,14 @@ const SETTINGS_SCHEMA: JsonSchema = {
     autoClearTempData: { type: "boolean" },
     sourceFileCCSID: { type: "string" },
     sqlJobCcsid: { type: ["string", "number"] },
+    sqlTransport: { type: "string", enum: ["auto", "mapepire", "qzdfmdb2"] },
+    mapepireMode: { type: "string", enum: ["auto", "daemon", "ssh"] },
+    mapepirePort: { type: "number" },
+    mapepireServerPath: { type: "string" },
+    mapepireJavaPath: { type: "string" },
     enableSourceDates: { type: "boolean" },
+    sourceReadMaxBytes: { type: "number" },
+    sourceReadMaxLines: { type: "number" },
     homeDirectory: { type: "string" },
     libraryList: { type: "array", items: { type: "string" } },
     currentLibrary: { type: "string" },
@@ -67,21 +96,10 @@ const SETTINGS_SCHEMA: JsonSchema = {
     debugSepPort: { type: "number" },
     sessionIdleMinutes: { type: "number" },
     sessionPingSeconds: { type: "number" },
-    sessionReconnectAttempts: { type: "number" }
-  }
-};
-
-const POLICY_SCHEMA: JsonSchema = {
-  type: "object",
-  properties: {
-    profile: { type: "string", enum: ["read-only", "guarded", "power-user"] },
-    requireApprovalFor: { type: "array", items: { type: "string" } },
-    allowCommands: { type: "array", items: { type: "string" } },
-    denyCommands: { type: "array", items: { type: "string" } },
-    allowLibraries: { type: "array", items: { type: "string" } },
-    denyLibraries: { type: "array", items: { type: "string" } },
-    allowPaths: { type: "array", items: { type: "string" } },
-    denyPaths: { type: "array", items: { type: "string" } }
+    sessionReconnectAttempts: { type: "number" },
+    tn5250Port: { type: "number", description: "TN5250 telnet port (default 23, or 992 when tn5250Tls is true)." },
+    tn5250Tls: { type: "boolean", description: "Use TLS for TN5250 sessions (default true when the port is 992)." },
+    tn5250DeviceName: { type: "string", description: "Virtual device name requested for TN5250 sessions." }
   }
 };
 
@@ -107,52 +125,34 @@ const PROFILE_SCHEMA: JsonSchema = {
     name: { type: "string" },
     currentLibrary: { type: "string" },
     libraryList: { type: "array", items: { type: "string" } },
-    customVariables: { type: "array", items: CUSTOM_VARIABLE_SCHEMA }
+    customVariables: { type: "array", items: CUSTOM_VARIABLE_SCHEMA },
+    setLibraryListCommand: { type: "string", description: "CL command run by ibmi.libl.runProfileCommand to set the library list." }
   },
   required: ["name"]
 };
 
-type Tn5250Field = {
-  id: string;
-  label: string;
-  value: string;
-  row: number;
-  col: number;
-  length: number;
-  protected?: boolean;
+const LINE_RANGE_SCHEMA: JsonSchema = {
+  type: "object",
+  properties: {
+    start: { type: "number" },
+    end: { type: "number" }
+  },
+  required: ["start", "end"]
 };
 
-type Tn5250HistoryEntry = {
-  at: string;
-  command: string;
-  ok: boolean;
-  code: number;
-  stderr?: string;
-  messages: string[];
+const SOURCE_INSPECTION_OPERATION_SCHEMA: JsonSchema = {
+  type: "object",
+  properties: {
+    operation: { type: "string", enum: ["metadata", "outline", "search", "read_ranges", "dependencies"] },
+    query: { type: "string" },
+    terms: { type: "array", items: { type: "string" } },
+    ranges: { type: "array", items: LINE_RANGE_SCHEMA },
+    before: { type: "number" },
+    after: { type: "number" },
+    maxMatches: { type: "number" }
+  },
+  required: ["operation"]
 };
-
-type Tn5250Screen = {
-  sessionId: string;
-  connectionName: string;
-  title: string;
-  status: "ready" | "busy";
-  textLines: string[];
-  fields: Tn5250Field[];
-  cursorFieldId: string;
-  lastKeys: string[];
-  commandHistory: Tn5250HistoryEntry[];
-  updatedAt: string;
-};
-
-type Tn5250Session = {
-  connectionName: string;
-  createdAt: number;
-  screen: Tn5250Screen;
-};
-
-const tn5250Sessions = new Map<string, Tn5250Session>();
-const TN5250_MAX_LINES = 30;
-const TN5250_MAX_HISTORY = 20;
 
 export function getTools() {
   const tools = [
@@ -194,13 +194,22 @@ export function getTools() {
       inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
     },
     {
+      name: "ibmi.session.bootstrap",
+      description: "Return connection, IBM i release, library-list, policy, and transport capabilities in one call.",
+      inputSchema: {
+        type: "object",
+        properties: { connectionName: { type: "string" } },
+        required: ["connectionName"]
+      }
+    },
+    {
       name: "ibmi.connections.list",
       description: "List saved IBM i connections.",
       inputSchema: { type: "object", properties: {} }
     },
     {
       name: "ibmi.connections.add",
-      description: "Add a saved IBM i connection (credentials are managed via local control-plane UI).",
+      description: "Add a saved IBM i connection (credentials are managed via local control-plane UI). The policy and the safety settings (readOnlyMode, tempDir, tempLibrary, autoClearTempData, mapepire*) can only be set in the web UI or config.json.",
       inputSchema: {
         type: "object",
         properties: {
@@ -209,8 +218,7 @@ export function getTools() {
           port: { type: "number", default: 22 },
           username: { type: "string" },
           privateKeyPath: { type: "string" },
-          settings: SETTINGS_SCHEMA,
-          policy: POLICY_SCHEMA
+          settings: SETTINGS_SCHEMA
         },
         required: ["name", "host", "username"],
         additionalProperties: false
@@ -218,7 +226,7 @@ export function getTools() {
     },
     {
       name: "ibmi.connections.update",
-      description: "Update a saved IBM i connection (credentials are managed via local control-plane UI).",
+      description: "Update a saved IBM i connection (credentials are managed via local control-plane UI). The policy and the safety settings (readOnlyMode, tempDir, tempLibrary, autoClearTempData, mapepire*) can only be changed in the web UI or config.json.",
       inputSchema: {
         type: "object",
         properties: {
@@ -227,8 +235,7 @@ export function getTools() {
           port: { type: "number" },
           username: { type: "string" },
           privateKeyPath: { type: "string" },
-          settings: SETTINGS_SCHEMA,
-          policy: POLICY_SCHEMA
+          settings: SETTINGS_SCHEMA
         },
         required: ["name"],
         additionalProperties: false
@@ -274,25 +281,56 @@ export function getTools() {
       description: "List members in a source file.",
       inputSchema: {
         type: "object",
-        properties: { library: { type: "string" }, sourceFile: { type: "string" } },
+        properties: {
+          connectionName: { type: "string" },
+          library: { type: "string" },
+          sourceFile: { type: "string" },
+          member: { type: "string" },
+          memberPrefix: { type: "string" },
+          memberContains: { type: "string" },
+          sourceTypes: { type: "array", items: { type: "string" } },
+          changedSince: { type: "string" },
+          limit: { type: "number" },
+          cursor: { type: "string" },
+          responseFormat: { type: "string", enum: ["legacy-array", "page"] }
+        },
         required: ["library", "sourceFile"]
       }
     },
     {
       name: "ibmi.qsys.members.read",
-      description: "Read a member.",
+      description: "Read a member. Full reads larger than the sourceReadMaxBytes/sourceReadMaxLines settings fail with SOURCE_TOO_LARGE; use startLine/endLine, ranges, ibmi.search.members or ibmi.source.inspect instead. startLine without endLine reads to the end of the member.",
       inputSchema: {
         type: "object",
-        properties: { library: { type: "string" }, sourceFile: { type: "string" }, member: { type: "string" } },
+        properties: {
+          connectionName: { type: "string" },
+          library: { type: "string" },
+          sourceFile: { type: "string" },
+          member: { type: "string" },
+          startLine: { type: "number" },
+          endLine: { type: "number" },
+          ranges: { type: "array", items: LINE_RANGE_SCHEMA },
+          before: { type: "number" },
+          after: { type: "number" },
+          metadataOnly: { type: "boolean" },
+          expectedVersion: { type: "string" },
+          expectedSha256: { type: "string" },
+          forceFresh: { type: "boolean" },
+          responseFormat: { type: "string", enum: ["text", "structured"] }
+        },
         required: ["library", "sourceFile", "member"]
       }
     },
     {
       name: "ibmi.qsys.members.write",
-      description: "Write a member.",
+      description: "Write a member. Pass expectedVersion or expectedSha256 from a structured read to reject the write (VERSION_CONFLICT error) if the member changed. With a version check or responseFormat \"structured\" the result carries the new version and sha256 for chaining edits.",
       inputSchema: {
         type: "object",
-        properties: { library: { type: "string" }, sourceFile: { type: "string" }, member: { type: "string" }, content: { type: "string" } },
+        properties: {
+          connectionName: { type: "string" }, library: { type: "string" }, sourceFile: { type: "string" }, member: { type: "string" }, content: { type: "string" },
+          expectedVersion: { type: "string" }, expectedSha256: { type: "string" },
+          responseFormat: { type: "string", enum: ["text", "structured"] }
+        },
         required: ["library", "sourceFile", "member", "content"]
       }
     },
@@ -344,8 +382,16 @@ export function getTools() {
     },
     {
       name: "ibmi.ifs.read",
-      description: "Read an IFS file.",
-      inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+      description: "Read an IFS file. Text is returned as-is; files that are not valid UTF-8 text are returned base64-encoded. Files larger than maxBytes are refused (use ibmi.ifs.download).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          maxBytes: { type: "number", description: "Maximum file size to read (default 1048576, max 16777216)." },
+          encoding: { type: "string", enum: ["auto", "utf8", "base64"], default: "auto" }
+        },
+        required: ["path"]
+      }
     },
     {
       name: "ibmi.ifs.write",
@@ -359,8 +405,16 @@ export function getTools() {
     },
     {
       name: "ibmi.ifs.delete",
-      description: "Delete an IFS file or directory.",
-      inputSchema: { type: "object", properties: { path: { type: "string" }, recursive: { type: "boolean" } }, required: ["path"] }
+      description: "Delete an IFS file or directory. A recursive delete needs confirmPath equal to path and is refused for paths less than three levels deep (for example /home/USER).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          recursive: { type: "boolean" },
+          confirmPath: { type: "string", description: "Required with recursive=true: repeat the exact path to confirm the delete." }
+        },
+        required: ["path"]
+      }
     },
     {
       name: "ibmi.ifs.upload",
@@ -374,16 +428,93 @@ export function getTools() {
     },
     {
       name: "ibmi.search.members",
-      description: "Search in source members.",
+      description: "Search in source members. Returns at most maxMatches matching lines (default 100, maximum 1000) and reports truncated: true when more exist. Lines are marked kind \"match\" or \"context\".",
       inputSchema: {
         type: "object",
         properties: {
+          connectionName: { type: "string" },
           library: { type: "string" },
           sourceFile: { type: "string" },
           term: { type: "string" },
-          members: { type: ["string", "array"], items: { type: "string" } }
+          terms: { type: "array", items: { type: "string" } },
+          members: { type: ["string", "array"], items: { type: "string" } },
+          caseSensitive: { type: "boolean" },
+          before: { type: "number" },
+          after: { type: "number" },
+          maxMatches: { type: "number" }
         },
-        required: ["library", "sourceFile", "term"]
+        required: ["library", "sourceFile"]
+      }
+    },
+    {
+      name: "ibmi.source.resolve",
+      description: "Resolve an exact source member across candidate source files without listing every member.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          connectionName: { type: "string" },
+          library: { type: "string" },
+          member: { type: "string" },
+          candidateSourceFiles: { type: "array", items: { type: "string" } },
+          sourceTypes: { type: "array", items: { type: "string" } },
+          limit: { type: "number" }
+        },
+        required: ["connectionName", "library", "member"]
+      }
+    },
+    {
+      name: "ibmi.source.inspect",
+      description: "Resolve and inspect one source member with batched metadata, outline, search, ranges, and dependency operations.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          connectionName: { type: "string" },
+          library: { type: "string" },
+          sourceFile: { type: "string" },
+          member: { type: "string" },
+          candidateSourceFiles: { type: "array", items: { type: "string" } },
+          sourceTypes: { type: "array", items: { type: "string" } },
+          operations: { type: "array", items: SOURCE_INSPECTION_OPERATION_SCHEMA },
+          expectedVersion: { type: "string" },
+          expectedSha256: { type: "string" },
+          forceFresh: { type: "boolean" }
+        },
+        required: ["connectionName", "library", "member", "operations"]
+      }
+    },
+    {
+      name: "ibmi.docs.search",
+      description: "Search the release-aware catalog and cache of official IBM i documentation.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          connectionName: { type: "string" },
+          releases: { type: "array", items: { type: "string" } },
+          categories: { type: "array", items: { type: "string" } },
+          limit: { type: "number" },
+          cursor: { type: "string" },
+          freshness: { type: "string", enum: ["indexed", "prefer-live"] }
+        },
+        required: ["query"]
+      }
+    },
+    {
+      name: "ibmi.docs.open",
+      description: "Open and cache an official IBM documentation page: a ref from ibmi.docs.search or any https://www.ibm.com/docs/ URL. Cached copies expire after 7 days by default.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ref: { type: "string" },
+          url: { type: "string" },
+          expectedVersion: { type: "string" },
+          requireLive: { type: "boolean" },
+          freshness: { type: "string", enum: ["allow-cached", "require-live"] },
+          section: { type: "string" },
+          startLine: { type: "number" },
+          endLine: { type: "number" },
+          maxCharacters: { type: "number" }
+        }
       }
     },
     {
@@ -403,20 +534,33 @@ export function getTools() {
     },
     {
       name: "ibmi.actions.run",
-      description: "Run an action.",
+      description:
+        "Run an action (for example a compile) against a source member or an IFS streamfile. " +
+        "Member targets set &OPENLIB/&OPENSPF/&OPENMBR/&EXT/&NAME; streamfile targets set &FULLPATH/&RELATIVEPATH/&NAME/&EXT. " +
+        "When the command uses OPTION(*EVENTF) the EVFEVENT file is read and errors are returned grouped by file with line, column, severity and message id. " +
+        "Honours the action's deployFirst (with localWorkspace + remoteWorkspace), postDownload (to downloadTo or localWorkspace) and outputToFile. " +
+        "Set includeListing to also return the compile listing spooled file.",
       inputSchema: {
         type: "object",
         properties: {
           actionName: { type: "string" },
           action: ACTION_SCHEMA,
           targetType: { type: "string", enum: ["member", "streamfile", "file"] },
-          targetPath: { type: "string" },
+          targetPath: { type: "string", description: "Streamfile: absolute IFS path. Member: LIB/FILE/MEMBER[.TYPE] (or use library/sourceFile/member)." },
           library: { type: "string" },
           sourceFile: { type: "string" },
           member: { type: "string" },
-          extension: { type: "string" }
+          extension: { type: "string", description: "Member type (looked up when omitted) or streamfile extension." },
+          cwd: { type: "string", description: "Remote working directory for streamfile actions (default remoteWorkspace, then the home directory)." },
+          localWorkspace: { type: "string", description: "Local project folder, used by deployFirst, postDownload and relative outputToFile paths." },
+          remoteWorkspace: { type: "string", description: "IFS folder the local workspace deploys to." },
+          downloadTo: { type: "string", description: "Local folder for postDownload outputs (default localWorkspace)." },
+          evfeventLibrary: { type: "string", description: "Override the EVFEVENT library (default: the compiled object's library)." },
+          evfeventMember: { type: "string", description: "Override the EVFEVENT member (default: the compiled object's name)." },
+          includeListing: { type: "boolean", description: "Also return the compile listing spooled file." },
+          listingMaxLines: { type: "number" }
         },
-        required: ["targetType", "targetPath"]
+        required: ["targetType"]
       }
     }
     ,
@@ -597,20 +741,30 @@ export function getTools() {
     },
     {
       name: "ibmi.deploy.compare",
-      description: "Compare local and remote directories (by relative paths).",
-      inputSchema: { type: "object", properties: { localPath: { type: "string" }, remotePath: { type: "string" } }, required: ["localPath", "remotePath"] }
-    },
-    {
-      name: "ibmi.deploy.sync",
-      description: "Sync local directory to remote (upload missing or overwrite).",
+      description: "Compare local and remote directories (by relative paths). method \"all\" compares sizes; method \"changed\" also compares SHA-256 content hashes of files present on both sides.",
       inputSchema: {
         type: "object",
         properties: {
           localPath: { type: "string" },
           remotePath: { type: "string" },
-          overwrite: { type: "boolean", default: false },
+          method: { type: "string", enum: ["all", "changed"], default: "all" }
+        },
+        required: ["localPath", "remotePath"]
+      }
+    },
+    {
+      name: "ibmi.deploy.sync",
+      description: "Sync a local directory to the IFS. method: \"all\" (default) uploads missing files and, with overwrite, size-changed ones; \"changed\" uploads only files whose SHA-256 differs or that are missing remotely; \"gitChanged\" uploads staged, unstaged and untracked files from git status; \"selection\" uploads the listed files (paths relative to localPath). Reports uploaded, unchanged and skipped counts.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          localPath: { type: "string" },
+          remotePath: { type: "string" },
+          method: { type: "string", enum: ["all", "changed", "gitChanged", "selection"], default: "all" },
+          files: { type: "array", items: { type: "string" }, description: "Relative file paths for method \"selection\"." },
+          overwrite: { type: "boolean", default: false, description: "method \"all\" only: also upload files whose size differs." },
           dryRun: { type: "boolean", default: false },
-          deleteExtraRemote: { type: "boolean", default: false }
+          deleteExtraRemote: { type: "boolean", default: false, description: "methods \"all\" and \"changed\" only." }
         },
         required: ["localPath", "remotePath"]
       }
@@ -663,7 +817,7 @@ export function getTools() {
     },
     {
       name: "ibmi.diagnostics.parseEvfevent",
-      description: "Parse EVFEVENT text into structured diagnostics.",
+      description: "Parse EVFEVENT (compiler events file) records into errors grouped by source file, with line, column, severity and message id. Errors in SQL precompiler temp files are mapped back to the original source.",
       inputSchema: { type: "object", properties: { content: { type: "string" } }, required: ["content"] }
     },
     {
@@ -673,8 +827,18 @@ export function getTools() {
     },
     {
       name: "ibmi.spool.list",
-      description: "List spool file entries.",
-      inputSchema: { type: "object", properties: { connectionName: { type: "string" }, limit: { type: "number" } } }
+      description: "List spool file entries, newest first, optionally filtered by user, output queue or job.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          connectionName: { type: "string" },
+          limit: { type: "number" },
+          userName: { type: "string", description: "User profile that owns the spooled files." },
+          outputQueue: { type: "string", description: "Output queue name." },
+          outputQueueLibrary: { type: "string", description: "Output queue library." },
+          jobName: { type: "string", description: "Qualified job name (number/user/name) or a simple job name." }
+        }
+      }
     },
     {
       name: "ibmi.spool.read",
@@ -941,14 +1105,15 @@ export function getTools() {
     },
     {
       name: "ibmi.dataqueue.receive",
-      description: "Receive (or peek) an entry from a data queue.",
+      description: "Peek at (default) or receive an entry from a data queue. remove=true takes the entry off the queue and needs a writable connection.",
       inputSchema: {
         type: "object",
         properties: {
           library: { type: "string" },
           queue: { type: "string" },
-          waitSeconds: { type: "number", default: 0 },
-          remove: { type: "boolean", default: true },
+          waitSeconds: { type: "number", default: 0, description: "Seconds to wait for an entry (0 to 60)." },
+          remove: { type: "boolean", default: false },
+          approve: { type: "boolean", description: "Only used when the connection's approvalMode is \"agent\" (remove=true). By default the user is asked to confirm." },
           connectionName: { type: "string" }
         },
         required: ["library", "queue"]
@@ -1048,7 +1213,7 @@ export function getTools() {
     },
     {
       name: "ibmi.journal.entries.query",
-      description: "Read normalized entries from a journal.",
+      description: "Read normalized journal entries, newest first. Filters are applied on the IBM i before the row limit.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1056,6 +1221,7 @@ export function getTools() {
           journal: { type: "string" },
           objectLibrary: { type: "string" },
           objectName: { type: "string" },
+          objectType: { type: "string", description: "Object type for the object filter (default *FILE)." },
           journalCode: { type: "string" },
           entryType: { type: "string" },
           userName: { type: "string" },
@@ -1221,58 +1387,26 @@ export function getTools() {
           connectionName: { type: "string" }
         }
       }
-    },
-    {
-      name: "ibmi.tn5250.connect",
-      description: "Connect to a TN5250 command session.",
-      inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
-    },
-    {
-      name: "ibmi.tn5250.readScreen",
-      description: "Read TN5250 screen model.",
-      inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
-    },
-    {
-      name: "ibmi.tn5250.setField",
-      description: "Set TN5250 field value.",
-      inputSchema: {
-        type: "object",
-        properties: { fieldId: { type: "string" }, value: { type: "string" }, connectionName: { type: "string" } },
-        required: ["fieldId", "value"]
-      }
-    },
-    {
-      name: "ibmi.tn5250.sendKeys",
-      description: "Send TN5250 keys.",
-      inputSchema: {
-        type: "object",
-        properties: { keys: { type: "string" }, timeoutMs: { type: "number" }, connectionName: { type: "string" }, approve: { type: "boolean" } },
-        required: ["keys"]
-      }
-    },
-    {
-      name: "ibmi.tn5250.waitFor",
-      description: "Wait for TN5250 text condition.",
-      inputSchema: { type: "object", properties: { text: { type: "string" }, timeoutMs: { type: "number" }, connectionName: { type: "string" } } }
-    },
-    {
-      name: "ibmi.tn5250.snapshot",
-      description: "Capture TN5250 snapshot.",
-      inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
-    },
-    {
-      name: "ibmi.tn5250.disconnect",
-      description: "Disconnect TN5250 session.",
-      inputSchema: { type: "object", properties: { connectionName: { type: "string" } } }
     }
   ];
-  return tools
+  return [...tools, ...toolModules.flatMap(module => module.tools)]
     .map(withGuardedApprovalHint)
-    .map(withStrictInputSchema);
+    .map(withSourceConnectionName)
+    .map(withStrictInputSchema)
+    .map(withAnnotations);
 }
 
-export async function handleTool(ctx: McpContext, name: string, args: any) {
+/** The outermost tool call being handled, so confirmation prompts can name it. */
+const toolCallStore = new AsyncLocalStorage<{ toolName: string }>();
+
+export async function handleTool(ctx: McpContext, name: string, args: any): Promise<any> {
+  if (!toolCallStore.getStore()) {
+    return toolCallStore.run({ toolName: name }, () => handleTool(ctx, name, args));
+  }
   const connections = new ConnectionService(ctx.store);
+  await enforceResourcePolicy(ctx, name, args);
+  const toolModule = findToolModule(name);
+  if (toolModule) return toolModule.handle(ctx, name, args);
   switch (name) {
     case "ibmi.connect": {
       if (!args?.name) throw new Error("name is required");
@@ -1285,11 +1419,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.disconnect": {
       const name = args?.connectionName || ctx.activeName;
       await ctx.disconnect(args?.connectionName);
-      if (name) {
-        tn5250Sessions.delete(name);
-      } else {
-        tn5250Sessions.clear();
-      }
+      notifyModulesOfDisconnect(name);
       return result("Disconnected");
     }
     case "ibmi.session.list": {
@@ -1304,8 +1434,43 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.session.terminate": {
       const name = args?.connectionName || ctx.activeName;
       await ctx.terminateSession(args?.connectionName);
-      if (name) tn5250Sessions.delete(name);
+      notifyModulesOfDisconnect(name);
       return result("Terminated");
+    }
+    case "ibmi.session.bootstrap": {
+      const conn = await ctx.ensureActive(args.connectionName);
+      const system = await readSystemFacts(conn);
+      const config = conn.getConfig();
+      return json({
+        connectionName: conn.currentConnectionName,
+        host: conn.currentHost,
+        systemName: system.systemName,
+        effectiveUser: system.effectiveUser || conn.currentUser,
+        release: system.release,
+        currentLibrary: config.currentLibrary || "QGPL",
+        libraryList: config.libraryList || [],
+        defaultUserLibraries: conn.defaultUserLibraries,
+        ccsid: config.sqlJobCcsid ?? 1208,
+        sourceFileCcsid: config.sourceFileCCSID || "*FILE",
+        policy: ctx.getPolicy(args.connectionName),
+        transports: {
+          sql: conn.sqlJob?.isOpen?.() ? "MAPEPIRE" : "QZDFMDB2",
+          sqlJob: conn.sqlJob?.status?.(),
+          sourceRead: ["sql-member", "cpytostmf"]
+        },
+        remoteFeatures: conn.remoteFeatures,
+        capabilities: {
+          version: "1",
+          memberPaging: true,
+          rangedMemberRead: true,
+          multiTermSearch: true,
+          sourceResolve: true,
+          sourceInspect: true,
+          optimisticConcurrency: true,
+          ibmDocs: true
+        },
+        validatedAt: new Date().toISOString()
+      });
     }
     case "ibmi.connections.list": {
       const list = await connections.list();
@@ -1313,11 +1478,13 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.connections.add": {
       rejectCredentialArgs(args, "ibmi.connections.add");
+      assertAgentConnectionChangeAllowed("ibmi.connections.add", args);
       await connections.add(args);
       return result(`Connection ${args.name} saved`);
     }
     case "ibmi.connections.update": {
       rejectCredentialArgs(args, "ibmi.connections.update");
+      assertAgentConnectionChangeAllowed("ibmi.connections.update", args);
       await connections.update(args.name, args);
       return result(`Connection ${args.name} updated`);
     }
@@ -1369,47 +1536,95 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.qsys.members.list": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      const data = await conn.content.getMemberList({ library: args.library, sourceFile: args.sourceFile });
+      const data = hasMemberListExtensions(args)
+        ? await conn.content.getMemberListPage({
+          library: args.library,
+          sourceFile: args.sourceFile,
+          member: args.member,
+          memberPrefix: args.memberPrefix,
+          memberContains: args.memberContains,
+          sourceTypes: args.sourceTypes,
+          changedSince: args.changedSince,
+          limit: args.limit,
+          cursor: args.cursor
+        })
+        : await conn.content.getMemberList({ library: args.library, sourceFile: args.sourceFile });
       return json(data);
     }
     case "ibmi.qsys.members.read": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      const content = await conn.content.downloadMemberContent(args.library, args.sourceFile, args.member);
-      return result(content);
+      const limits = sourceReadLimits(conn);
+      if (!hasStructuredMemberReadOptions(args)) {
+        const content = await conn.content.downloadMemberContent(args.library, args.sourceFile, args.member);
+        const tooLarge = sourceTooLarge(content, undefined, limits, args);
+        if (tooLarge) return tooLarge;
+        return result(content);
+      }
+      const wantsVersionCheck = Boolean(args.expectedVersion || args.expectedSha256);
+      if (args.metadataOnly && !wantsVersionCheck && !args.forceFresh && typeof conn.content.getMemberVersionInfo === "function") {
+        // Metadata-only reads never download content; a validated cached
+        // snapshot supplies sha256/version when one is available.
+        const info = await conn.content.getMemberVersionInfo(args.library, args.sourceFile, args.member);
+        if (info.snapshot) return json(formatMemberRead(info.snapshot, args, limits));
+        return json(memberMetadataEnvelope(args, info.metadata, info.observedAt));
+      }
+      if (isFullMemberRead(args) && typeof conn.content.getMemberMetadata === "function") {
+        const metadata = await conn.content.getMemberMetadata(args.library, args.sourceFile, args.member);
+        const rows = Number(metadata?.rowCount || 0);
+        if (limits.maxLines > 0 && rows > limits.maxLines) {
+          return sourceTooLargeError(args, { lineCount: rows, metadata }, limits);
+        }
+      }
+      const snapshot = await conn.content.getMemberSnapshot(args.library, args.sourceFile, args.member, Boolean(args.forceFresh));
+      const conflict = memberVersionConflict(snapshot, args);
+      if (conflict) return conflict;
+      return formatMemberReadResult(snapshot, args, limits);
     }
     case "ibmi.qsys.members.write": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
+      const versionChecked = Boolean(args.expectedVersion || args.expectedSha256);
+      let previous: MemberSnapshot | undefined;
+      if (versionChecked) {
+        // Re-read the member fresh immediately before writing. A change made
+        // between this check and the write itself can still slip through;
+        // the host offers no compare-and-swap for source members.
+        previous = await conn.content.getMemberSnapshot(args.library, args.sourceFile, args.member, true);
+        const conflict = memberVersionConflict(previous!, args);
+        if (conflict) return conflict;
+      }
       await conn.content.uploadMemberContent(args.library, args.sourceFile, args.member, args.content);
-      return result("OK");
+      const written = await describeWrittenMember(conn, args, previous);
+      if (versionChecked || args.responseFormat === "structured") return json(written);
+      return { content: [{ type: "text", text: "OK" }], structuredContent: { ok: true, text: "OK", data: written } };
     }
     case "ibmi.qsys.members.create": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.createMember(args.library, args.sourceFile, args.member, args.srctype);
       return result("OK");
     }
     case "ibmi.qsys.members.rename": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.renameMember(args.library, args.sourceFile, args.member, args.newMember);
       return result("OK");
     }
     case "ibmi.qsys.members.delete": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.deleteMember(args.library, args.sourceFile, args.member);
       return result("OK");
     }
     case "ibmi.qsys.sourcefiles.create": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.createSourceFile(args.library, args.sourceFile, args.rcdlen || 112);
       return result("OK");
     }
     case "ibmi.qsys.libraries.create": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       await conn.content.createLibrary(args.library);
       return result("OK");
     }
@@ -1420,47 +1635,157 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.ifs.read": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      const data = await conn.content.downloadStreamfileRaw(args.path);
-      return result(Buffer.from(data).toString("utf8"));
+      const maxBytes = clampNumber(args?.maxBytes, IFS_READ_DEFAULT_MAX_BYTES, 1, IFS_READ_HARD_MAX_BYTES);
+      const encoding = String(args?.encoding || "auto").toLowerCase();
+      if (!["auto", "utf8", "base64"].includes(encoding)) throw new Error("encoding must be auto, utf8 or base64");
+      const knownSize = await statIfsFileSize(conn, String(args.path));
+      if (knownSize !== undefined && knownSize > maxBytes) {
+        return toolError(
+          `File is ${knownSize} bytes, which is more than maxBytes (${maxBytes}). Raise maxBytes or use ibmi.ifs.download.`,
+          { path: args.path, size: knownSize, maxBytes }
+        );
+      }
+      const data = Buffer.from(await conn.content.downloadStreamfileRaw(args.path));
+      if (data.length > maxBytes) {
+        return toolError(
+          `File is ${data.length} bytes, which is more than maxBytes (${maxBytes}). Raise maxBytes or use ibmi.ifs.download.`,
+          { path: args.path, size: data.length, maxBytes }
+        );
+      }
+      const text = encoding === "base64" ? undefined : decodeUtf8Text(data);
+      if (text !== undefined) return result(text);
+      if (encoding === "utf8") {
+        return toolError("File is not valid UTF-8 text; read it with encoding=base64.", { path: args.path, size: data.length });
+      }
+      return json({ path: args.path, size: data.length, encoding: "base64", content: data.toString("base64") });
     }
     case "ibmi.ifs.write": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const op = resolveIfsWriteOperation(args.path);
-      enforceWritable(ctx, conn, op, args);
+      await enforceWritable(ctx, conn, op, args);
       await conn.content.writeStreamfileRaw(args.path, args.content);
       return result("OK");
     }
     case "ibmi.ifs.mkdir": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const op = resolveIfsWriteOperation(args.path);
-      enforceWritable(ctx, conn, op, args);
-      await conn.sendCommand({ command: `mkdir -p ${Tools.escapePath(args.path)}` });
+      await enforceWritable(ctx, conn, op, args);
+      requireCommandSuccess(await conn.sendCommand({ command: `mkdir -p ${Tools.escapePath(args.path)}` }), "mkdir");
       return result("OK");
     }
     case "ibmi.ifs.delete": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "ifs.delete", args);
+      await enforceWritable(ctx, conn, "ifs.delete", args);
+      const deletePath = assertSafeIfsDeletePath(args.path);
+      if (args.recursive) {
+        // A recursive delete removes a whole tree, so it must be deep enough and confirmed.
+        if (deletePath.split("/").filter(Boolean).length < 3) {
+          throw new Error(`ifs.delete refused: recursive deletes need a path at least three levels deep (${deletePath})`);
+        }
+        if (typeof args.confirmPath !== "string" || args.confirmPath.trim().replace(/\/+$/, "") !== deletePath) {
+          throw new Error("ifs.delete refused: recursive deletes need confirmPath set to the exact path being deleted");
+        }
+      }
       const flag = args.recursive ? "-rf" : "-f";
-      await conn.sendCommand({ command: `rm ${flag} ${Tools.escapePath(args.path)}` });
+      requireCommandSuccess(await conn.sendCommand({ command: `rm ${flag} ${Tools.escapePath(deletePath)}` }), "rm");
       return result("OK");
     }
     case "ibmi.ifs.upload": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const op = resolveIfsWriteOperation(args.remotePath);
-      enforceWritable(ctx, conn, op, args);
-      await conn.client!.putFile(args.localPath, args.remotePath);
+      await enforceWritable(ctx, conn, op, args);
+      const localPath = await guardLocalPath(ctx, args.localPath, "read");
+      await conn.client!.putFile(localPath, args.remotePath);
       return result("OK");
     }
     case "ibmi.ifs.download": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      await conn.client!.getFile(args.localPath, args.remotePath);
+      const localPath = await guardLocalPath(ctx, args.localPath, "write");
+      await conn.client!.getFile(localPath, args.remotePath);
       return result("OK");
     }
     case "ibmi.search.members": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const members = args.members || "*";
-      const data = await Search.searchMembers(conn, args.library, args.sourceFile, args.term, members, false);
+      const terms = normalizeSearchTerms(args);
+      const data = await Search.searchMembersTerms(conn, args.library, args.sourceFile, terms, members, false, {
+        caseSensitive: Boolean(args.caseSensitive),
+        before: args.before,
+        after: args.after,
+        maxMatches: args.maxMatches
+      });
       return json(data);
+    }
+    case "ibmi.source.resolve": {
+      const conn = await ctx.ensureActive(args.connectionName);
+      const candidates = await conn.content.resolveMembers({
+        library: args.library,
+        member: args.member,
+        candidateSourceFiles: args.candidateSourceFiles,
+        sourceTypes: args.sourceTypes,
+        limit: args.limit
+      });
+      rankMemberCandidates(candidates, args.candidateSourceFiles);
+      return json({
+        status: candidates.length === 0 ? "not-found" : candidates.length === 1 ? "found" : "ambiguous",
+        library: String(args.library).toUpperCase(),
+        member: String(args.member).toUpperCase(),
+        candidates,
+        returned: candidates.length,
+        observedAt: new Date().toISOString()
+      });
+    }
+    case "ibmi.source.inspect": {
+      const conn = await ctx.ensureActive(args.connectionName);
+      const operations = Array.isArray(args.operations) ? args.operations : [];
+      if (operations.length < 1 || operations.length > 8) throw new Error("Provide between 1 and 8 inspection operations");
+      let sourceFile = args.sourceFile ? String(args.sourceFile).toUpperCase() : "";
+      let resolution: any;
+      if (!sourceFile) {
+        const candidates = await conn.content.resolveMembers({
+          library: args.library,
+          member: args.member,
+          candidateSourceFiles: args.candidateSourceFiles,
+          sourceTypes: args.sourceTypes,
+          limit: 20
+        });
+        rankMemberCandidates(candidates, args.candidateSourceFiles);
+        resolution = {
+          status: candidates.length === 0 ? "not-found" : candidates.length === 1 ? "found" : "ambiguous",
+          candidates
+        };
+        if (candidates.length !== 1) return json(resolution);
+        sourceFile = candidates[0].file;
+      }
+      const snapshot = await conn.content.getMemberSnapshot(args.library, sourceFile, args.member, Boolean(args.forceFresh));
+      const conflict = memberVersionConflict(snapshot, args);
+      if (conflict) return conflict;
+      return json({
+        status: "found",
+        identity: snapshot.identity,
+        version: snapshot.version,
+        sha256: snapshot.sha256,
+        observedAt: snapshot.observedAt,
+        complete: snapshot.complete,
+        transport: snapshot.transport,
+        cacheStatus: snapshot.cacheStatus,
+        warnings: snapshot.warnings,
+        ...(resolution ? { resolution } : {}),
+        results: operations.map((operation: any) => inspectMemberOperation(snapshot, operation, sourceReadLimits(conn)))
+      });
+    }
+    case "ibmi.docs.search": {
+      let releases = args.releases;
+      if ((!releases || releases.length === 0) && args.connectionName) {
+        const conn = await ctx.ensureActive(args.connectionName);
+        const detected = await readSystemFacts(conn);
+        if (detected.release) releases = [detected.release];
+      }
+      return json(await ibmDocs.search({ ...args, releases }));
+    }
+    case "ibmi.docs.open": {
+      if (!args.ref && !args.url) throw new Error("ref or url is required");
+      return json(await ibmDocs.open(args));
     }
     case "ibmi.search.ifs": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -1484,54 +1809,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return json(actions);
     }
     case "ibmi.actions.run": {
-      const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
-      const action = await resolveAction(ctx, args);
-      if (!action) throw new Error("Action not found");
-
-      const envVars: Record<string, string> = {};
-      const targetPath = args.targetPath as string;
-      const targetType = args.targetType as string;
-
-      if (targetType === "file") {
-        throw new Error("Local file actions are not supported in this MCP server (use streamfile or member).");
-      }
-
-      if (targetType === "streamfile") {
-        envVars["&FULLPATH"] = targetPath;
-        const base = targetPath.split("/").pop() || targetPath;
-        envVars["&BASENAME"] = base;
-        envVars["&NAME"] = base.includes(".") ? base.substring(0, base.lastIndexOf(".")) : base;
-        envVars["&EXT"] = base.includes(".") ? base.substring(base.lastIndexOf(".") + 1) : "";
-        envVars["&RELATIVEPATH"] = targetPath;
-      }
-
-      if (targetType === "member") {
-        const lib = requireQsysName(conn, args.library, "library");
-        const src = requireQsysName(conn, args.sourceFile, "sourceFile");
-        const mbr = requireQsysName(conn, args.member || targetPath.split("/").pop(), "member");
-        const ext = String(args.extension || "");
-        envVars["&LIBRARY"] = lib;
-        envVars["&SRCFILE"] = src;
-        envVars["&NAME"] = mbr;
-        envVars["&EXT"] = ext;
-        envVars["&EXTL"] = ext.toLowerCase();
-        envVars["&FULLPATH"] = `${lib}/${src}/${mbr}`;
-        envVars["&OPENLIB"] = lib;
-        envVars["&OPENLIBL"] = lib.toLowerCase();
-        envVars["&OPENSPF"] = src;
-        envVars["&OPENSPFL"] = src.toLowerCase();
-        envVars["&OPENMBR"] = mbr;
-        envVars["&OPENMBRL"] = mbr.toLowerCase();
-      }
-
-      const resultCmd = await CompileTools.runCommand(conn, {
-        command: action.command,
-        environment: action.environment,
-        env: envVars
-      });
-
-      return json(mapActionExecution(action, targetType, targetPath, resultCmd));
+      return runActionTool(ctx, args);
     }
     case "ibmi.actions.save": {
       const action = args.action as Action;
@@ -1562,15 +1840,13 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.libl.set": {
       const name = getConnectionName(ctx, args);
       const active = await ctx.ensureActive(name);
-      enforceWritable(ctx, active, "qsys.write", args);
+      await enforceWritable(ctx, active, "qsys.write", args);
       await updateConnectionSettings(ctx, name, {
         currentLibrary: args.currentLibrary,
         libraryList: args.libraryList
       });
-      if (args.applyToJob) {
-        await applyLibraryList(active, args.libraryList, args.currentLibrary);
-      }
-      return result("OK");
+      const applied = args.applyToJob ? await applyLibraryList(active, args.libraryList, args.currentLibrary) : undefined;
+      return okApplied(applied);
     }
     case "ibmi.libl.add": {
       const name = getConnectionName(ctx, args);
@@ -1580,12 +1856,10 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const lib = String(args.library).toUpperCase();
       if (!list.includes(lib)) list.push(lib);
       const active = await ctx.ensureActive(name);
-      enforceWritable(ctx, active, "qsys.write", args);
+      await enforceWritable(ctx, active, "qsys.write", args);
       await updateConnectionSettings(ctx, name, { libraryList: list });
-      if (args.applyToJob) {
-        await applyLibraryList(active, list, conn.settings?.currentLibrary);
-      }
-      return result("OK");
+      const applied = args.applyToJob ? await applyLibraryList(active, list, conn.settings?.currentLibrary) : undefined;
+      return okApplied(applied);
     }
     case "ibmi.libl.remove": {
       const name = getConnectionName(ctx, args);
@@ -1593,23 +1867,19 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       if (!conn) throw new Error(`Connection ${name} not found`);
       const list = (conn.settings?.libraryList || []).filter(l => l !== String(args.library).toUpperCase());
       const active = await ctx.ensureActive(name);
-      enforceWritable(ctx, active, "qsys.write", args);
+      await enforceWritable(ctx, active, "qsys.write", args);
       await updateConnectionSettings(ctx, name, { libraryList: list });
-      if (args.applyToJob) {
-        await applyLibraryList(active, list, conn.settings?.currentLibrary);
-      }
-      return result("OK");
+      const applied = args.applyToJob ? await applyLibraryList(active, list, conn.settings?.currentLibrary) : undefined;
+      return okApplied(applied);
     }
     case "ibmi.libl.setCurrent": {
       const name = getConnectionName(ctx, args);
       const lib = String(args.library).toUpperCase();
       const active = await ctx.ensureActive(name);
-      enforceWritable(ctx, active, "qsys.write", args);
+      await enforceWritable(ctx, active, "qsys.write", args);
       await updateConnectionSettings(ctx, name, { currentLibrary: lib });
-      if (args.applyToJob) {
-        await applyLibraryList(active, undefined, lib);
-      }
-      return result("OK");
+      const applied = args.applyToJob ? await applyLibraryList(active, undefined, lib) : undefined;
+      return okApplied(applied);
     }
     case "ibmi.libl.validate": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -1640,7 +1910,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const profile = (connInfo.profiles || []).find(p => p.name === args.name);
       if (!profile) throw new Error(`Profile ${args.name} not found`);
       const active = await ctx.ensureActive(name);
-      enforceWritable(ctx, active, "qsys.write", args);
+      await enforceWritable(ctx, active, "qsys.write", args);
 
       await ctx.store.setCurrentProfile(name, args.name);
       await updateConnectionSettings(ctx, name, {
@@ -1649,10 +1919,8 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         customVariables: profile.customVariables
       });
 
-      if (args.applyToJob) {
-        await applyLibraryList(active, profile.libraryList, profile.currentLibrary);
-      }
-      return result(`Profile ${args.name} activated`);
+      const applied = args.applyToJob ? await applyLibraryList(active, profile.libraryList, profile.currentLibrary) : undefined;
+      return okApplied(applied, `Profile ${args.name} activated`);
     }
     case "ibmi.resolve.path": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -1673,15 +1941,20 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.deploy.uploadDirectory": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "deploy.sync", args);
-      await conn.client!.putDirectory(args.localPath, args.remotePath, { recursive: true, concurrency: 5 });
+      await enforceWritable(ctx, conn, "deploy.sync", args);
+      const localPath = await guardLocalPath(ctx, args.localPath, "read");
+      await conn.client!.putDirectory(localPath, args.remotePath, { recursive: true, concurrency: 5 });
       return result("OK");
     }
     case "ibmi.deploy.uploadFiles": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "deploy.sync", args);
+      await enforceWritable(ctx, conn, "deploy.sync", args);
       const remoteDir = String(args.remoteDirectory);
+      const localFiles: string[] = [];
       for (const file of args.localFiles || []) {
+        localFiles.push(await guardLocalPath(ctx, file, "read"));
+      }
+      for (const file of localFiles) {
         const base = String(file).split(/[\\/]/).pop();
         const remotePath = `${remoteDir}/${base}`;
         await conn.client!.putFile(String(file), remotePath);
@@ -1690,11 +1963,14 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.deploy.setCcsid": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "deploy.sync", args);
+      await enforceWritable(ctx, conn, "deploy.sync", args);
       const setccsid = conn.remoteFeatures.setccsid;
       if (!setccsid) throw new Error("setccsid not available on remote system");
       const ccsid = args.ccsid || "1208";
-      await conn.sendCommand({ command: `${setccsid} -R ${Tools.shellQuote(ccsid)} ${Tools.escapePath(args.remotePath)}` });
+      requireCommandSuccess(
+        await conn.sendCommand({ command: `${setccsid} -R ${Tools.shellQuote(ccsid)} ${Tools.escapePath(args.remotePath)}` }),
+        "setccsid"
+      );
       return result("OK");
     }
     case "ibmi.filters.list": {
@@ -1755,48 +2031,86 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.debug.startService": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const submitOptions = `JOBQ(QSYS/QUSRNOMAX) JOBD(QSYS/QSYSJOBD) OUTQ(QUSRSYS/QDBGSRV) USER(QDBGSRV)`;
       const cmd = `QSYS/SBMJOB JOB(QDBGSRV) SYSLIBL(*SYSVAL) CURLIB(*USRPRF) INLLIBL(*JOBD) ${submitOptions} CMD(QSH CMD('/QIBM/ProdData/IBMiDebugService/bin/startDebugService.sh'))`;
       const res = await conn.sendQsh({ command: `system \"${cmd}\"` });
-      return json(res);
+      return commandOutcome({ ok: res.code === 0, ...res });
     }
     case "ibmi.debug.stopService": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const res = await conn.sendCommand({ command: `/QIBM/ProdData/IBMiDebugService/bin/stopDebugService.sh` });
-      return json(res);
+      return commandOutcome({ ok: res.code === 0, ...res });
     }
     case "ibmi.deploy.compare": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      const localPath = String(args.localPath);
+      const localPath = await guardLocalPath(ctx, args.localPath, "read");
       const remotePath = String(args.remotePath);
+      const method = normalizeDeployMethod(args.method);
+      if (method !== "all" && method !== "changed") throw new Error(`deploy.compare supports method "all" or "changed", not "${method}"`);
       const comparison = await compareDeployTrees(conn, localPath, remotePath);
-      return json(comparison);
+      return json(method === "changed" ? await refineComparisonByHash(conn, comparison) : comparison);
     }
     case "ibmi.deploy.sync": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "deploy.sync", args);
-      const localPath = String(args.localPath);
+      await enforceWritable(ctx, conn, "deploy.sync", args);
+      const localPath = await guardLocalPath(ctx, args.localPath, "read");
       const remotePath = String(args.remotePath);
+      const method = normalizeDeployMethod(args.method);
       const overwrite = Boolean(args.overwrite);
       const dryRun = Boolean(args.dryRun);
       const deleteExtraRemote = Boolean(args.deleteExtraRemote);
-      const comparison = await compareDeployTrees(conn, localPath, remotePath);
+      if (deleteExtraRemote && (method === "gitChanged" || method === "selection")) {
+        throw new Error(`deleteExtraRemote is only supported with method "all" or "changed"`);
+      }
+      const errors: Array<{ operation: "upload" | "delete"; path: string; message: string }> = [];
 
-      const uploadSet = new Set<string>(comparison.onlyLocal);
-      if (overwrite) {
-        comparison.changed.forEach(entry => uploadSet.add(entry.path));
-        comparison.unresolved.forEach(entry => uploadSet.add(entry.path));
+      let comparison: DeployComparison | undefined;
+      let uploadSet: Set<string>;
+      let skipChanged: string[] = [];
+      let unresolved: string[] = [];
+      let unchanged: string[] = [];
+      let gitDeleted: string[] = [];
+      if (method === "all" || method === "changed") {
+        comparison = await compareDeployTrees(conn, localPath, remotePath);
+        if (method === "changed") comparison = await refineComparisonByHash(conn, comparison);
+        uploadSet = new Set<string>(comparison.onlyLocal);
+        // "changed" compared content, so every differing file is uploaded.
+        const includeChanged = overwrite || method === "changed";
+        if (includeChanged) {
+          comparison.changed.forEach(entry => uploadSet.add(entry.path));
+          comparison.unresolved.forEach(entry => uploadSet.add(entry.path));
+        }
+        skipChanged = includeChanged ? [] : comparison.changed.map(entry => entry.path).sort((a, b) => a.localeCompare(b));
+        unresolved = includeChanged ? [] : comparison.unresolved.map(entry => entry.path).sort((a, b) => a.localeCompare(b));
+        unchanged = [...comparison.identical];
+      } else if (method === "gitChanged") {
+        const git = await gitChangedFiles(localPath);
+        uploadSet = new Set<string>(git.files);
+        gitDeleted = git.deleted;
+      } else {
+        uploadSet = new Set<string>();
+        for (const rel of normalizeDeploySelection(args.files)) {
+          try {
+            const resolved = await guardLocalPath(ctx, path.join(localPath, rel), "read");
+            const relative = path.relative(localPath, resolved);
+            if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+              throw new Error("file is outside localPath");
+            }
+            const stat = await fs.stat(resolved).catch(() => undefined);
+            if (!stat?.isFile()) throw new Error("local file not found");
+            uploadSet.add(rel);
+          } catch (err: any) {
+            errors.push({ operation: "upload", path: rel, message: err?.message || String(err) });
+          }
+        }
       }
       const uploadPlan = Array.from(uploadSet).sort((a, b) => a.localeCompare(b));
-      const skipChanged = overwrite ? [] : comparison.changed.map(entry => entry.path).sort((a, b) => a.localeCompare(b));
-      const unresolved = overwrite ? [] : comparison.unresolved.map(entry => entry.path).sort((a, b) => a.localeCompare(b));
-      const deletePlan = deleteExtraRemote ? [...comparison.onlyRemote] : [];
+      const deletePlan = deleteExtraRemote && comparison ? [...comparison.onlyRemote] : [];
 
       const uploaded: string[] = [];
       const deleted: string[] = [];
-      const errors: Array<{ operation: "upload" | "delete"; path: string; message: string }> = [];
 
       if (!dryRun) {
         const createdDirs = new Set<string>();
@@ -1806,7 +2120,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
           const remoteDir = remoteFile.split("/").slice(0, -1).join("/");
           try {
             if (!createdDirs.has(remoteDir)) {
-              await conn.sendCommand({ command: `mkdir -p ${Tools.escapePath(remoteDir)}` });
+              requireCommandSuccess(await conn.sendCommand({ command: `mkdir -p ${Tools.escapePath(remoteDir)}` }), "mkdir");
               createdDirs.add(remoteDir);
             }
             await conn.client!.putFile(localFile, remoteFile);
@@ -1819,7 +2133,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         for (const rel of deletePlan) {
           const remoteFile = joinRemotePath(remotePath, rel);
           try {
-            await conn.sendCommand({ command: `rm -f ${Tools.escapePath(remoteFile)}` });
+            requireCommandSuccess(await conn.sendCommand({ command: `rm -f ${Tools.escapePath(remoteFile)}` }), "rm");
             deleted.push(rel);
           } catch (err: any) {
             errors.push({ operation: "delete", path: rel, message: err?.message || String(err) });
@@ -1827,22 +2141,35 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         }
       }
 
-      return json({
+      const syncResult = {
         ok: errors.length === 0,
-        mode: { overwrite, deleteExtraRemote, dryRun },
-        comparison,
+        mode: { method, overwrite, deleteExtraRemote, dryRun },
+        comparison: comparison ?? null,
         planned: {
           upload: uploadPlan,
           delete: deletePlan,
           skippedChanged: skipChanged,
-          unresolved
+          unresolved,
+          ...(method === "gitChanged" ? { gitDeleted } : {})
         },
         applied: {
           uploaded: dryRun ? [] : uploaded,
           deleted: dryRun ? [] : deleted
         },
+        summary: {
+          planned: uploadPlan.length,
+          uploaded: dryRun ? 0 : uploaded.length,
+          unchanged: unchanged.length,
+          skipped: skipChanged.length + unresolved.length + gitDeleted.length,
+          deleted: dryRun ? 0 : deleted.length,
+          failed: errors.length
+        },
         errors
-      });
+      };
+      if (errors.length > 0) {
+        return jsonError(`deploy.sync finished with ${errors.length} failed operation(s)`, syncResult);
+      }
+      return json(syncResult);
     }
     case "ibmi.sql.query": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -1864,13 +2191,13 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
 
       if (!args?.sql) throw new Error("sql is required when cursor is not provided");
       const sql = String(args.sql);
-      if (!isReadOnlySql(sql)) throw new Error("ibmi.sql.query only supports read-only SQL");
+      const readOnlyCheck = checkReadOnlySql(sql);
+      if (!readOnlyCheck.readOnly) throw new Error(`ibmi.sql.query only supports read-only SQL: ${readOnlyCheck.reason}`);
       const startedAt = Date.now();
-      const rows = await withTimeout(
-        conn.runSQL(sql),
-        timeoutMs,
-        `SQL query timed out after ${timeoutMs}ms`
-      );
+      // Ask for one row more than maxRows so truncation can be reported without
+      // pulling the whole result set over the wire.
+      const capped = applySqlRowCap(sql, maxRows + 1);
+      const rows = await runSqlWithTimeout(conn, capped.sql, timeoutMs, `SQL query timed out after ${timeoutMs}ms`);
       const limited = rows.slice(0, maxRows);
       const firstPage = limited.slice(0, pageSize);
       const cursorInfo = ctx.createSqlCursor(limited, pageSize);
@@ -1881,6 +2208,9 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         cursor: cursorInfo.cursor,
         totalRows: limited.length,
         truncated: rows.length > limited.length,
+        ...(rows.length > limited.length
+          ? { truncationNote: `Result has more than ${maxRows} rows; only the first ${maxRows} are returned. Raise maxRows (up to 20000) or narrow the query.` }
+          : {}),
         ...(includeMetadata
           ? {
             metadata: {
@@ -1888,6 +2218,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
               columns: getRowColumns(firstPage),
               pageSize,
               maxRows,
+              rowCapAppliedInSql: capped.applied,
               timeoutMs,
               executionMs
             }
@@ -1897,17 +2228,13 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.sql.execute": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforcePolicyOperation(ctx, "sql.write", args);
+      await enforceWritable(ctx, conn, "sql.write", args);
       const sql = String(args.sql);
       const timeoutMs = clampNumber(args?.timeoutMs, 45000, 1000, 300000);
       const statementType = getSqlStatementType(sql);
       const startedAt = Date.now();
       try {
-        const rows = await withTimeout(
-          conn.runSQL(sql),
-          timeoutMs,
-          `SQL execute timed out after ${timeoutMs}ms`
-        );
+        const rows = await runSqlWithTimeout(conn, sql, timeoutMs, `SQL execute timed out after ${timeoutMs}ms`);
         const executionMs = Date.now() - startedAt;
         const affectedRows = inferAffectedRows(rows);
         log("info", "audit.sql.execute", {
@@ -1939,7 +2266,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.cl.run": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforcePolicyOperation(ctx, "cl.run", args);
+      await enforceWritable(ctx, conn, "cl.run", args);
       const command = String(args.command || "");
       if (!command.trim()) throw new Error("command is required");
       const environment = String(args.environment || "ile");
@@ -1961,13 +2288,26 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     case "ibmi.joblog.get": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const limit = clampNumber(args?.limit, 200, 1, 5000);
-      const rows = await conn.runSQL(`select message_id, message_text, severity, message_timestamp from table(qsys2.joblog_info('*')) order by message_timestamp desc fetch first ${limit} rows only`);
+      // MCH3401 "Cannot resolve to object PPTT" is logged by the database
+      // machinery on every statement on some systems; it would crowd out the
+      // messages from the user's own SQL and CL.
+      const rows = await conn.runSQL(
+        `select message_id, message_text, severity, message_timestamp from table(qsys2.joblog_info('*')) x ` +
+        `where not (coalesce(message_id, '') = 'MCH3401' and coalesce(message_text, '') like '%PPTT%') ` +
+        `order by message_timestamp desc fetch first ${limit} rows only`
+      );
       return json(rows.map(normalizeJoblogRow));
     }
     case "ibmi.spool.list": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const limit = clampNumber(args?.limit, 200, 1, 5000);
-      const rows = await querySpoolEntries(conn, limit);
+      const rows = await querySpoolEntries(conn, {
+        limit,
+        userName: args?.userName ? requireIbmObjectName(args.userName, "userName") : undefined,
+        outputQueue: args?.outputQueue ? requireIbmObjectName(args.outputQueue, "outputQueue") : undefined,
+        outputQueueLibrary: args?.outputQueueLibrary ? requireIbmObjectName(args.outputQueueLibrary, "outputQueueLibrary") : undefined,
+        jobName: args?.jobName ? requireSpoolJobFilter(args.jobName) : undefined
+      });
       return json(rows.map(normalizeSpoolEntry));
     }
     case "ibmi.spool.read": {
@@ -1976,39 +2316,43 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const jobName = Tools.sqlString(String(args.jobName));
       const fileName = Tools.sqlString(String(args.spooledFileName));
       const fileNbr = clampNumber(args.spooledFileNumber, 1, 1, 999999999);
-      const rows = await conn.runSQL(`select line_number, spooled_data from table(qsys2.display_spooled_file_data(${jobName}, ${fileName}, ${fileNbr})) fetch first ${limit} rows only`);
+      // DISPLAY_SPOOLED_FILE_DATA returns ORDINAL_POSITION and SPOOLED_DATA.
+      const rows = await conn.runSQL(
+        `select ordinal_position, spooled_data from table(qsys2.display_spooled_file_data(${jobName}, ${fileName}, ${fileNbr})) ` +
+        `order by ordinal_position fetch first ${limit} rows only`
+      );
       return json(rows.map(normalizeSpoolLine));
     }
     case "ibmi.spool.hold": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
-      const command = buildSpoolCommand("HLDSPFL", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
+      const command = buildSpoolCommand("HLDSPLF", args);
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.spool.release": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const command = buildSpoolCommand("RLSSPLF", args);
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.spool.delete": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const command = buildSpoolCommand("DLTSPLF", args);
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.spool.move": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const baseCommand = buildSpoolCommand("CHGSPLFA", args);
       const outQueueLibrary = requireIbmObjectName(args.outQueueLibrary, "outQueueLibrary");
       const outQueue = requireIbmObjectName(args.outQueue, "outQueue");
       const command = `${baseCommand} OUTQ(${outQueueLibrary}/${outQueue})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.jobs.list": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -2023,24 +2367,24 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.jobs.hold": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const jobName = requireJobName(args.jobName);
       const hold = Boolean(args?.holdOnJobQueue) ? "*JOBQ" : "*NO";
       const command = `HLDJOB JOB(${jobName}) HOLD(${hold})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.jobs.release": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const jobName = requireJobName(args.jobName);
       const command = `RLSJOB JOB(${jobName})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.jobs.end": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const jobName = requireJobName(args.jobName);
       const option = String(args?.option || "*CNTRLD").toUpperCase();
       if (option !== "*CNTRLD" && option !== "*IMMED") {
@@ -2049,7 +2393,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const delaySeconds = clampNumber(args?.delaySeconds, 30, 0, 99999);
       const command = `ENDJOB JOB(${jobName}) OPTION(${option}) DELAY(${delaySeconds})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.subsystems.list": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -2070,15 +2414,15 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.subsystems.start": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const subsystemDescription = requireQualifiedObject(args.subsystemDescription, "subsystemDescription");
       const command = `STRSBS SBSD(${subsystemDescription.library}/${subsystemDescription.object})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.subsystems.end": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const subsystem = requireIbmObjectName(args.subsystem, "subsystem");
       const option = String(args?.option || "*CNTRLD").toUpperCase();
       if (option !== "*CNTRLD" && option !== "*IMMED") {
@@ -2087,7 +2431,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const delaySeconds = clampNumber(args?.delaySeconds, 30, 0, 99999);
       const command = `ENDSBS SBS(${subsystem}) OPTION(${option}) DELAY(${delaySeconds})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.msgq.read": {
       const conn = await ctx.ensureActive(args?.connectionName);
@@ -2099,7 +2443,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.msgq.send": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const library = requireIbmObjectName(args?.library || "QSYS", "library");
       const messageQueue = requireIbmObjectName(args?.messageQueue || "QSYSOPR", "messageQueue");
       const messageType = String(args?.messageType || "*INFO").toUpperCase();
@@ -2108,16 +2452,19 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       }
       const message = String(args.message || "");
       if (!message.trim()) throw new Error("message is required");
-      const mappedMessageType = messageType === "*INQ" ? "*INQ" : "*INFO";
-      const command = mappedMessageType === "*INQ"
-        ? `SNDMSG MSG(${quoteClString(message)}) TOMSGQ(${library}/${messageQueue}) MSGTYPE(*INQ) RPYMSGQ(${library}/${messageQueue})`
-        : `SNDMSG MSG(${quoteClString(message)}) TOMSGQ(${library}/${messageQueue}) MSGTYPE(*INFO)`;
+      const command = buildSendMessageCommand(message, library, messageQueue, messageType);
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, requestedMessageType: messageType, mappedMessageType, ...cmdResult });
+      return commandOutcome({
+        ok: cmdResult.code === 0,
+        command,
+        requestedMessageType: messageType,
+        mappedMessageType: messageType,
+        ...cmdResult
+      });
     }
     case "ibmi.msgq.reply": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const library = requireIbmObjectName(args?.library || "QSYS", "library");
       const messageQueue = requireIbmObjectName(args?.messageQueue || "QSYSOPR", "messageQueue");
       const messageKey = requireMessageKey(args.messageKey);
@@ -2125,16 +2472,16 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       if (!reply.trim()) throw new Error("reply is required");
       const command = `SNDRPY MSGKEY(${messageKey}) MSGQ(${library}/${messageQueue}) RPY(${quoteClString(reply)})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.locks.list": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const limit = clampNumber(args?.limit, 200, 1, 5000);
       const rows = await queryLockEntries(conn, {
-        objectLibrary: args?.objectLibrary,
-        objectName: args?.objectName,
-        objectType: args?.objectType,
-        member: args?.member,
+        objectLibrary: args?.objectLibrary ? requireIbmObjectName(args.objectLibrary, "objectLibrary") : undefined,
+        objectName: args?.objectName ? requireIbmObjectName(args.objectName, "objectName") : undefined,
+        objectType: args?.objectType ? requireObjectTypeValue(args.objectType, "objectType") : undefined,
+        member: args?.member ? requireIbmObjectName(args.member, "member") : undefined,
         limit
       });
       return json(rows);
@@ -2150,13 +2497,17 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.dataqueue.send": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const library = requireIbmObjectName(args.library, "library");
       const queue = requireIbmObjectName(args.queue, "queue");
       const message = String(args.message || "");
       if (!message) throw new Error("message is required");
+      let primaryError: string;
       try {
-        await conn.runSQL(`call qsys2.send_data_queue(${Tools.sqlString(message)}, ${Tools.sqlString(queue)}, ${Tools.sqlString(library)})`);
+        await conn.runSQL(
+          `call qsys2.send_data_queue(message_data => ${Tools.sqlString(message)}, ` +
+          `data_queue => ${Tools.sqlString(queue)}, data_queue_library => ${Tools.sqlString(library)})`
+        );
         return json({
           ok: true,
           method: "qsys2.send_data_queue",
@@ -2164,18 +2515,30 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
           queue,
           messageLength: message.length
         });
-      } catch {
-        const command = `SNDDTAQ DTAQ(${library}/${queue}) DTA(${quoteClString(message)})`;
-        const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-        return json({ ok: cmdResult.code === 0, method: "cl.snddtaq", command, ...cmdResult });
+      } catch (err: any) {
+        primaryError = err?.message || String(err);
       }
+      // Older releases without QSYS2.SEND_DATA_QUEUE: call the QSNDDTAQ API.
+      // There is no SNDDTAQ CL command.
+      const command = buildQsnddtaqCall(library, queue, message);
+      const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
+      return commandOutcome({
+        ok: cmdResult.code === 0,
+        method: "api.qsnddtaq",
+        command,
+        primaryError,
+        ...cmdResult
+      });
     }
     case "ibmi.dataqueue.receive": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const library = requireIbmObjectName(args.library, "library");
       const queue = requireIbmObjectName(args.queue, "queue");
-      const waitSeconds = clampNumber(args?.waitSeconds, 0, 0, 999999);
-      const remove = Boolean(args?.remove ?? true);
+      const waitSeconds = clampNumber(args?.waitSeconds, 0, 0, DATA_QUEUE_MAX_WAIT_SECONDS);
+      // Peek by default. Removing an entry changes the queue, so it goes
+      // through the same write gate as the other write tools.
+      const remove = args?.remove === true;
+      if (remove) await enforceWritable(ctx, conn, "qsys.write", args);
       const rows = await queryDataQueueEntries(conn, { library, queue, waitSeconds, remove });
       return json(rows);
     }
@@ -2188,15 +2551,19 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.dataarea.write": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const library = requireIbmObjectName(args.library, "library");
       const dataArea = requireIbmObjectName(args.dataArea, "dataArea");
-      const value = String(args.value || "");
-      const startPosition = clampNumber(args?.startPosition, 1, 1, 2000);
-      const length = clampNumber(args?.length, Math.max(value.length, 1), 1, 2000);
-      const command = `CHGDTAARA DTAARA(${library}/${dataArea} (${startPosition} ${length})) VALUE(${quoteClString(value)})`;
+      const value = String(args.value ?? "");
+      let info: ReturnType<typeof normalizeDataAreaInfoRow> | undefined;
+      try {
+        info = (await queryDataAreaInfo(conn, { library, dataArea }))[0];
+      } catch {
+        info = undefined;
+      }
+      const command = buildChangeDataAreaCommand(library, dataArea, value, info, args);
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({ ok: cmdResult.code === 0, command, ...cmdResult });
+      return commandOutcome({ ok: cmdResult.code === 0, command, dataAreaType: info?.type || null, ...cmdResult });
     }
     case "ibmi.audit.list": {
       const data = await listAuditRecords({
@@ -2215,7 +2582,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.audit.export": {
       const exported = await exportAuditRecords({
-        outputPath: String(args.outputPath),
+        outputPath: await guardLocalPath(ctx, args.outputPath, "write"),
         format: args?.format,
         filter: {
           limit: args?.limit,
@@ -2229,8 +2596,8 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       return json(exported);
     }
     case "ibmi.audit.purge": {
-      if (!Boolean(args?.dryRun) && !Boolean(args?.approve)) {
-        throw new Error("ibmi.audit.purge requires approve=true unless dryRun=true.");
+      if (!Boolean(args?.dryRun)) {
+        await requireDangerousApproval(ctx, "audit.purge", args, "ibmi.audit.purge requires approve=true unless dryRun=true.");
       }
       const purged = await purgeAuditRecords({
         before: String(args.before),
@@ -2249,6 +2616,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const journal = requireIbmObjectName(args.journal, "journal");
       const objectLibrary = args?.objectLibrary ? requireIbmObjectName(args.objectLibrary, "objectLibrary") : undefined;
       const objectName = args?.objectName ? requireIbmObjectName(args.objectName, "objectName") : undefined;
+      const objectType = args?.objectType ? requireObjectTypeValue(args.objectType, "objectType") : undefined;
       const journalCode = args?.journalCode ? requireJournalCode(args.journalCode) : undefined;
       const entryType = args?.entryType ? requireJournalEntryType(args.entryType) : undefined;
       const userName = args?.userName ? requireIbmObjectName(args.userName, "userName") : undefined;
@@ -2262,6 +2630,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         journal,
         objectLibrary,
         objectName,
+        objectType,
         journalCode,
         entryType,
         userName,
@@ -2303,13 +2672,13 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.journal.receiver.create": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const lib = requireIbmObjectName(args.library, "library");
       const rcv = requireIbmObjectName(args.receiver, "receiver");
       const threshold = clampNumber(args?.threshold, 1000000, 1, 1000000000);
       const command = `CRTJRNRCV JRNRCV(${lib}/${rcv}) THRESHOLD(${threshold})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({
+      return commandOutcome({
         ok: cmdResult.code === 0,
         command,
         ...cmdResult
@@ -2317,14 +2686,14 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.journal.create": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const lib = requireIbmObjectName(args.library, "library");
       const jrn = requireIbmObjectName(args.journal, "journal");
       const rcvLib = requireIbmObjectName(args.receiverLibrary, "receiverLibrary");
       const rcv = requireIbmObjectName(args.receiver, "receiver");
       const command = `CRTJRN JRN(${lib}/${jrn}) JRNRCV(${rcvLib}/${rcv})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({
+      return commandOutcome({
         ok: cmdResult.code === 0,
         command,
         ...cmdResult
@@ -2332,14 +2701,14 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.journal.receiver.change": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const jrnLib = requireIbmObjectName(args.journalLibrary, "journalLibrary");
       const jrn = requireIbmObjectName(args.journal, "journal");
       const rcvLib = requireIbmObjectName(args.receiverLibrary, "receiverLibrary");
       const rcv = requireIbmObjectName(args.receiver, "receiver");
       const command = `CHGJRN JRN(${jrnLib}/${jrn}) JRNRCV(${rcvLib}/${rcv})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({
+      return commandOutcome({
         ok: cmdResult.code === 0,
         command,
         ...cmdResult
@@ -2347,7 +2716,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.journal.startPf": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const lib = requireIbmObjectName(args.library, "library");
       const file = requireIbmObjectName(args.file, "file");
       const jrnLib = requireIbmObjectName(args.journalLibrary, "journalLibrary");
@@ -2358,7 +2727,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       }
       const command = `STRJRNPF FILE(${lib}/${file}) JRN(${jrnLib}/${jrn}) IMAGES(${images})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({
+      return commandOutcome({
         ok: cmdResult.code === 0,
         command,
         ...cmdResult
@@ -2366,12 +2735,12 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.journal.endPf": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const lib = requireIbmObjectName(args.library, "library");
       const file = requireIbmObjectName(args.file, "file");
       const command = `ENDJRNPF FILE(${lib}/${file})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({
+      return commandOutcome({
         ok: cmdResult.code === 0,
         command,
         ...cmdResult
@@ -2379,14 +2748,14 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.journal.startIfs": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const objectType = requireIfsJournalObjectType(args?.objectType);
       const journalLibrary = requireIbmObjectName(args.journalLibrary, "journalLibrary");
       const journal = requireIbmObjectName(args.journal, "journal");
       const objectPath = requireIfsPath(args.path, "path");
       const command = `STRJRNOBJ OBJ((${quoteClString(objectPath)} ${objectType})) JRN(${journalLibrary}/${journal})`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({
+      return commandOutcome({
         ok: cmdResult.code === 0,
         command,
         ...cmdResult
@@ -2394,12 +2763,12 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
     }
     case "ibmi.journal.endIfs": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const objectType = requireIfsJournalObjectType(args?.objectType);
       const objectPath = requireIfsPath(args.path, "path");
       const command = `ENDJRNOBJ OBJ((${quoteClString(objectPath)} ${objectType}))`;
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
-      return json({
+      return commandOutcome({
         ok: cmdResult.code === 0,
         command,
         ...cmdResult
@@ -2411,9 +2780,16 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
       const journal = requireIbmObjectName(args.journal, "journal");
       const retentionDays = clampNumber(args?.retentionDays, 30, 1, 36500);
       const maxDeletes = clampNumber(args?.maxDeletes, 50, 1, 500);
-      const dryRun = Boolean(args?.dryRun);
-      if (!dryRun && !Boolean(args?.approve)) {
-        throw new Error("ibmi.journal.receivers.retention requires approve=true unless dryRun=true.");
+      // The schema documents dryRun as defaulting to true; only an explicit
+      // dryRun=false may delete receivers.
+      const dryRun = args?.dryRun === undefined || args?.dryRun === null ? true : Boolean(args.dryRun);
+      if (!dryRun) {
+        await requireDangerousApproval(
+          ctx,
+          "journal.receivers.delete",
+          args,
+          "ibmi.journal.receivers.retention requires approve=true unless dryRun=true."
+        );
       }
 
       const plan = await planJournalReceiverRetention(conn, {
@@ -2433,7 +2809,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         });
       }
 
-      enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "qsys.write", args);
       const deleted: Array<{ receiverLibrary: string; receiver: string; ok: boolean; error?: string }> = [];
       for (const candidate of candidates) {
         const command = `DLTJRNRCV JRNRCV(${candidate.receiverLibrary}/${candidate.receiver}) DLTOPT(*IGNINQMSG)`;
@@ -2446,7 +2822,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         });
       }
 
-      return json({
+      return commandOutcome({
         ok: deleted.every(item => item.ok),
         dryRun: false,
         retentionDays,
@@ -2474,7 +2850,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         return json(report);
       }
 
-      const outputPath = path.resolve(String(args.outputPath));
+      const outputPath = await guardLocalPath(ctx, args.outputPath, "write");
       await fs.mkdir(path.dirname(outputPath), { recursive: true });
       await fs.writeFile(outputPath, JSON.stringify(report, null, 2), "utf8");
 
@@ -2504,122 +2880,6 @@ export async function handleTool(ctx: McpContext, name: string, args: any) {
         signature
       });
     }
-    case "ibmi.tn5250.connect": {
-      const name = getConnectionName(ctx, args);
-      await ctx.ensureActive(name);
-      const session = ensureTn5250Session(name);
-      appendTn5250Message(session, `Session ready for ${name}.`);
-      return json(session.screen);
-    }
-    case "ibmi.tn5250.readScreen": {
-      const session = requireTn5250Session(ctx, args);
-      return json(session.screen);
-    }
-    case "ibmi.tn5250.setField": {
-      const session = requireTn5250Session(ctx, args);
-      const field = findTn5250Field(session, args.fieldId);
-      if (!field) throw new Error(`TN5250 field not found: ${args.fieldId}`);
-      if (field.protected) throw new Error(`TN5250 field is protected: ${field.id}`);
-      const value = String(args.value || "");
-      field.value = value.length > field.length ? value.substring(0, field.length) : value;
-      touchTn5250Session(session);
-      return json(session.screen);
-    }
-    case "ibmi.tn5250.sendKeys": {
-      const session = requireTn5250Session(ctx, args);
-      const conn = await ctx.ensureActive(session.connectionName);
-      const keys = parseTn5250Keys(args.keys);
-      const timeoutMs = clampNumber(args?.timeoutMs, 45000, 1000, 300000);
-      const commandField = findTn5250Field(session, "command");
-
-      session.screen.lastKeys = keys;
-      session.screen.status = "busy";
-      touchTn5250Session(session);
-
-      for (const key of keys) {
-        if (key === "ENTER" || key === "RETURN") {
-          const command = String(commandField?.value || "").trim();
-          if (!command) {
-            appendTn5250Message(session, "No command entered.");
-            continue;
-          }
-
-          enforcePolicyOperation(ctx, "cl.run", {
-            ...args,
-            command,
-            connectionName: session.connectionName
-          });
-
-          const cmdResult = await runClCommand(conn, command, "ile", undefined, timeoutMs);
-          const recent = await readRecentJoblogMessages(conn, 5);
-          const messages = recent.map((row: any) => {
-            const id = String(row.MESSAGE_ID || "");
-            const text = String(row.MESSAGE_TEXT || "");
-            return id ? `[${id}] ${text}` : text;
-          });
-
-          session.screen.commandHistory.unshift({
-            at: new Date().toISOString(),
-            command,
-            ok: cmdResult.code === 0,
-            code: cmdResult.code,
-            stderr: cmdResult.stderr ? String(cmdResult.stderr) : undefined,
-            messages: messages.slice(0, 5)
-          });
-          if (session.screen.commandHistory.length > TN5250_MAX_HISTORY) {
-            session.screen.commandHistory = session.screen.commandHistory.slice(0, TN5250_MAX_HISTORY);
-          }
-
-          appendTn5250Message(session, `${cmdResult.code === 0 ? "OK" : "ERROR"}: ${command}`);
-          for (const line of messages.slice(0, 3)) {
-            appendTn5250Message(session, line);
-          }
-          if (commandField) commandField.value = "";
-          continue;
-        }
-
-        if (key === "CLEAR" || key === "F3" || key === "F12") {
-          resetTn5250Screen(session, `Cleared via ${key}.`);
-          continue;
-        }
-
-        if (key === "TAB") {
-          rotateTn5250Cursor(session);
-          continue;
-        }
-
-        appendTn5250Message(session, `Unsupported key: ${key}`);
-      }
-
-      session.screen.status = "ready";
-      touchTn5250Session(session);
-      return json(session.screen);
-    }
-    case "ibmi.tn5250.waitFor": {
-      const session = requireTn5250Session(ctx, args);
-      const timeoutMs = clampNumber(args?.timeoutMs, 5000, 250, 120000);
-      const pattern = args?.text ? String(args.text) : "";
-      if (!pattern) {
-        return json({ matched: true, timeoutMs, screen: session.screen });
-      }
-      const matched = await waitForTn5250Text(session, pattern, timeoutMs);
-      return json({ matched, text: pattern, timeoutMs, screen: session.screen });
-    }
-    case "ibmi.tn5250.snapshot": {
-      const session = requireTn5250Session(ctx, args);
-      return json({
-        capturedAt: new Date().toISOString(),
-        connectionName: session.connectionName,
-        plainText: renderTn5250Screen(session.screen),
-        screen: session.screen
-      });
-    }
-    case "ibmi.tn5250.disconnect": {
-      const name = resolveTn5250SessionName(ctx, args);
-      if (!name) throw new Error("connectionName is required (no active session)");
-      const existed = tn5250Sessions.delete(name);
-      return json({ disconnected: existed, connectionName: name });
-    }
   }
 
   throw new Error(`Unknown tool: ${name}`);
@@ -2631,7 +2891,7 @@ async function listActions(ctx: McpContext) {
   return [...builtins, ...custom];
 }
 
-async function resolveAction(ctx: McpContext, args: any): Promise<Action | undefined> {
+export async function resolveAction(ctx: McpContext, args: any): Promise<Action | undefined> {
   if (args.action) return args.action as Action;
   if (!args.actionName) return undefined;
   const actions = await listActions(ctx);
@@ -2647,7 +2907,7 @@ type ClCommandResult = {
   [key: string]: unknown;
 };
 
-async function runClCommand(conn: any, command: string, environment: string, cwd: string | undefined, timeoutMs: number): Promise<ClCommandResult> {
+export async function runClCommand(conn: any, command: string, environment: string, cwd: string | undefined, timeoutMs: number): Promise<ClCommandResult> {
   if (environment === "pase") {
     return await withTimeout(
       conn.sendCommand({ command, directory: cwd }),
@@ -2664,25 +2924,10 @@ async function runClCommand(conn: any, command: string, environment: string, cwd
   }
 
   try {
-    await withTimeout(
-      conn.runSQL(`CALL QSYS2.QCMDEXC(${Tools.sqlString(command)})`),
-      timeoutMs,
-      `CL command timed out after ${timeoutMs}ms`
-    );
+    await runSqlWithTimeout(conn, `CALL QSYS2.QCMDEXC(${Tools.sqlString(command)})`, timeoutMs, `CL command timed out after ${timeoutMs}ms`);
     return { code: 0, signal: null, stdout: "", stderr: "", command };
   } catch (err: any) {
     return { code: 1, signal: null, stdout: "", stderr: err?.message || String(err), command };
-  }
-}
-
-async function readRecentJoblogMessages(conn: any, limit: number) {
-  try {
-    const capped = clampNumber(limit, 5, 1, 20);
-    return await conn.runSQL(
-      `select message_id, message_text, severity, message_timestamp from table(qsys2.joblog_info('*')) order by message_timestamp desc fetch first ${capped} rows only`
-    );
-  } catch {
-    return [];
   }
 }
 
@@ -2691,6 +2936,7 @@ type JournalQueryOptions = {
   journal: string;
   objectLibrary?: string;
   objectName?: string;
+  objectType?: string;
   journalCode?: string;
   entryType?: string;
   userName?: string;
@@ -2701,6 +2947,9 @@ type JournalQueryOptions = {
   sinceTimestamp?: string;
 };
 
+// Every filter is applied on the IBM i (table function parameters and WHERE
+// predicates) before FETCH FIRST, so the row cap never hides matching entries.
+// Rows come back newest first.
 async function queryJournalEntries(conn: any, options: JournalQueryOptions) {
   let rows: Array<Record<string, unknown>>;
   try {
@@ -2709,42 +2958,7 @@ async function queryJournalEntries(conn: any, options: JournalQueryOptions) {
     rows = await queryJournalEntriesViaOutfile(conn, options);
   }
 
-  let normalized = rows.map(normalizeJournalEntry);
-  if (options.objectLibrary) {
-    normalized = normalized.filter(row => (row.objectLibrary || "") === options.objectLibrary);
-  }
-  if (options.objectName) {
-    normalized = normalized.filter(row => (row.objectName || "") === options.objectName);
-  }
-  if (options.journalCode) {
-    normalized = normalized.filter(row => (row.journalCode || "") === options.journalCode);
-  }
-  if (options.entryType) {
-    normalized = normalized.filter(row => (row.entryType || "") === options.entryType);
-  }
-  if (options.userName) {
-    normalized = normalized.filter(row => (row.userName || "") === options.userName);
-  }
-  if (options.jobName) {
-    normalized = normalized.filter(row => (row.jobName || "").includes(options.jobName!));
-  }
-  if (options.programName) {
-    normalized = normalized.filter(row => (row.programName || "") === options.programName);
-  }
-  if (typeof options.sinceSequence === "number") {
-    normalized = normalized.filter(row => typeof row.sequence === "number" && row.sequence >= options.sinceSequence!);
-  }
-  if (options.sinceTimestamp) {
-    const cutoff = Date.parse(options.sinceTimestamp);
-    if (Number.isFinite(cutoff)) {
-      normalized = normalized.filter(row => {
-        if (!row.timestamp) return false;
-        const value = Date.parse(row.timestamp);
-        return Number.isFinite(value) && value >= cutoff;
-      });
-    }
-  }
-
+  const normalized = rows.map(normalizeJournalEntry);
   normalized.sort((a, b) => {
     const aSeq = typeof a.sequence === "number" ? a.sequence : -1;
     const bSeq = typeof b.sequence === "number" ? b.sequence : -1;
@@ -2755,6 +2969,27 @@ async function queryJournalEntries(conn: any, options: JournalQueryOptions) {
   });
 
   return normalized.slice(0, options.limit);
+}
+
+// Turns an ISO-8601 or IBM i style timestamp into a Db2 for i timestamp
+// expression in the system's local time. Values with an explicit zone (Z or
+// +hh:mm) are converted from UTC with CURRENT TIMEZONE; values without a zone
+// are taken as system local time.
+function sqlTimestampExpression(value: string) {
+  const raw = String(value || "").trim();
+  const local = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T-](\d{2})[:.](\d{2})(?:[:.](\d{2})(?:\.(\d{1,6}))?)?)?$/);
+  if (local) {
+    const [, y, mo, d, h = "00", mi = "00", s = "00", frac = "0"] = local;
+    return `timestamp('${y}-${mo}-${d}-${h}.${mi}.${s}.${frac.padEnd(6, "0")}')`;
+  }
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw)) {
+    throw new Error(`Invalid sinceTimestamp: ${value}`);
+  }
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) throw new Error(`Invalid sinceTimestamp: ${value}`);
+  const iso = new Date(parsed).toISOString();
+  const db2 = `${iso.slice(0, 10)}-${iso.slice(11, 13)}.${iso.slice(14, 16)}.${iso.slice(17, 19)}.${iso.slice(20, 23)}000`;
+  return `(timestamp('${db2}') + current timezone)`;
 }
 
 type JobQueryOptions = {
@@ -2857,31 +3092,78 @@ type MessageQueueOptions = {
   limit: number;
 };
 
+// Newest messages first. The table function form takes QUEUE_LIBRARY and
+// QUEUE_NAME; the view form is the fallback for releases without it.
 async function queryMessageQueueEntries(conn: any, options: MessageQueueOptions) {
   let rows: Array<Record<string, unknown>>;
   try {
     rows = await conn.runSQL(
-      `select * from table(qsys2.message_queue_info(message_queue_name => ${Tools.sqlString(options.messageQueue)}, message_queue_library => ${Tools.sqlString(options.library)})) fetch first ${options.limit} rows only`
+      `select x.*, hex(x.message_key) as message_key_hex from table(qsys2.message_queue_info(queue_library => ${Tools.sqlString(options.library)}, queue_name => ${Tools.sqlString(options.messageQueue)})) x ` +
+      `order by message_timestamp desc fetch first ${options.limit} rows only`
     );
   } catch {
     rows = await conn.runSQL(
-      `select * from qsys2.message_queue_info where upper(message_queue_name)=${Tools.sqlString(options.messageQueue)} and upper(message_queue_library)=${Tools.sqlString(options.library)} fetch first ${options.limit} rows only`
+      `select x.*, hex(x.message_key) as message_key_hex from qsys2.message_queue_info x where message_queue_name=${Tools.sqlString(options.messageQueue)} and message_queue_library=${Tools.sqlString(options.library)} ` +
+      `order by message_timestamp desc fetch first ${options.limit} rows only`
     );
   }
   return rows.map(normalizeMessageQueueEntry);
 }
 
-async function querySpoolEntries(conn: any, limit: number) {
-  const queries = [
-    `select * from qsys2.output_queue_entries fetch first ${limit} rows only`,
-    `select * from table(qsys2.output_queue_entries()) fetch first ${limit} rows only`,
-    `select job_name, spooled_file_name, spooled_file_number, output_queue_name, total_pages, file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
-    `select job_name, spooled_file_name, spooled_file_number, output_queue_name, total_pages, cast('' as varchar(10)) as file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
-    `select job_name, spooled_file_name, cast(0 as integer) as spooled_file_number, output_queue_name, total_pages, file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
-    `select job_name, spooled_file_name, cast(0 as integer) as spooled_file_number, output_queue_name, total_pages, cast('' as varchar(10)) as file_status from qsys2.output_queue_entries fetch first ${limit} rows only`,
-    `select * from qsys2.spooled_file_info fetch first ${limit} rows only`,
-    `select * from table(qsys2.spooled_file_info()) fetch first ${limit} rows only`
-  ];
+type SpoolQueryOptions = {
+  limit: number;
+  userName?: string;
+  outputQueue?: string;
+  outputQueueLibrary?: string;
+  jobName?: string;
+};
+
+// QSYS2.OUTPUT_QUEUE_ENTRIES columns: USER_NAME, OUTPUT_QUEUE_NAME,
+// OUTPUT_QUEUE_LIBRARY_NAME, JOB_NAME (qualified), CREATE_TIMESTAMP, ...
+function buildSpoolWhereClause(options: SpoolQueryOptions) {
+  const predicates: string[] = [];
+  if (options.userName) predicates.push(`user_name = ${Tools.sqlString(options.userName)}`);
+  if (options.outputQueue) predicates.push(`output_queue_name = ${Tools.sqlString(options.outputQueue)}`);
+  if (options.outputQueueLibrary) predicates.push(`output_queue_library_name = ${Tools.sqlString(options.outputQueueLibrary)}`);
+  if (options.jobName) {
+    predicates.push(options.jobName.includes("/")
+      ? `job_name = ${Tools.sqlString(options.jobName)}`
+      : `job_name like ${Tools.sqlString(`%/${options.jobName}`)}`);
+  }
+  return predicates.length > 0 ? ` where ${predicates.join(" and ")}` : "";
+}
+
+async function querySpoolEntries(conn: any, options: SpoolQueryOptions) {
+  const limit = options.limit;
+  const where = buildSpoolWhereClause(options);
+  const queries: string[] = [];
+  // OUTPUT_QUEUE_ENTRIES scans every spooled file on the system before the
+  // WHERE applies, which can take minutes. SPOOLED_FILE_INFO filters by user
+  // or job inside the service, so use it first when one of those is given.
+  const qualifiedJob = options.jobName?.includes("/") ? options.jobName : undefined;
+  if (options.userName || qualifiedJob) {
+    const params = [
+      options.userName ? `user_name => ${Tools.sqlString(options.userName)}` : "",
+      qualifiedJob ? `job_name => ${Tools.sqlString(qualifiedJob)}` : ""
+    ].filter(Boolean).join(", ");
+    const filters = [
+      options.outputQueue ? `output_queue = ${Tools.sqlString(options.outputQueue)}` : "",
+      options.outputQueueLibrary ? `output_queue_library = ${Tools.sqlString(options.outputQueueLibrary)}` : "",
+      options.jobName && !qualifiedJob ? `job_name = ${Tools.sqlString(options.jobName)}` : ""
+    ].filter(Boolean);
+    queries.push(`select * from table(qsys2.spooled_file_info(${params})) x${filters.length ? ` where ${filters.join(" and ")}` : ""} order by creation_timestamp desc fetch first ${limit} rows only`);
+  }
+  queries.push(
+    `select * from qsys2.output_queue_entries${where} order by create_timestamp desc fetch first ${limit} rows only`,
+    `select * from qsys2.output_queue_entries${where} fetch first ${limit} rows only`
+  );
+  if (!where) {
+    queries.push(
+      `select * from table(qsys2.output_queue_entries()) fetch first ${limit} rows only`,
+      `select * from qsys2.spooled_file_info fetch first ${limit} rows only`,
+      `select * from table(qsys2.spooled_file_info()) fetch first ${limit} rows only`
+    );
+  }
 
   let lastError: unknown;
   for (const sql of queries) {
@@ -2897,7 +3179,8 @@ async function querySpoolEntries(conn: any, limit: number) {
 function normalizeMessageQueueEntry(row: Record<string, unknown>) {
   return {
     source: "msgq",
-    messageKey: toNullableString(pickFirst(row, ["MESSAGE_KEY", "MSGKEY"])),
+    // The raw key is binary; the hex form is what ibmi.msgq.reply accepts.
+    messageKey: toNullableString(pickFirst(row, ["MESSAGE_KEY_HEX", "MSGKEY"])),
     messageId: toNullableString(pickFirst(row, ["MESSAGE_ID", "MSGID"])),
     messageType: toNullableString(pickFirst(row, ["MESSAGE_TYPE", "MSGTYPE"])),
     severity: toNullableNumber(pickFirst(row, ["SEVERITY", "MSGSEV"])),
@@ -2915,18 +3198,33 @@ type LockQueryOptions = {
   limit: number;
 };
 
+// QSYS2.OBJECT_LOCK_INFO is a view; filters go into its WHERE clause so the row
+// cap applies to matching locks only.
 async function queryLockEntries(conn: any, options: LockQueryOptions) {
+  const base: string[] = [];
+  if (options.objectLibrary) base.push(`object_schema = ${Tools.sqlString(options.objectLibrary)}`);
+  if (options.objectName) base.push(`object_name = ${Tools.sqlString(options.objectName)}`);
+  if (options.objectType) base.push(`object_type = ${Tools.sqlString(options.objectType)}`);
+  const memberPredicate = options.member ? `system_table_member = ${Tools.sqlString(options.member)}` : undefined;
+  const whereOf = (predicates: string[]) => predicates.length > 0 ? ` where ${predicates.join(" and ")}` : "";
+
   let rows: Array<Record<string, unknown>>;
+  let filterMemberLocally = false;
   try {
-    rows = await conn.runSQL(`select * from table(qsys2.object_lock_info()) fetch first ${Math.min(options.limit, 500)} rows only`);
-  } catch {
-    rows = await conn.runSQL(`select * from qsys2.object_lock_info fetch first ${Math.min(options.limit, 500)} rows only`);
+    rows = await conn.runSQL(
+      `select * from qsys2.object_lock_info${whereOf(memberPredicate ? [...base, memberPredicate] : base)} fetch first ${options.limit} rows only`
+    );
+  } catch (err) {
+    if (!memberPredicate) throw err;
+    // Fallback when the member column is named differently on this release:
+    // keep the object filters in SQL and match the member locally.
+    rows = await conn.runSQL(`select * from qsys2.object_lock_info${whereOf(base)} fetch first 5000 rows only`);
+    filterMemberLocally = true;
   }
   let normalized = rows.map(normalizeLockEntry);
-  if (options.objectLibrary) normalized = normalized.filter(row => (row.objectLibrary || "") === String(options.objectLibrary).toUpperCase());
-  if (options.objectName) normalized = normalized.filter(row => (row.objectName || "") === String(options.objectName).toUpperCase());
-  if (options.objectType) normalized = normalized.filter(row => (row.objectType || "") === String(options.objectType).toUpperCase());
-  if (options.member) normalized = normalized.filter(row => (row.member || "") === String(options.member).toUpperCase());
+  if (filterMemberLocally && options.member) {
+    normalized = normalized.filter(row => (row.member || "") === options.member);
+  }
   return normalized.slice(0, options.limit);
 }
 
@@ -2936,7 +3234,7 @@ function normalizeLockEntry(row: Record<string, unknown>) {
     objectLibrary: toNullableString(pickFirst(row, ["OBJECT_SCHEMA", "OBJECT_LIBRARY", "OBJLIB"])),
     objectName: toNullableString(pickFirst(row, ["OBJECT_NAME", "OBJNAME"])),
     objectType: toNullableString(pickFirst(row, ["OBJECT_TYPE", "OBJTYPE"])),
-    member: toNullableString(pickFirst(row, ["MEMBER_NAME", "MEMBER"])),
+    member: toNullableString(pickFirst(row, ["SYSTEM_TABLE_MEMBER", "MEMBER_NAME", "MEMBER"])),
     lockState: toNullableString(pickFirst(row, ["LOCK_STATE", "LOCK_STATUS", "STATUS"])),
     lockScope: toNullableString(pickFirst(row, ["LOCK_SCOPE", "SCOPE"])),
     lockHolderJob: toNullableString(pickFirst(row, ["JOB_NAME", "LOCK_JOB_NAME"])),
@@ -2983,28 +3281,33 @@ type DataQueueReceiveOptions = {
   remove: boolean;
 };
 
+const DATA_QUEUE_MAX_WAIT_SECONDS = 60;
+
+// remove=false never falls back to anything that takes the entry off the
+// queue: it peeks with RECEIVE_DATA_QUEUE(REMOVE => 'NO') and then with the
+// read-only DATA_QUEUE_ENTRIES service.
 async function queryDataQueueEntries(conn: any, options: DataQueueReceiveOptions) {
+  const queue = Tools.sqlString(options.queue);
+  const library = Tools.sqlString(options.library);
+  const waitSeconds = Math.max(0, Math.min(DATA_QUEUE_MAX_WAIT_SECONDS, Math.floor(options.waitSeconds)));
   let rows: Array<Record<string, unknown>>;
+  if (options.remove) {
+    rows = await conn.runSQL(
+      `select * from table(qsys2.receive_data_queue(data_queue => ${queue}, data_queue_library => ${library}, ` +
+      `wait_time => ${waitSeconds}, remove => 'YES')) fetch first 1 rows only`
+    );
+    return rows.map(normalizeDataQueueEntry);
+  }
   try {
     rows = await conn.runSQL(
-      `select * from table(qsys2.receive_data_queue(${Tools.sqlString(options.queue)}, ${Tools.sqlString(options.library)}, ${Tools.sqlString(options.remove ? "YES" : "NO")}, ${options.waitSeconds})) fetch first 1 rows only`
+      `select * from table(qsys2.receive_data_queue(data_queue => ${queue}, data_queue_library => ${library}, ` +
+      `wait_time => ${waitSeconds}, remove => 'NO')) fetch first 1 rows only`
     );
   } catch {
-    try {
-      rows = await conn.runSQL(
-        `select * from table(qsys2.receive_data_queue(${Tools.sqlString(options.queue)}, ${Tools.sqlString(options.library)})) fetch first 1 rows only`
-      );
-    } catch {
-      try {
-        rows = await conn.runSQL(
-          `select * from table(qsys2.data_queue_entries(${Tools.sqlString(options.queue)}, ${Tools.sqlString(options.library)})) fetch first 1 rows only`
-        );
-      } catch {
-        rows = await conn.runSQL(
-          `select * from qsys2.data_queue_entries where upper(data_queue_name)=${Tools.sqlString(options.queue)} and upper(data_queue_library)=${Tools.sqlString(options.library)} fetch first 1 rows only`
-        );
-      }
-    }
+    rows = await conn.runSQL(
+      `select * from table(qsys2.data_queue_entries(data_queue => ${queue}, data_queue_library => ${library})) ` +
+      `order by ordinal_position fetch first 1 rows only`
+    );
   }
   return rows.map(normalizeDataQueueEntry);
 }
@@ -3045,7 +3348,8 @@ function normalizeDataAreaInfoRow(row: Record<string, unknown>) {
     dataArea: toNullableString(pickFirst(row, ["DATA_AREA_NAME", "OBJECT_NAME"])),
     type: toNullableString(pickFirst(row, ["DATA_AREA_TYPE", "OBJECT_TYPE"])),
     length: toNullableNumber(pickFirst(row, ["LENGTH", "DATA_AREA_LENGTH"])),
-    value: toNullableString(pickFirst(row, ["CHARACTER_VALUE", "VALUE", "DECIMAL_VALUE"])),
+    decimalPositions: toNullableNumber(pickFirst(row, ["DECIMAL_POSITIONS"])),
+    value: toNullableString(pickFirst(row, ["DATA_AREA_VALUE", "CHARACTER_VALUE", "VALUE", "DECIMAL_VALUE"])),
     updatedAt: toNullableString(pickFirst(row, ["LAST_CHANGED_TIMESTAMP", "CHANGE_TIMESTAMP"]))
   };
 }
@@ -3060,25 +3364,86 @@ function buildSpoolCommand(commandName: string, args: any) {
   return `${commandName} FILE(${spooledFileName}) JOB(${jobName}) SPLNBR(${spooledFileNumber})`;
 }
 
+function isQualifiedJobName(value: string) {
+  return /^[^/]+\/[^/]+\/[^/]+$/.test(value);
+}
+
 async function queryJournalEntriesViaDisplayJournal(conn: any, options: JournalQueryOptions) {
-  const sampleSize = Math.min(options.limit * 5, 5000);
+  if (options.objectLibrary && !options.objectName) {
+    // A library on its own is not a DISPLAY_JOURNAL filter; the outfile path
+    // filters it in SQL.
+    throw new Error("objectLibrary without objectName is handled by the DSPJRN outfile query");
+  }
+  const params = [
+    `journal_library => ${Tools.sqlString(options.journalLibrary)}`,
+    `journal_name => ${Tools.sqlString(options.journal)}`
+  ];
+  const where: string[] = [];
+  const since = options.sinceTimestamp ? sqlTimestampExpression(options.sinceTimestamp) : undefined;
+  if (typeof options.sinceSequence === "number" || since) {
+    // Search the whole receiver chain, not only the attached receiver, when a
+    // starting point is given.
+    params.push(`starting_receiver_name => '*CURCHAIN'`);
+  }
+  if (typeof options.sinceSequence === "number") {
+    params.push(`starting_sequence => ${Math.max(0, Math.floor(options.sinceSequence))}`);
+    where.push(`sequence_number >= ${Math.max(0, Math.floor(options.sinceSequence))}`);
+    if (since) where.push(`entry_timestamp >= ${since}`);
+  } else if (since) {
+    params.push(`starting_timestamp => ${since}`);
+  }
+  if (options.journalCode) params.push(`journal_codes => ${Tools.sqlString(options.journalCode)}`);
+  if (options.entryType) params.push(`journal_entry_types => ${Tools.sqlString(options.entryType)}`);
+  if (options.objectName) {
+    params.push(`object_library => ${Tools.sqlString(options.objectLibrary || "*LIBL")}`);
+    params.push(`object_name => ${Tools.sqlString(options.objectName)}`);
+    const objectType = options.objectType || "*FILE";
+    params.push(`object_objtype => ${Tools.sqlString(objectType)}`);
+    if (objectType === "*FILE") params.push(`object_member => '*ALL'`);
+  }
+  if (options.userName) params.push(`user => ${Tools.sqlString(options.userName)}`);
+  if (options.programName) params.push(`program => ${Tools.sqlString(options.programName)}`);
+  if (options.jobName) {
+    if (isQualifiedJobName(options.jobName)) params.push(`job => ${Tools.sqlString(options.jobName)}`);
+    else where.push(`job_name = ${Tools.sqlString(options.jobName)}`);
+  }
+  const whereClause = where.length > 0 ? ` where ${where.join(" and ")}` : "";
   const rows = await conn.runSQL(
-    `select * from table(qsys2.display_journal(journal_name => ${Tools.sqlString(options.journal)}, journal_library => ${Tools.sqlString(options.journalLibrary)})) fetch first ${sampleSize} rows only`
+    `select * from table(qsys2.display_journal(${params.join(", ")}))${whereClause} ` +
+    `order by sequence_number desc fetch first ${options.limit} rows only`
   );
   return rows as Array<Record<string, unknown>>;
 }
 
+// DSPJRN writes to QTEMP, which belongs to one job. The CALL QCMDEXC and the
+// SELECT are sent in the same QZDFMDB2 request so they run in the same job.
 async function queryJournalEntriesViaOutfile(conn: any, options: JournalQueryOptions) {
-  const outfile = `MCPJ${String(Math.floor(Math.random() * 90000) + 10000)}`;
-  const fileFilter = options.objectLibrary && options.objectName
-    ? ` FILE((${options.objectLibrary}/${options.objectName}))`
-    : "";
-  const command = `DSPJRN JRN(${options.journalLibrary}/${options.journal}) OUTPUT(*OUTFILE) OUTFILE(QTEMP/${outfile})${fileFilter}`;
-  const result = await runClCommand(conn, command, "ile", undefined, 45000);
-  if (result.code !== 0) {
-    throw new Error(result.stderr || "Unable to query journal entries");
+  const outfile = `MCPJ${String(Math.floor(Math.random() * 900000) + 100000)}`;
+  const rangeOption = typeof options.sinceSequence === "number" || options.sinceTimestamp ? " RCVRNG(*CURCHAIN)" : "";
+  const command = `DSPJRN JRN(${options.journalLibrary}/${options.journal})${rangeOption} ` +
+    `OUTPUT(*OUTFILE) OUTFILFMT(*TYPE5) OUTFILE(QTEMP/${outfile})`;
+  const where: string[] = [];
+  if (options.objectLibrary) where.push(`JOLIB = ${Tools.sqlString(options.objectLibrary)}`);
+  if (options.objectName) where.push(`JOOBJ = ${Tools.sqlString(options.objectName)}`);
+  if (options.journalCode) where.push(`JOCODE = ${Tools.sqlString(options.journalCode)}`);
+  if (options.entryType) where.push(`JOENTT = ${Tools.sqlString(options.entryType)}`);
+  if (options.userName) where.push(`JOUSPF = ${Tools.sqlString(options.userName)}`);
+  if (options.programName) where.push(`JOPGM = ${Tools.sqlString(options.programName)}`);
+  if (options.jobName) {
+    if (isQualifiedJobName(options.jobName)) {
+      const [number, user, name] = options.jobName.split("/");
+      where.push(`JONBR = ${Tools.sqlString(number)}`, `JOUSER = ${Tools.sqlString(user)}`, `JOJOB = ${Tools.sqlString(name)}`);
+    } else {
+      where.push(`JOJOB = ${Tools.sqlString(options.jobName)}`);
+    }
   }
-  const rows = await conn.runSQL(`select * from QTEMP.${outfile}`);
+  if (typeof options.sinceSequence === "number") where.push(`JOSEQN >= ${Math.max(0, Math.floor(options.sinceSequence))}`);
+  if (options.sinceTimestamp) where.push(`JOTSTP >= ${sqlTimestampExpression(options.sinceTimestamp)}`);
+  const whereClause = where.length > 0 ? ` where ${where.join(" and ")}` : "";
+  const rows = await conn.runSQL([
+    `CALL QSYS2.QCMDEXC(${Tools.sqlString(command)});`,
+    `select * from QTEMP.${outfile}${whereClause} order by JOSEQN desc fetch first ${options.limit} rows only;`
+  ].join("\n"));
   return rows as Array<Record<string, unknown>>;
 }
 
@@ -3091,7 +3456,7 @@ function normalizeJournalEntry(row: Record<string, unknown>) {
   const objectName = toNullableString(pickFirst(row, ["OBJECT_NAME", "JOOBJ", "OBJNAME"]));
   const objectType = toNullableString(pickFirst(row, ["OBJECT_TYPE", "JOOBJT", "OBJTYPE"]));
   const jobName = toNullableString(pickFirst(row, ["JOB_NAME", "JOJOB", "JOB"]));
-  const userName = toNullableString(pickFirst(row, ["USER_NAME", "JOUSER", "USER"]));
+  const userName = toNullableString(pickFirst(row, ["USER_NAME", "CURRENT_USER", "JOUSPF", "JOUSER", "USER"]));
   const programName = toNullableString(pickFirst(row, ["PROGRAM_NAME", "JOPGM", "PROGRAM"]));
   return {
     source: "journal",
@@ -3108,149 +3473,378 @@ function normalizeJournalEntry(row: Record<string, unknown>) {
   };
 }
 
-function pickFirst(row: Record<string, unknown>, keys: string[]) {
+export function pickFirst(row: Record<string, unknown>, keys: string[]) {
   for (const key of keys) {
     if (typeof row[key] !== "undefined" && row[key] !== null) return row[key];
   }
   return undefined;
 }
 
-function toNullableNumber(value: unknown) {
+export function toNullableNumber(value: unknown) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 }
 
-function toNullableString(value: unknown) {
+export function toNullableString(value: unknown) {
   if (typeof value === "undefined" || value === null) return null;
   const text = String(value).trim();
   return text.length > 0 ? text : null;
 }
 
-function ensureTn5250Session(connectionName: string): Tn5250Session {
-  const existing = tn5250Sessions.get(connectionName);
-  if (existing) {
-    touchTn5250Session(existing);
-    return existing;
-  }
+function hasMemberListExtensions(args: any) {
+  return args?.responseFormat === "page" || [
+    "member", "memberPrefix", "memberContains", "sourceTypes", "changedSince", "limit", "cursor"
+  ].some(key => typeof args?.[key] !== "undefined");
+}
 
-  const now = new Date().toISOString();
-  const session: Tn5250Session = {
-    connectionName,
-    createdAt: Date.now(),
-    screen: {
-      sessionId: `tn5250:${connectionName}`,
-      connectionName,
-      title: "MCP TN5250 Command Session",
-      status: "ready",
-      textLines: [
-        `Connected to ${connectionName}.`,
-        "Set field 'command' (or fieldId '1') and send Enter.",
-        "Supported keys: Enter, Tab, F3, F12, Clear."
-      ],
-      fields: [
-        {
-          id: "command",
-          label: "Command",
-          value: "",
-          row: 20,
-          col: 2,
-          length: 512,
-          protected: false
-        }
-      ],
-      cursorFieldId: "command",
-      lastKeys: [],
-      commandHistory: [],
-      updatedAt: now
+function hasStructuredMemberReadOptions(args: any) {
+  return args?.responseFormat === "structured" || [
+    "startLine", "endLine", "ranges", "before", "after", "metadataOnly",
+    "expectedVersion", "expectedSha256", "forceFresh"
+  ].some(key => typeof args?.[key] !== "undefined");
+}
+
+function memberVersionConflict(snapshot: MemberSnapshot, args: any) {
+  const versionMismatch = args?.expectedVersion && args.expectedVersion !== snapshot.version;
+  const hashMismatch = args?.expectedSha256 && String(args.expectedSha256).toLowerCase() !== snapshot.sha256.toLowerCase();
+  if (!versionMismatch && !hashMismatch) return undefined;
+  const { identity } = snapshot;
+  return toolError(
+    `Version conflict: ${identity.library}/${identity.sourceFile}(${identity.member}) is now version ${snapshot.version}. ` +
+    "Nothing was modified. Re-read the member and retry with the current version.",
+    {
+      code: "VERSION_CONFLICT",
+      status: "version-conflict",
+      identity,
+      expectedVersion: args?.expectedVersion,
+      expectedSha256: args?.expectedSha256,
+      actualVersion: snapshot.version,
+      actualSha256: snapshot.sha256,
+      currentVersion: snapshot.version,
+      currentSha256: snapshot.sha256,
+      observedAt: snapshot.observedAt,
+      modified: false
     }
+  );
+}
+
+const DEFAULT_SOURCE_READ_MAX_BYTES = 2_000_000;
+const DEFAULT_SOURCE_READ_MAX_LINES = 50_000;
+const MAX_RANGE_LINES = 2_000;
+
+type SourceReadLimits = { maxBytes: number; maxLines: number };
+
+function sourceReadLimits(conn: any): SourceReadLimits {
+  const config = typeof conn?.getConfig === "function" ? conn.getConfig() || {} : {};
+  const read = (value: any, fallback: number) => {
+    const parsed = Number(value);
+    if (value === undefined || value === null || value === "" || !Number.isFinite(parsed) || parsed < 0) return fallback;
+    return Math.floor(parsed);
   };
-  tn5250Sessions.set(connectionName, session);
-  return session;
+  return {
+    maxBytes: read(config.sourceReadMaxBytes, DEFAULT_SOURCE_READ_MAX_BYTES),
+    maxLines: read(config.sourceReadMaxLines, DEFAULT_SOURCE_READ_MAX_LINES)
+  };
 }
 
-function requireTn5250Session(ctx: McpContext, args: any): Tn5250Session {
-  const name = resolveTn5250SessionName(ctx, args);
-  if (!name) throw new Error("connectionName is required (no active session)");
-  const session = tn5250Sessions.get(name);
-  if (!session) {
-    throw new Error(`TN5250 session for ${name} not found. Call ibmi.tn5250.connect first.`);
+function isFullMemberRead(args: any) {
+  return !args?.metadataOnly &&
+    typeof args?.startLine === "undefined" &&
+    typeof args?.endLine === "undefined" &&
+    !(Array.isArray(args?.ranges) && args.ranges.length > 0);
+}
+
+function exceedsSourceLimits(content: string, lineCount: number | undefined, limits: SourceReadLimits) {
+  const bytes = Buffer.byteLength(content, "utf8");
+  const lines = typeof lineCount === "number" ? lineCount : (content === "" ? 0 : content.split("\n").length);
+  const tooLarge = (limits.maxBytes > 0 && bytes > limits.maxBytes) || (limits.maxLines > 0 && lines > limits.maxLines);
+  return tooLarge ? { bytes, lineCount: lines } : undefined;
+}
+
+function sourceTooLarge(content: string, lineCount: number | undefined, limits: SourceReadLimits, args: any) {
+  const size = exceedsSourceLimits(content, lineCount, limits);
+  return size ? sourceTooLargeError(args, size, limits) : undefined;
+}
+
+function sourceTooLargeError(args: any, size: Record<string, any>, limits: SourceReadLimits, extra: Record<string, any> = {}) {
+  const name = `${String(args?.library || "").toUpperCase()}/${String(args?.sourceFile || "").toUpperCase()}(${String(args?.member || "").toUpperCase()})`;
+  return toolError(
+    `${name} is too large for a full read (${size.lineCount ?? "?"} lines` +
+    `${typeof size.bytes === "number" ? `, ${size.bytes} bytes` : ""}; limits ${limits.maxLines} lines, ${limits.maxBytes} bytes). ` +
+    "Read it in pieces with startLine/endLine or ranges, locate code with ibmi.search.members or ibmi.source.inspect " +
+    "(search, outline), or use metadataOnly: true for its size and version.",
+    { code: "SOURCE_TOO_LARGE", ...size, maxLines: limits.maxLines, maxBytes: limits.maxBytes, ...extra }
+  );
+}
+
+function formatMemberReadResult(snapshot: MemberSnapshot, args: any, limits: SourceReadLimits) {
+  if (isFullMemberRead(args)) {
+    const size = exceedsSourceLimits(snapshot.content, snapshot.lines.length, limits);
+    if (size) {
+      return sourceTooLargeError(args, size, limits, {
+        identity: snapshot.identity,
+        metadata: snapshot.metadata,
+        version: snapshot.version,
+        sha256: snapshot.sha256,
+        observedAt: snapshot.observedAt
+      });
+    }
   }
-  return session;
+  return json(formatMemberRead(snapshot, args, limits));
 }
 
-function resolveTn5250SessionName(ctx: McpContext, args: any) {
-  return args?.connectionName || ctx.activeName;
+function memberMetadataEnvelope(args: any, metadata: any, observedAt: string) {
+  return {
+    status: "found",
+    identity: {
+      library: String(args.library).toUpperCase(),
+      sourceFile: String(args.sourceFile).toUpperCase(),
+      member: String(args.member).toUpperCase()
+    },
+    metadata,
+    ...(metadata?.lastChanged ? { changeMarker: metadata.lastChanged } : {}),
+    observedAt,
+    contentLoaded: false,
+    cacheStatus: "bypass",
+    warnings: [
+      "Content was not downloaded, so sha256 and version are omitted. Pass expectedVersion/expectedSha256 or read without metadataOnly to compute them."
+    ]
+  };
 }
 
-function findTn5250Field(session: Tn5250Session, fieldId: string): Tn5250Field | undefined {
-  const normalized = String(fieldId || "").trim().toLowerCase();
-  if (!normalized) return undefined;
-  const aliases = normalized === "1" ? ["command", "1"] : [normalized];
-  return session.screen.fields.find(field => {
-    const id = field.id.toLowerCase();
-    return aliases.includes(id);
-  });
-}
-
-function parseTn5250Keys(value: string) {
-  const raw = String(value || "").trim();
-  if (!raw) throw new Error("keys is required");
-  return raw
-    .split(/[,\s+]+/)
-    .map(part => part.trim().toUpperCase())
-    .filter(Boolean);
-}
-
-function touchTn5250Session(session: Tn5250Session) {
-  session.screen.updatedAt = new Date().toISOString();
-  tn5250Sessions.set(session.connectionName, session);
-}
-
-function appendTn5250Message(session: Tn5250Session, message: string) {
-  session.screen.textLines.unshift(message);
-  if (session.screen.textLines.length > TN5250_MAX_LINES) {
-    session.screen.textLines = session.screen.textLines.slice(0, TN5250_MAX_LINES);
+async function describeWrittenMember(conn: any, args: any, previous?: MemberSnapshot) {
+  const identity = {
+    library: String(args.library).toUpperCase(),
+    sourceFile: String(args.sourceFile).toUpperCase(),
+    member: String(args.member).toUpperCase()
+  };
+  const base: Record<string, any> = {
+    status: "written",
+    identity,
+    modified: true,
+    ...(previous ? { previousVersion: previous.version, previousSha256: previous.sha256 } : {})
+  };
+  try {
+    // Read back what the host stored (record length and CCSID conversion may
+    // differ from what was sent) so the caller can chain the next edit.
+    const snapshot: MemberSnapshot = await conn.content.getMemberSnapshot(args.library, args.sourceFile, args.member, true);
+    return {
+      ...base,
+      version: snapshot.version,
+      sha256: snapshot.sha256,
+      lineCount: snapshot.lines.length,
+      observedAt: snapshot.observedAt
+    };
+  } catch (error: any) {
+    return { ...base, warnings: [`Write succeeded, but reading back the new version failed: ${error?.message || String(error)}`] };
   }
-  touchTn5250Session(session);
 }
 
-function resetTn5250Screen(session: Tn5250Session, message: string) {
-  const commandField = findTn5250Field(session, "command");
-  if (commandField) commandField.value = "";
-  session.screen.textLines = [message, `Connected to ${session.connectionName}.`];
-  session.screen.cursorFieldId = "command";
-  session.screen.lastKeys = [];
-  touchTn5250Session(session);
-}
+function formatMemberRead(snapshot: MemberSnapshot, args: any, limits?: SourceReadLimits) {
+  const envelope: Record<string, any> = {
+    status: "found",
+    identity: snapshot.identity,
+    metadata: snapshot.metadata,
+    version: snapshot.version,
+    sha256: snapshot.sha256,
+    observedAt: snapshot.observedAt,
+    ...(snapshot.validatedAt ? { validatedAt: snapshot.validatedAt } : {}),
+    complete: snapshot.complete,
+    transport: snapshot.transport,
+    cacheStatus: snapshot.cacheStatus,
+    lineCount: snapshot.lines.length,
+    warnings: snapshot.warnings
+  };
+  if (args?.metadataOnly) return envelope;
 
-function rotateTn5250Cursor(session: Tn5250Session) {
-  const fields = session.screen.fields;
-  if (fields.length === 0) return;
-  const idx = fields.findIndex(field => field.id === session.screen.cursorFieldId);
-  const next = idx >= 0 ? (idx + 1) % fields.length : 0;
-  session.screen.cursorFieldId = fields[next].id;
-  touchTn5250Session(session);
-}
-
-async function waitForTn5250Text(session: Tn5250Session, text: string, timeoutMs: number) {
-  const deadline = Date.now() + timeoutMs;
-  const needle = String(text).toLowerCase();
-  while (Date.now() <= deadline) {
-    const haystack = renderTn5250Screen(session.screen).toLowerCase();
-    if (haystack.includes(needle)) return true;
-    await new Promise(resolve => setTimeout(resolve, 200));
+  const selection = normalizeLineRanges(args, snapshot.lines.length);
+  if (!selection.requested) {
+    const size = limits ? exceedsSourceLimits(snapshot.content, snapshot.lines.length, limits) : undefined;
+    if (size) {
+      // Composite inspect read_ranges without ranges: never flood the caller.
+      return {
+        ...envelope,
+        contentOmitted: true,
+        ...size,
+        warnings: [...snapshot.warnings, "Member exceeds the full-read size limit; request ranges instead."]
+      };
+    }
+    return { ...envelope, content: snapshot.content };
   }
-  return false;
+  return {
+    ...envelope,
+    warnings: [...snapshot.warnings, ...selection.warnings],
+    ...(selection.truncated ? { truncated: true, nextLine: selection.nextLine } : {}),
+    ranges: selection.ranges.map(range => ({
+      start: range.start,
+      end: range.end,
+      lines: snapshot.lines.slice(range.start - 1, range.end).map((content, index) => ({
+        number: range.start + index,
+        content
+      }))
+    }))
+  };
 }
 
-function renderTn5250Screen(screen: Tn5250Screen) {
-  const lines: string[] = [];
-  lines.push(`${screen.title} (${screen.status})`);
-  lines.push(...screen.textLines);
-  for (const field of screen.fields) {
-    lines.push(`${field.label}[${field.id}]=${field.value}`);
+function normalizeLineRanges(args: any, lineCount: number) {
+  const before = clampInteger(args?.before, 0, 200, 0);
+  const after = clampInteger(args?.after, 0, 200, 0);
+  const requested: Array<{ start: number; end: number }> = [];
+  if (typeof args?.startLine !== "undefined" || typeof args?.endLine !== "undefined") {
+    const start = typeof args.startLine !== "undefined" ? Number(args.startLine) : 1;
+    // startLine without endLine reads to the end of the member.
+    const end = typeof args.endLine !== "undefined" ? Number(args.endLine) : Math.max(start, lineCount);
+    requested.push({ start, end });
   }
-  return lines.join("\n");
+  if (Array.isArray(args?.ranges)) {
+    for (const range of args.ranges.slice(0, 8)) requested.push({ start: Number(range.start), end: Number(range.end) });
+  }
+  const warnings: string[] = [];
+  if (requested.length === 0) return { requested: false, ranges: [], warnings, truncated: false };
+
+  const normalized: Array<{ start: number; end: number }> = [];
+  for (const range of requested) {
+    if (!Number.isFinite(range.start) || !Number.isFinite(range.end) || range.start < 1 || range.end < range.start) {
+      throw new Error(`Invalid line range ${range.start}-${range.end}`);
+    }
+    const start = Math.max(1, Math.floor(range.start) - before);
+    const end = Math.min(lineCount, Math.floor(range.end) + after);
+    if (start > lineCount || end < start) {
+      warnings.push(`Lines ${range.start}-${range.end} are past the end of the member (${lineCount} lines).`);
+      continue;
+    }
+    normalized.push({ start, end });
+  }
+  normalized.sort((a, b) => a.start - b.start || a.end - b.end);
+
+  const merged: Array<{ start: number; end: number }> = [];
+  for (const range of normalized) {
+    const previous = merged.at(-1);
+    if (previous && range.start <= previous.end + 1) previous.end = Math.max(previous.end, range.end);
+    else merged.push({ ...range });
+  }
+
+  // Cap the response instead of failing; nextLine says where to continue.
+  const limited: Array<{ start: number; end: number }> = [];
+  let remaining = MAX_RANGE_LINES;
+  let nextLine: number | undefined;
+  for (const range of merged) {
+    if (remaining <= 0) {
+      nextLine ??= range.start;
+      break;
+    }
+    const length = range.end - range.start + 1;
+    if (length > remaining) {
+      limited.push({ start: range.start, end: range.start + remaining - 1 });
+      nextLine = range.start + remaining;
+      remaining = 0;
+      continue;
+    }
+    limited.push(range);
+    remaining -= length;
+  }
+  if (nextLine !== undefined) {
+    warnings.push(`Response limited to ${MAX_RANGE_LINES} lines; continue from line ${nextLine}.`);
+  }
+  return { requested: true, ranges: limited, warnings, truncated: nextLine !== undefined, nextLine };
+}
+
+function normalizeSearchTerms(args: any) {
+  const terms = [
+    ...(typeof args?.term === "string" ? [args.term] : []),
+    ...(Array.isArray(args?.terms) ? args.terms : [])
+  ].map(value => String(value)).filter(value => value.length > 0);
+  const unique = [...new Set(terms)];
+  if (unique.length < 1 || unique.length > 20) throw new Error("Provide term or between 1 and 20 terms");
+  return unique;
+}
+
+function rankMemberCandidates(candidates: any[], preferredFiles?: string[]) {
+  if (!preferredFiles?.length) return;
+  const ranks = new Map(preferredFiles.map((value, index) => [String(value).toUpperCase(), index]));
+  candidates.sort((a, b) => (ranks.get(String(a.file).toUpperCase()) ?? Number.MAX_SAFE_INTEGER) -
+    (ranks.get(String(b.file).toUpperCase()) ?? Number.MAX_SAFE_INTEGER) || String(a.file).localeCompare(String(b.file)));
+}
+
+function inspectMemberOperation(snapshot: MemberSnapshot, operation: any, limits?: SourceReadLimits) {
+  switch (operation.operation) {
+    case "metadata":
+      return { operation: "metadata", metadata: snapshot.metadata };
+    case "read_ranges":
+      return { operation: "read_ranges", ...formatMemberRead(snapshot, { ranges: operation.ranges, before: operation.before, after: operation.after }, limits) };
+    case "search":
+      return { operation: "search", ...searchSnapshot(snapshot, operation) };
+    case "outline":
+      return { operation: "outline", language: sourceLanguageOf(snapshot), symbols: outlineSnapshot(snapshot) };
+    case "dependencies":
+      return { operation: "dependencies", language: sourceLanguageOf(snapshot), dependencies: dependenciesFromSnapshot(snapshot) };
+    default:
+      throw new Error(`Unsupported inspection operation: ${operation.operation}`);
+  }
+}
+
+function searchSnapshot(snapshot: MemberSnapshot, operation: any) {
+  const terms = normalizeSearchTerms({ term: operation.query, terms: operation.terms });
+  const before = clampInteger(operation.before, 0, 50, 0);
+  const after = clampInteger(operation.after, 0, 50, 0);
+  const maxMatches = clampInteger(operation.maxMatches, 1, 1_000, 100);
+  const lowered = terms.map(term => term.toLowerCase());
+  const matches: any[] = [];
+  for (let index = 0; index < snapshot.lines.length && matches.length < maxMatches; index++) {
+    const line = snapshot.lines[index];
+    const matchedTerms = terms.filter((_term, termIndex) => line.toLowerCase().includes(lowered[termIndex]));
+    if (matchedTerms.length === 0) continue;
+    const start = Math.max(0, index - before);
+    const end = Math.min(snapshot.lines.length - 1, index + after);
+    matches.push({
+      line: index + 1,
+      content: line,
+      matchedTerms,
+      context: snapshot.lines.slice(start, end + 1).map((content, contextIndex) => ({ number: start + contextIndex + 1, content }))
+    });
+  }
+  return { terms, matches, returned: matches.length, truncated: matches.length >= maxMatches };
+}
+
+function outlineSnapshot(snapshot: MemberSnapshot) {
+  return inspectSource(snapshot.lines, snapshot.metadata?.extension).symbols;
+}
+
+function dependenciesFromSnapshot(snapshot: MemberSnapshot) {
+  return inspectSource(snapshot.lines, snapshot.metadata?.extension).dependencies;
+}
+
+function sourceLanguageOf(snapshot: MemberSnapshot) {
+  return detectSourceLanguage(snapshot.metadata?.extension, snapshot.lines);
+}
+
+async function readSystemFacts(conn: any): Promise<{ release?: string; effectiveUser?: string; systemName?: string }> {
+  if (conn.__mcpSystemFacts) return conn.__mcpSystemFacts;
+  try {
+    const rows = await conn.runSQL(
+      "select OS_VERSION, OS_RELEASE, HOST_NAME, current_user as EFFECTIVE_USER " +
+      "from SYSIBMADM.ENV_SYS_INFO fetch first 1 row only"
+    );
+    const row = rows[0];
+    const version = String(row?.OS_VERSION || "").replace(/\D/g, "");
+    const release = String(row?.OS_RELEASE || "").replace(/\D/g, "");
+    const facts = {
+      ...(version && release ? { release: `${Number(version)}.${Number(release)}` } : {}),
+      ...(row?.EFFECTIVE_USER ? { effectiveUser: String(row.EFFECTIVE_USER).trim() } : {}),
+      ...(row?.HOST_NAME ? { systemName: String(row.HOST_NAME).trim() } : {})
+    };
+    conn.__mcpSystemFacts = facts;
+    return facts;
+  } catch {
+    // Older IBM i releases may not expose SYSIBMADM.ENV_SYS_INFO.
+  }
+  return {};
+}
+
+export function clampInteger(value: any, minimum: number, maximum: number, fallback: number) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(minimum, Math.min(maximum, Math.floor(parsed)));
 }
 
 function rejectCredentialArgs(args: any, toolName: string) {
@@ -3263,21 +3857,21 @@ function rejectCredentialArgs(args: any, toolName: string) {
   }
 }
 
-function result(text: string) {
+export function result(text: string) {
   return {
     content: [{ type: "text", text }],
     structuredContent: { ok: true, text }
   };
 }
 
-function json(obj: any) {
+export function json(obj: any) {
   return {
     content: [{ type: "text", text: JSON.stringify(obj, null, 2) }],
     structuredContent: { ok: true, data: obj }
   };
 }
 
-function toolError(message: string, error?: Record<string, any>) {
+export function toolError(message: string, error?: Record<string, any>) {
   return {
     isError: true,
     content: [{ type: "text", text: message }],
@@ -3291,13 +3885,187 @@ function toolError(message: string, error?: Record<string, any>) {
   };
 }
 
-function getConnectionName(ctx: McpContext, args: any): string {
+export function jsonError(message: string, obj: any) {
+  return {
+    isError: true,
+    content: [{ type: "text", text: `${message}\n${JSON.stringify(obj, null, 2)}` }],
+    structuredContent: {
+      ok: false,
+      data: obj,
+      error: { message }
+    }
+  };
+}
+
+// Returns the payload as normal JSON when the command worked and as a tool
+// error (isError) when it did not, so agents can't mistake a failure for "OK".
+export function commandOutcome(payload: { ok: boolean; command?: string; stderr?: unknown; [key: string]: unknown }) {
+  if (payload.ok) return json(payload);
+  const detail = String(payload.stderr || "").trim().split(/\r?\n/)[0] || "";
+  const label = payload.command ? `Command failed: ${payload.command}` : "Command failed";
+  return jsonError(detail ? `${label} (${detail})` : label, payload);
+}
+
+export function requireCommandSuccess(res: any, label: string) {
+  if (!res || res.code !== 0) {
+    const detail = String(res?.stderr || res?.stdout || "").trim();
+    throw new Error(`${label} failed (exit ${res?.code ?? "unknown"})${detail ? `: ${detail}` : ""}`);
+  }
+  return res;
+}
+
+const IFS_READ_DEFAULT_MAX_BYTES = 1024 * 1024;
+const IFS_READ_HARD_MAX_BYTES = 16 * 1024 * 1024;
+
+// Size of an IFS stream file from `ls -ldL`, or undefined when it can't be
+// determined (the download is then checked after the fact).
+export async function statIfsFileSize(conn: any, remotePath: string): Promise<number | undefined> {
+  try {
+    const res = await conn.sendCommand({ command: `ls -ldL ${Tools.escapePath(remotePath)}` });
+    if (!res || res.code !== 0) return undefined;
+    const parts = String(res.stdout || "").trim().split(/\s+/);
+    if (parts.length < 5 || parts[0].startsWith("d")) return undefined;
+    const size = Number(parts[4]);
+    return Number.isFinite(size) && size >= 0 ? size : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Decodes data as UTF-8 text, or returns undefined when it is binary (contains
+// NUL bytes or is not valid UTF-8).
+export function decodeUtf8Text(data: Buffer): string | undefined {
+  if (data.includes(0)) return undefined;
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(data);
+  } catch {
+    return undefined;
+  }
+}
+
+const SQL_TRAILING_ROW_CLAUSE = new RegExp(
+  "(?:fetch\\s+(?:first|next)\\s+(?:\\S+\\s+)?rows?\\s+only" +
+  "|for\\s+(?:read|fetch)\\s+only" +
+  "|for\\s+update(?:\\s+of\\s+[\\w\\s,\"]+)?" +
+  "|optimize\\s+for\\s+\\S+\\s+rows?" +
+  "|with\\s+(?:nc|ur|cs|rs|rr)(?:\\s+keep\\s+(?:update|exclusive|share)\\s+locks)?" +
+  "|limit\\s+\\S+(?:\\s+offset\\s+\\S+)?" +
+  "|offset\\s+\\S+\\s+rows?" +
+  "|skip\\s+locked\\s+data|use\\s+currently\\s+committed|wait\\s+for\\s+outcome)$"
+);
+
+// Adds FETCH FIRST n ROWS ONLY to a SELECT/WITH query so the row cap is applied
+// on the IBM i. Queries that already end with a row-limiting, locking or
+// isolation clause are left unchanged (the client-side slice still applies).
+function applySqlRowCap(sql: string, rowLimit: number): { sql: string; applied: boolean } {
+  const body = sql.replace(/[\s;]+$/, "");
+  const normalized = body
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n")
+    .map(line => line.replace(/--.*$/, ""))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (!/^(?:select|with)\b/.test(normalized)) return { sql, applied: false };
+  if (SQL_TRAILING_ROW_CLAUSE.test(normalized)) return { sql, applied: false };
+  return { sql: `${body}\nfetch first ${Math.max(1, Math.floor(rowLimit))} rows only`, applied: true };
+}
+
+function requireSpoolJobFilter(value: unknown) {
+  const raw = String(value || "").trim().toUpperCase();
+  return raw.includes("/") ? requireJobName(raw) : requireIbmObjectName(raw, "jobName");
+}
+
+export function requireObjectTypeValue(value: unknown, label: string) {
+  const objectType = String(value || "").trim().toUpperCase();
+  if (!/^\*[A-Z]{2,9}$/.test(objectType)) throw new Error(`Invalid ${label}: ${value}`);
+  return objectType;
+}
+
+// SNDMSG only sends *INFO and *INQ messages; *COMP and *DIAG need SNDPGMMSG.
+function buildSendMessageCommand(message: string, library: string, messageQueue: string, messageType: string) {
+  const queue = `${library}/${messageQueue}`;
+  switch (messageType) {
+    case "*INQ":
+      return `SNDMSG MSG(${quoteClString(message)}) TOMSGQ(${queue}) MSGTYPE(*INQ) RPYMSGQ(${queue})`;
+    case "*COMP":
+    case "*DIAG":
+      return `SNDPGMMSG MSG(${quoteClString(message)}) TOMSGQ(${queue}) MSGTYPE(${messageType})`;
+    default:
+      return `SNDMSG MSG(${quoteClString(message)}) TOMSGQ(${queue}) MSGTYPE(*INFO)`;
+  }
+}
+
+// CALL to the Send Data Queue (QSNDDTAQ) API with explicitly typed parameters:
+// queue name CHAR(10), library CHAR(10), data length DEC(5,0), data.
+function buildQsnddtaqCall(library: string, queue: string, message: string) {
+  if (/[^\x20-\x7E]/.test(message)) {
+    throw new Error("QSYS2.SEND_DATA_QUEUE is not available and the QSNDDTAQ fallback only supports printable single-byte text.");
+  }
+  if (message.length > 5000) {
+    throw new Error("QSYS2.SEND_DATA_QUEUE is not available and the QSNDDTAQ fallback is limited to 5000 characters.");
+  }
+  const length = message.length;
+  return `CALL PGM(QSYS/QSNDDTAQ) PARM((${quoteClString(queue)} (*CHAR 10)) (${quoteClString(library)} (*CHAR 10)) ` +
+    `(${length} (*DEC 5 0)) (${quoteClString(message)} (*CHAR ${length})))`;
+}
+
+// Formats CHGDTAARA for the data area's type: *DEC takes an unquoted number and
+// *LGL takes '0' or '1' (neither allows a substring); *CHAR keeps the
+// substring form so only the given positions change.
+function buildChangeDataAreaCommand(
+  library: string,
+  dataArea: string,
+  value: string,
+  info: { type?: string | null; length?: number | null; decimalPositions?: number | null } | undefined,
+  args: any
+) {
+  const target = `${library}/${dataArea}`;
+  const type = String(info?.type || "*CHAR").trim().toUpperCase();
+  const substringRequested = args?.startPosition !== undefined || args?.length !== undefined;
+  if (type === "*DEC") {
+    if (substringRequested) throw new Error("startPosition and length are only valid for *CHAR data areas");
+    const text = value.trim();
+    const match = text.match(/^([+-]?)(\d*)(?:\.(\d*))?$/);
+    if (!match || (match[2] === "" && !match[3])) throw new Error(`Value for *DEC data area must be numeric: ${value}`);
+    const intDigits = match[2].replace(/^0+(?=\d)/, "");
+    const fraction = match[3] || "";
+    const decimals = typeof info?.decimalPositions === "number" ? info.decimalPositions : undefined;
+    const totalDigits = typeof info?.length === "number" ? info.length : undefined;
+    if (decimals !== undefined && fraction.replace(/0+$/, "").length > decimals) {
+      throw new Error(`Value has more than ${decimals} decimal positions`);
+    }
+    if (totalDigits !== undefined && decimals !== undefined && intDigits.replace(/^0+/, "").length > totalDigits - decimals) {
+      throw new Error(`Value does not fit a *DEC ${totalDigits} ${decimals} data area`);
+    }
+    const formatted = `${match[1] === "-" ? "-" : ""}${intDigits || "0"}${fraction ? `.${fraction}` : ""}`;
+    return `CHGDTAARA DTAARA(${target}) VALUE(${formatted})`;
+  }
+  if (type === "*LGL") {
+    if (substringRequested) throw new Error("startPosition and length are only valid for *CHAR data areas");
+    const normalized = value.trim().toLowerCase();
+    const logical = ["1", "true", "*on", "on", "yes"].includes(normalized)
+      ? "1"
+      : ["0", "false", "*off", "off", "no"].includes(normalized) ? "0" : undefined;
+    if (!logical) throw new Error(`Value for *LGL data area must be 0 or 1: ${value}`);
+    return `CHGDTAARA DTAARA(${target}) VALUE('${logical}')`;
+  }
+  const startPosition = clampNumber(args?.startPosition, 1, 1, 2000);
+  const length = clampNumber(args?.length, Math.max(value.length, 1), 1, 2000);
+  if (typeof info?.length === "number" && info.length > 0 && startPosition + length - 1 > info.length) {
+    throw new Error(`Positions ${startPosition} to ${startPosition + length - 1} are outside the ${info.length}-character data area`);
+  }
+  return `CHGDTAARA DTAARA(${target} (${startPosition} ${length})) VALUE(${quoteClString(value)})`;
+}
+
+export function getConnectionName(ctx: McpContext, args: any): string {
   const name = args?.connectionName || ctx.activeName;
   if (!name) throw new Error("connectionName is required (no active connection)");
   return name;
 }
 
-function requireQsysName(conn: any, value: unknown, label: string) {
+export function requireQsysName(conn: any, value: unknown, label: string) {
   const raw = String(value || "").trim().toUpperCase();
   if (!raw) throw new Error(`${label} is required`);
   if (!conn.validQsysName(raw)) throw new Error(`Invalid ${label}: ${raw}`);
@@ -3341,7 +4109,7 @@ function requireMessageKey(value: unknown) {
   throw new Error(`Invalid messageKey: ${value}`);
 }
 
-async function updateConnectionSettings(ctx: McpContext, name: string, update: Record<string, any>) {
+export async function updateConnectionSettings(ctx: McpContext, name: string, update: Record<string, any>) {
   const conn = await ctx.store.getConnection(name);
   if (!conn) throw new Error(`Connection ${name} not found`);
   conn.settings = { ...(conn.settings || {}), ...stripUndefined(update) };
@@ -3354,19 +4122,48 @@ async function updateConnectionSettings(ctx: McpContext, name: string, update: R
   }
 }
 
-async function applyLibraryList(conn: any, libraryList?: string[], currentLibrary?: string) {
+/**
+ * applyToJob: puts the library list in effect now. A connected client applies
+ * its configured list (which the caller has just updated) to the persistent
+ * SQL job, or checks it for the per-call QZDFMDB2 and qsh jobs; libraries that
+ * do not exist are left out and reported in `warning` instead of failing.
+ */
+export async function applyLibraryList(conn: any, libraryList?: string[], currentLibrary?: string): Promise<{ warning?: string }> {
+  const names = [...(libraryList || []), ...(currentLibrary ? [currentLibrary] : [])].map(l => String(l).toUpperCase());
+  const invalid = names.find(l => !conn.validQsysName(l));
+  if (invalid) throw new Error(`Invalid library name: ${invalid}`);
+  if (typeof conn.applyConfiguredLibraryList === "function") {
+    const applied = await conn.applyConfiguredLibraryList();
+    return applied?.warning ? { warning: applied.warning } : {};
+  }
   if (libraryList && libraryList.length > 0) {
     const normalized = libraryList.map((l: string) => String(l).toUpperCase());
     const invalid = normalized.find((l: string) => !conn.validQsysName(l));
     if (invalid) throw new Error(`Invalid library name: ${invalid}`);
-    const libs = normalized.join(" ");
-    await conn.sendQsh({ command: `system \"CHGLIBL LIBL(${libs})\"` });
+    if (typeof conn.runCL === "function") {
+      // Runs in the persistent SQL job when there is one, so later SQL and CL see it.
+      requireCommandSuccess(await conn.runCL(`CHGLIBL LIBL(${normalized.join(" ")})`), "CHGLIBL");
+    } else {
+      // '$' is escaped so names like $LIB are not expanded by qsh.
+      const libs = normalized.join(" ").replace(/\$/g, "\\$");
+      requireCommandSuccess(await conn.sendQsh({ command: `system \"CHGLIBL LIBL(${libs})\"` }), "CHGLIBL");
+    }
   }
   if (currentLibrary) {
     const lib = String(currentLibrary).toUpperCase();
     if (!conn.validQsysName(lib)) throw new Error(`Invalid current library: ${lib}`);
-    await conn.sendQsh({ command: `system \"CHGCURLIB ${lib}\"` });
+    if (typeof conn.runCL === "function") {
+      requireCommandSuccess(await conn.runCL(`CHGCURLIB CURLIB(${lib})`), "CHGCURLIB");
+    } else {
+      requireCommandSuccess(await conn.sendQsh({ command: `system \"CHGCURLIB ${lib.replace(/\$/g, "\\$")}\"` }), "CHGCURLIB");
+    }
   }
+  return {};
+}
+
+/** "OK", plus the library list warning from applyToJob when there is one. */
+function okApplied(applied?: { warning?: string }, text = "OK") {
+  return result(applied?.warning ? `${text}. Warning: ${applied.warning}` : text);
 }
 
 function stripUndefined(obj: Record<string, any>) {
@@ -3386,12 +4183,15 @@ type DeployDiffEntry = {
   path: string;
   localSize?: number;
   remoteSize?: number;
-  reason: "size_mismatch" | "unknown_size";
+  localSha256?: string;
+  remoteSha256?: string;
+  reason: "size_mismatch" | "unknown_size" | "content_mismatch" | "hash_unavailable";
 };
 
 type DeployComparison = {
   localRoot: string;
   remoteRoot: string;
+  comparedBy?: "size" | "sha256";
   onlyLocal: string[];
   onlyRemote: string[];
   identical: string[];
@@ -3471,6 +4271,39 @@ async function compareDeployTrees(conn: any, localRoot: string, remoteRoot: stri
   };
 }
 
+/**
+ * Re-checks every file present on both sides by SHA-256, so files with equal
+ * size but different content count as changed and size-unknown files are
+ * resolved. Files whose remote hash can't be computed stay unresolved.
+ */
+async function refineComparisonByHash(conn: any, comparison: DeployComparison): Promise<DeployComparison> {
+  const sizeOf = new Map<string, DeployDiffEntry>();
+  for (const entry of [...comparison.changed, ...comparison.unresolved]) sizeOf.set(entry.path, entry);
+  const shared = [...comparison.identical, ...comparison.changed.map(e => e.path), ...comparison.unresolved.map(e => e.path)]
+    .sort((a, b) => a.localeCompare(b));
+  const remoteHashes = await sha256RemoteFiles(conn, comparison.remoteRoot, shared);
+  const identical: string[] = [];
+  const changed: DeployDiffEntry[] = [];
+  const unresolved: DeployDiffEntry[] = [];
+  for (const rel of shared) {
+    const sizes = sizeOf.get(rel);
+    const localSha256 = await sha256LocalFile(path.join(comparison.localRoot, rel));
+    const remoteSha256 = remoteHashes.get(rel);
+    const base = { path: rel, localSize: sizes?.localSize, remoteSize: sizes?.remoteSize, localSha256, remoteSha256 };
+    if (!remoteSha256) unresolved.push({ ...base, reason: "hash_unavailable" });
+    else if (remoteSha256 === localSha256) identical.push(rel);
+    else changed.push({ ...base, reason: "content_mismatch" });
+  }
+  return {
+    ...comparison,
+    comparedBy: "sha256",
+    identical,
+    changed,
+    unresolved,
+    summary: { ...comparison.summary, identical: identical.length, changed: changed.length, unresolved: unresolved.length }
+  };
+}
+
 async function listLocalFiles(root: string): Promise<Map<string, DeployFileMeta>> {
   const resolvedRoot = path.resolve(root);
   const results = new Map<string, DeployFileMeta>();
@@ -3495,6 +4328,10 @@ async function listRemoteFiles(conn: any, remoteRoot: string): Promise<Map<strin
   const normalizedRoot = remoteRoot.replace(/\/$/, "");
   const find = conn.remoteFeatures.find || "/QOpenSys/pkgs/bin/find";
   const stat = conn.remoteFeatures.stat;
+
+  // A remote root that does not exist yet is an empty tree (first deploy).
+  const exists = await conn.sendCommand({ command: `test -d ${Tools.escapePath(normalizedRoot)}` });
+  if (exists.code !== 0) return new Map<string, DeployFileMeta>();
 
   if (stat) {
     const statCmd = `${find} ${Tools.escapePath(normalizedRoot)} -type f -exec ${stat} -c '%n|%s' {} \\;`;
@@ -3548,7 +4385,7 @@ function joinRemotePath(root: string, rel: string) {
   return `${base}/${rel}`.replace(/\\/g, "/");
 }
 
-function mapActionExecution(action: Action, targetType: string, targetPath: string, result: any) {
+export function mapActionExecution(action: Action, targetType: string, targetPath: string, result: any) {
   const diagnostics = normalizeCommandDiagnostics(result);
   const code = Number(result?.code);
   const ok = Number.isFinite(code) ? code === 0 : false;
@@ -3614,32 +4451,59 @@ function normalizeJoblogRow(row: Record<string, unknown>) {
   };
 }
 
-function normalizeSpoolEntry(row: Record<string, unknown>) {
+export function normalizeSpoolEntry(row: Record<string, unknown>) {
   return {
     ...row,
     source: "spool",
-    jobName: toNullableString(pickFirst(row, ["JOB_NAME", "JOB"])) || "",
+    jobName: toNullableString(pickFirst(row, ["QUALIFIED_JOB_NAME", "JOB_NAME", "JOB"])) || "",
     spooledFileName: toNullableString(pickFirst(row, ["SPOOLED_FILE_NAME", "SPOOLED_FILE", "SPLF_NAME"])) || "",
     spooledFileNumber: toNullableNumber(pickFirst(row, ["SPOOLED_FILE_NUMBER", "SPLF_NUMBER", "FILE_NUMBER"])),
     outputQueue: toNullableString(pickFirst(row, ["OUTPUT_QUEUE_NAME", "OUTQ_NAME", "OUTPUT_QUEUE"])) || "",
+    outputQueueLibrary: toNullableString(pickFirst(row, ["OUTPUT_QUEUE_LIBRARY_NAME", "OUTPUT_QUEUE_LIBRARY"])) || "",
+    userName: toNullableString(pickFirst(row, ["USER_NAME", "JOB_USER"])) || "",
+    createdAt: toNullableString(pickFirst(row, ["CREATE_TIMESTAMP", "CREATION_TIMESTAMP"])),
     totalPages: toNullableNumber(pickFirst(row, ["TOTAL_PAGES", "PAGES"])),
     status: toNullableString(pickFirst(row, ["FILE_STATUS", "STATUS"])) || ""
   };
 }
 
-function normalizeSpoolLine(row: Record<string, unknown>) {
+export function normalizeSpoolLine(row: Record<string, unknown>) {
+  const position = pickFirst(row, ["ORDINAL_POSITION", "LINE_NUMBER"]);
   return {
     ...row,
     source: "spool",
-    lineNumber: Number.isFinite(Number(row.LINE_NUMBER)) ? Number(row.LINE_NUMBER) : null,
-    text: String(row.SPOOLED_DATA || "")
+    lineNumber: Number.isFinite(Number(position)) && position !== null && position !== "" ? Number(position) : null,
+    text: String(row.SPOOLED_DATA ?? "")
   };
 }
 
-function clampNumber(value: unknown, fallback: number, min: number, max: number) {
+export function clampNumber(value: unknown, fallback: number, min: number, max: number) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+/**
+ * Runs SQL with a time limit. When the limit is reached the call fails and the
+ * signal asks the client to cancel the statement in its persistent SQL job, so
+ * it does not keep running on the IBM i.
+ */
+async function runSqlWithTimeout(conn: any, sql: string, timeoutMs: number, timeoutMessage: string): Promise<any[]> {
+  const controller = new AbortController();
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      conn.runSQL(sql, { signal: controller.signal }),
+      new Promise<any[]>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          controller.abort();
+          reject(new Error(timeoutMessage));
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
@@ -3657,14 +4521,7 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMes
 }
 
 function getSqlStatementType(sql: string) {
-  const stripped = sql
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .split("\n")
-    .filter(line => !line.trim().startsWith("--"))
-    .join(" ")
-    .trim();
-  const token = stripped.split(/\s+/)[0] || "UNKNOWN";
-  return token.toUpperCase();
+  return parseSqlStatementType(sql);
 }
 
 function getRowColumns(rows: any[]) {
@@ -3673,6 +4530,9 @@ function getRowColumns(rows: any[]) {
 }
 
 function inferAffectedRows(rows: any[]) {
+  // The persistent SQL job reports the update count of INSERT/UPDATE/DELETE.
+  const updateCount = (rows as any)?.updateCount;
+  if (typeof updateCount === "number" && Number.isFinite(updateCount)) return updateCount;
   if (!Array.isArray(rows) || rows.length === 0) return null;
   const candidateKeys = [
     "ROWS_AFFECTED",
@@ -3714,32 +4574,109 @@ function toSafeSqlError(err: any, sql: string, timeoutMs: number) {
 }
 
 function isReadOnlySql(sql: string) {
-  const stripped = sql
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .split("\n")
-    .filter(line => !line.trim().startsWith("--"))
-    .join(" ")
-    .trim()
-    .toLowerCase();
-  return stripped.startsWith("select ") || stripped.startsWith("with ") || stripped.startsWith("values ");
+  return checkReadOnlySql(sql).readOnly;
 }
 
-function enforceWritable(ctx: McpContext, conn: any, operation: string, args: any) {
+export async function enforceWritable(ctx: McpContext, conn: any, operation: string, args: any) {
   if (conn.getConfig().readOnlyMode) throw new Error("Connection is in read-only mode");
-  enforcePolicyOperation(ctx, operation, args);
+  await enforcePolicyOperation(ctx, operation, args);
 }
 
-function enforcePolicyOperation(ctx: McpContext, operation: string, args: any) {
+async function enforcePolicyOperation(ctx: McpContext, operation: string, args: any) {
   const policy = ctx.getPolicy(args?.connectionName);
   if (policy.profile === "read-only") {
     throw new Error(`Blocked by policy (${policy.profile}): ${operation}`);
   }
-  if (isDeniedByPolicy(policy, operation, args)) {
-    throw new Error(`Blocked by policy: ${operation}`);
+  const deniedReason = isDeniedByPolicy(policy, operation, args);
+  if (deniedReason) {
+    throw new Error(`Blocked by policy: ${operation} (${deniedReason})`);
   }
-  if (requiresApproval(policy, operation) && !Boolean(args?.approve)) {
-    throw new Error(`Operation '${operation}' requires approve=true under '${policy.profile}' policy.`);
+  if (policy.profile !== "guarded") return;
+  // Shell text can do anything the profile can, so under guarded it always
+  // needs the person's say, whatever requireApprovalFor lists.
+  if (isShellOperation(args)) {
+    await requireConfirmation(ctx, policy, "shell.run", args, false);
+  } else if (requiresApproval(policy, operation)) {
+    await requireConfirmation(ctx, policy, operation, args, operation !== "ifs.delete");
   }
+}
+
+/**
+ * Get the person's approval for a guarded operation. With approvalMode
+ * "prompt" (the default) the MCP client asks them; the agent's approve flag
+ * counts for nothing. With "agent", approve=true is enough.
+ */
+export async function requireConfirmation(
+  ctx: McpContext,
+  policy: ConnectionPolicy,
+  operation: string,
+  args: any,
+  allowSession: boolean
+) {
+  if (policy.approvalMode === "agent") {
+    if (!Boolean(args?.approve)) {
+      throw new Error(`Operation '${operation}' requires approve=true under '${policy.profile}' policy.`);
+    }
+    return;
+  }
+  const connectionName = String(args?.connectionName || ctx.activeName || "");
+  const sessionKey = `${connectionName}\u0000${operation}`;
+  if (allowSession && ctx.sessionApprovals?.has(sessionKey)) return;
+
+  const unsupported = new Error(
+    `Operation '${operation}' needs the user's confirmation, but this MCP client cannot show confirmation prompts. ` +
+    "Ask the user to run it from a client that supports MCP elicitation, or to set this connection's approval mode " +
+    "to \"agent\" in config.json (approve=true is then accepted)."
+  );
+  if (!ctx.confirm) throw unsupported;
+  const answer = await ctx.confirm({
+    operation,
+    connectionName,
+    toolName: toolCallStore.getStore()?.toolName,
+    details: describeOperation(args),
+    allowSession
+  });
+  if (answer === "unsupported") throw unsupported;
+  if (!answer.allowed) {
+    throw new Error(`Operation '${operation}' was not confirmed by the user, so it did not run.`);
+  }
+  if (allowSession && answer.forSession) ctx.sessionApprovals?.add(sessionKey);
+}
+
+/**
+ * Approval for operations that always need it, whatever requireApprovalFor
+ * lists: under guarded the person is asked (no session allowance); other
+ * profiles keep the agent's approve=true.
+ */
+export async function requireDangerousApproval(ctx: McpContext, operation: string, args: any, approveMessage: string) {
+  const policy = ctx.getPolicy(args?.connectionName);
+  if (policy.profile === "guarded") {
+    await requireConfirmation(ctx, policy, operation, args, false);
+    return;
+  }
+  if (!Boolean(args?.approve)) throw new Error(approveMessage);
+}
+
+const DESCRIBED_ARG_KEYS = [
+  "command", "environment", "cwd", "sql",
+  "library", "file", "sourceFile", "member", "object", "type", "objectType", "name", "newName",
+  "path", "remotePath", "remoteDirectory", "targetPath", "localPath", "recursive", "confirmPath",
+  "deleteExtraRemote", "libraryList", "currentLibrary", "remove",
+  "confirmName", "journalLibrary", "journal", "retentionDays", "maxDeletes", "before"
+];
+
+/** Short plain-text lines describing the arguments that decide what runs. */
+export function describeOperation(args: any): string[] {
+  const lines: string[] = [];
+  if (!args || typeof args !== "object") return lines;
+  for (const key of DESCRIBED_ARG_KEYS) {
+    const value = args[key];
+    if (value === undefined || value === null || value === "") continue;
+    let text = typeof value === "string" ? value : JSON.stringify(value);
+    if (text.length > 600) text = `${text.substring(0, 600)}... (${text.length} characters)`;
+    lines.push(`${key}: ${text}`);
+  }
+  return lines;
 }
 
 function isMissingColumnError(err: any, column: string) {
@@ -3747,7 +4684,7 @@ function isMissingColumnError(err: any, column: string) {
   return message.includes("42703") && message.includes(column.toUpperCase());
 }
 
-function requireIfsPath(value: unknown, label: string) {
+export function requireIfsPath(value: unknown, label: string) {
   const pathValue = String(value || "").trim();
   if (!pathValue.startsWith("/")) {
     throw new Error(`Invalid ${label}: must be an absolute IFS path`);
@@ -3766,11 +4703,11 @@ function requireIfsJournalObjectType(value: unknown) {
   return objectType;
 }
 
-function quoteClString(value: string) {
+export function quoteClString(value: string) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
-function requireIbmObjectName(value: unknown, label: string) {
+export function requireIbmObjectName(value: unknown, label: string) {
   const name = String(value || "").trim().toUpperCase();
   if (!/^[A-Z#@$][A-Z0-9#@$]{0,9}$/.test(name)) {
     throw new Error(`Invalid ${label}: ${value}`);
@@ -3951,13 +4888,58 @@ function requiresApproval(policy: ConnectionPolicy, operation: string) {
   return requires.includes(operation);
 }
 
-function isDeniedByPolicy(policy: ConnectionPolicy, operation: string, args: any) {
-  const denyCommands = (policy.denyCommands || []).map(v => v.toLowerCase());
+/** Returns the reason an operation is denied by the command policy, if any. */
+function isDeniedByPolicy(policy: ConnectionPolicy, operation: string, args: any): string | undefined {
   if (operation === "cl.run" && args?.command) {
-    const command = String(args.command).toLowerCase();
-    if (denyCommands.some(prefix => command.startsWith(prefix))) return true;
+    const environment = String(args.environment || "ile");
+    return environment === "ile"
+      ? checkClCommand(policy, String(args.command))
+      : checkShellCommand(policy, String(args.command));
   }
-  return false;
+  if (typeof args?.sql === "string") {
+    return checkSqlEmbeddedCl(policy, args.sql);
+  }
+  return undefined;
+}
+
+/** Library, IFS path and embedded-CL policy checks that apply to every tool. */
+async function enforceResourcePolicy(ctx: McpContext, toolName: string, args: any) {
+  const resolver = ctx as Partial<McpContext>;
+  const policy = typeof resolver.resolvePolicy === "function"
+    ? await resolver.resolvePolicy(args?.connectionName)
+    : typeof resolver.getPolicy === "function" ? resolver.getPolicy(args?.connectionName) : undefined;
+  if (!policy) return;
+  const reason = checkResourcePolicy(policy, toolName, args);
+  if (reason) {
+    throw new Error(`Blocked by policy: ${toolName} (${reason})`);
+  }
+}
+
+/** Check the policy against an action's expanded command before it runs. */
+export function actionCommandGuard(ctx: McpContext, environment: string | undefined, args: any) {
+  return async (expanded: string) => {
+    const policy = ctx.getPolicy(args?.connectionName);
+    const env = environment || "ile";
+    const reason = env === "ile"
+      ? checkClCommands(policy, expanded)
+      : checkShellCommand(policy, expanded);
+    if (reason) throw new Error(`Blocked by policy: actions.run (${reason})`);
+    if (policy.profile === "guarded" && (env !== "ile" || clStartsShell(expanded))) {
+      await requireConfirmation(ctx, policy, "shell.run", { ...args, command: expanded, environment: env }, false);
+    }
+    return expanded;
+  };
+}
+
+/** Resolve a local path and refuse it outside the allowed local roots. */
+export async function guardLocalPath(ctx: McpContext, value: unknown, mode: LocalPathMode) {
+  let settingsRoots: unknown;
+  try {
+    settingsRoots = ((await ctx.store.getSettings()) as any)?.allowedLocalRoots;
+  } catch {
+    settingsRoots = undefined;
+  }
+  return resolveAllowedLocalPath(value, mode, configuredLocalRoots(settingsRoots));
 }
 
 const APPROVAL_HINT_TOOLS = new Set([
@@ -4014,8 +4996,29 @@ function withGuardedApprovalHint(tool: any) {
   if (!schema.properties.approve) {
     schema.properties.approve = {
       type: "boolean",
-      description: "Set true to approve guarded-policy operations."
+      description: "Only used when the connection's approvalMode is \"agent\". By default the user is asked to confirm guarded operations and this flag is ignored."
     };
+  }
+  return { ...tool, inputSchema: schema };
+}
+
+/** Tools outside the qsys/search/source families that also accept connectionName. */
+const CONNECTION_NAME_TOOLS = new Set([
+  "ibmi.find.ifs",
+  "ibmi.actions.run",
+  "ibmi.libl.validate",
+  "ibmi.resolve.path",
+  "ibmi.debug.status",
+  "ibmi.journal.objects.list"
+]);
+
+function withSourceConnectionName(tool: any) {
+  const accepts = /^ibmi\.(?:qsys|search|source|ifs|deploy)\./.test(tool.name) || CONNECTION_NAME_TOOLS.has(tool.name);
+  if (!accepts) return tool;
+  const schema = tool.inputSchema || { type: "object", properties: {} };
+  if (!schema.properties) schema.properties = {};
+  if (!schema.properties.connectionName) {
+    schema.properties.connectionName = { type: "string", description: "Saved IBM i connection name." };
   }
   return { ...tool, inputSchema: schema };
 }
@@ -4049,33 +5052,10 @@ function isObjectSchema(schema: JsonSchema) {
   return schema.type === "object";
 }
 
-function resolveIfsWriteOperation(pathValue: unknown): string {
+export function resolveIfsWriteOperation(pathValue: unknown): string {
   const target = String(pathValue || "");
   if (/^\/qsys\.lib\//i.test(target)) {
     return "qsys.write";
   }
   return "ifs.write";
 }
-
-function parseEvfevent(content: string) {
-  const diagnostics: Array<{ source: string; line?: number; column?: number; code?: string; severity: "INFO" | "WARN" | "ERROR"; message: string }> = [];
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.trimEnd();
-    if (!line.trim()) continue;
-    const match = line.match(/^\s*(\d+)\s+(\d+)\s+([A-Z0-9]+)\s+(INFO|WARN|ERROR)?\s*(.*)$/i);
-    if (match) {
-      diagnostics.push({
-        source: "evfevent",
-        line: Number(match[1]),
-        column: Number(match[2]),
-        code: match[3],
-        severity: ((match[4] || "ERROR").toUpperCase() as "INFO" | "WARN" | "ERROR"),
-        message: match[5] || line
-      });
-    } else {
-      diagnostics.push({ source: "evfevent", severity: inferSeverity(line), message: line });
-    }
-  }
-  return diagnostics;
-}
-

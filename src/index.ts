@@ -4,13 +4,23 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ListResourcesRequestSchema,
+  ListToolsRequestSchema,
+  ReadResourceRequestSchema
+} from "@modelcontextprotocol/sdk/types.js";
 import { getTools, handleTool } from "./mcp/tools.js";
 import { McpContext } from "./mcp/context.js";
+import { createElicitationConfirm } from "./mcp/confirm.js";
 import { log } from "./mcp/logger.js";
+import { redactSecrets, redactSecretsInText } from "./security/redact.js";
 import { validateToolInput } from "./mcp/validation.js";
 import { appendAuditRecord } from "./mcp/audit.js";
+import { redactModuleArgs } from "./mcp/modules/index.js";
 import { runControlCommand } from "./controlplane/commands.js";
+import { ibmDocs } from "./ibmi/IbmDocs.js";
 
 const argv = process.argv.slice(2);
 const firstArg = (argv[0] || "").toLowerCase();
@@ -36,10 +46,11 @@ if (firstArg === "--help" || firstArg === "-h" || firstArg === "help") {
 
 const server = new Server(
   { name: "mcp-for-i", version: packageVersion },
-  { capabilities: { tools: {} } }
+  { capabilities: { tools: {}, resources: {} } }
 );
 
 const ctx = new McpContext();
+ctx.confirm = createElicitationConfirm(server);
 const tools = getTools();
 const toolMap = new Map(tools.map(tool => [tool.name, tool]));
 
@@ -47,10 +58,45 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools
 }));
 
+server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+  resources: [
+    {
+      uri: "ibmi-docs://catalog",
+      name: "IBM i documentation catalog",
+      description: "Release-aware allowlist of official IBM i documentation available through mcp-for-i.",
+      mimeType: "application/json"
+    },
+    ...ibmDocs.listResources()
+  ]
+}));
+
+server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+  resourceTemplates: [{
+    uriTemplate: "ibmi-docs://topic/{ref}",
+    name: "Official IBM i documentation topic",
+    description: "Open a versioned official IBM i documentation topic using a ref from ibmi.docs.search.",
+    mimeType: "text/markdown"
+  }]
+}));
+
+server.setRequestHandler(ReadResourceRequestSchema, async request => {
+  const uri = request.params.uri;
+  const text = await ibmDocs.readResource(uri);
+  return {
+    contents: [{
+      uri,
+      mimeType: uri === "ibmi-docs://catalog" ? "application/json" : "text/markdown",
+      text
+    }]
+  };
+});
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   const correlationId = crypto.randomUUID();
   const startedAt = Date.now();
+  // Computed before the call: module redaction depends on the state the call starts from.
+  let redactedArgs: unknown;
   try {
     const toolDef = toolMap.get(name);
     if (!toolDef) throw new Error(`Unknown tool: ${name}`);
@@ -58,7 +104,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (errors.length > 0) {
       throw new Error(`Invalid arguments: ${errors.join("; ")}`);
     }
-    const redactedArgs = redactSensitive(args || {});
+    redactedArgs = redactSensitive(redactModuleArgs(ctx, name, args || {}));
     log("info", "tool.call", { name, correlationId, args: redactedArgs });
     const result = await handleTool(ctx, name, args || {});
     const durationMs = Date.now() - startedAt;
@@ -81,12 +127,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     await safeAppendAudit({
       tool: name,
       status: "error",
-      args: redactSensitive(args || {}),
+      args: redactedArgs ?? redactSensitive(redactModuleArgs(ctx, name, args || {})),
       connectionName: resolveConnectionName(name, args || {}, ctx.activeName),
       approve: Boolean(args && typeof args === "object" && (args as any).approve),
       durationMs,
       correlationId,
-      error: errorMessage
+      error: redactSecretsInText(errorMessage)
     });
     return {
       isError: true,
@@ -99,22 +145,7 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 
 function redactSensitive(input: unknown): unknown {
-  const secrets = new Set(["password", "passphrase", "secret", "token", "apikey", "apiKey", "authorization"]);
-  if (Array.isArray(input)) {
-    return input.map(redactSensitive);
-  }
-  if (typeof input === "object" && input !== null) {
-    const out: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
-      if (secrets.has(key)) {
-        out[key] = "***REDACTED***";
-      } else {
-        out[key] = redactSensitive(value);
-      }
-    }
-    return out;
-  }
-  return input;
+  return redactSecrets(input);
 }
 
 function summarizeResult(result: any) {
