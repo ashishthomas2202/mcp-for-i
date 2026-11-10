@@ -32,26 +32,36 @@ export function renderLivePage() {
   main { padding: 16px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
   #wrap { position: relative; outline: none; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: #000; max-width: 100%; overflow-x: auto; }
   #wrap:focus { border-color: var(--accent); }
-  #screen { position: relative; font: 16px/1.25 "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace; white-space: pre; user-select: none; }
-  .row { height: 1.25em; position: relative; z-index: 1; }
-  .row span { cursor: text; }
+  #screen { position: relative; font: 16px/1.25 "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace; white-space: pre; -webkit-user-select: text; user-select: text; }
+  .row { height: 1.25em; }
+  /* Cells are inline-block so reverse-video blocks fill the whole line height: no black gaps between rows. */
+  .row span { cursor: text; display: inline-block; height: 1.25em; line-height: 1.25em; vertical-align: top; }
   .c-green { color: var(--green); } .c-white { color: var(--white); } .c-red { color: var(--red); }
   .c-turquoise { color: var(--turquoise); } .c-yellow { color: var(--yellow); } .c-pink { color: var(--pink); } .c-blue { color: var(--blue); }
   .rev { background: currentColor; }
   .rev > i { color: #000; font-style: normal; }
   .ul { text-decoration: underline; }
-  /* Block cursor (overwrite): a white box that inverts the character under it, like a real 5250. */
-  #cursor { position: absolute; width: 1ch; height: 1.25em; background: #ffffff; mix-blend-mode: difference; pointer-events: none; z-index: 3; animation: blink 1.06s steps(1, start) infinite; }
-  /* Underline cursor (insert mode). */
-  #cursor.insert { height: 2px; margin-top: calc(1.25em - 2px); background: var(--accent); mix-blend-mode: normal; }
-  @keyframes blink { 50% { opacity: 0; } }
+  /* Underline cursor (overwrite mode): a blinking bar under the character, like ACS. */
+  #cursor { position: absolute; width: 1ch; height: 3px; margin-top: calc(1.25em - 3px); background: var(--accent); pointer-events: none; z-index: 3; box-shadow: 0 0 2px var(--accent); }
+  /* Block cursor (insert mode): inverts the character under it. */
+  #cursor.insert { height: 1.25em; margin-top: 0; background: #ffffff; mix-blend-mode: difference; box-shadow: none; }
+  #cursor.blink-off { opacity: 0; }
   #status { display: flex; gap: 14px; flex-wrap: wrap; width: 100%; max-width: 1100px; color: var(--muted); font-size: 12px; justify-content: center; }
   #status .on { color: var(--warn); }
   #error { color: var(--red); min-height: 1.2em; font-size: 12px; text-align: center; }
   #keys { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; max-width: 1100px; }
   #keys button { min-width: 44px; font-size: 12px; }
+  #keys button.pulse { border-color: var(--warn); color: var(--warn); animation: pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 50% { background: #3a2e14; } }
   .hint { color: var(--muted); font-size: 12px; text-align: center; max-width: 900px; }
   .closed { opacity: .5; }
+  /* Always-visible notice and state chip, so a blocked keyboard is clear even in screen-only mode. */
+  #toast { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); z-index: 20; max-width: 92%; padding: 7px 14px; border-radius: 8px; font-size: 13px; display: none; }
+  #toast.show { display: block; }
+  #toast.err { background: #2a1414; color: #ffdede; border: 1px solid var(--red); }
+  #toast.info { background: #122019; color: #d7f5e2; border: 1px solid var(--accent); }
+  #state-chip { position: fixed; top: 8px; left: 8px; z-index: 12; padding: 3px 10px; border-radius: 999px; font-size: 12px; background: #2a1e0a; color: var(--warn); border: 1px solid var(--warn); display: none; }
+  #state-chip.show { display: block; }
   /* Configurable chrome: hide parts of the UI via URL params or the toggle. */
   body.hide-header header { display: none; }
   body.hide-keys #keys { display: none; }
@@ -66,6 +76,8 @@ export function renderLivePage() {
 </head>
 <body>
 <button id="display-toggle" title="Show or hide the toolbar, keys and help (screen-only mode)">Display</button>
+<div id="state-chip" aria-live="polite"></div>
+<div id="toast" role="status"></div>
 <header>
   <h1>Live 5250</h1>
   <select id="session" aria-label="Session"></select>
@@ -79,7 +91,7 @@ export function renderLivePage() {
   <div id="status"></div>
   <div id="error" role="status"></div>
   <div id="keys"></div>
-  <p class="hint">Click the screen and type. Enter, F1-F12 (Shift for F13-F24), Tab, arrows, Home, End, Insert, Delete, Page Up/Down work as in an emulator. Esc is Attn, Shift+Esc is SysReq, the Ctrl key on its own is Reset, keypad + and - are Field+ and Field-. Click moves the cursor, a click on a key legend such as F3=Exit presses it, a double click presses Enter. While you type, the agent waits.</p>
+  <p class="hint">Click an underlined field and type. The arrows move the cursor; <b>Page Up / Page Down (or the mouse wheel) scroll</b> the screen. Enter, F1-F12 (Shift for F13-F24), Tab, Home, End, Insert, Delete work as in an emulator. Esc is Attn, Shift+Esc is SysReq, the Ctrl key on its own is Reset, keypad + and - are Field+ and Field-. A click moves the cursor (a click on a key legend such as F3=Exit presses it), a double click presses Enter, and you can drag to select text to copy. While you type, the agent waits.</p>
 </main>
 <script>
 (function () {
@@ -94,11 +106,35 @@ export function renderLivePage() {
   var actorEl = document.getElementById('actor');
   var connEl = document.getElementById('conn');
   var sessionEl = document.getElementById('session');
+  var toastEl = document.getElementById('toast');
+  var stateChip = document.getElementById('state-chip');
+  var resetBtn = null;
   var source = null;
   var last = null;
   var pending = '';
   var flushTimer = null;
   var queue = Promise.resolve();
+
+  // Blink the cursor from JS so it works regardless of CSS animation support.
+  setInterval(function () { if (cursorEl) cursorEl.classList.toggle('blink-off'); }, 520);
+
+  var toastTimer = null;
+  function showToast(msg, kind) {
+    if (!msg) { toastEl.className = ''; return; }
+    toastEl.textContent = msg;
+    toastEl.className = 'show ' + (kind || 'err');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toastEl.className = ''; }, 4500);
+  }
+  // Turn a raw host/server error into something a person can act on.
+  function friendlyError(e) {
+    e = e || 'Something went wrong';
+    if (/not in an input field/i.test(e)) return 'The cursor is not in an input field. Click an underlined field, then type.';
+    if (/keyboard is locked/i.test(e)) return 'The host is still working (X System). Wait a moment, then try again.';
+    if (/input is inhibited|RESET key/i.test(e)) return 'Input is blocked by a host message. Press Reset (the Ctrl key, or the Reset button).';
+    if (/read-only/i.test(e)) return 'This connection is read-only, so keys sent to the host are blocked.';
+    return e;
+  }
 
   // Configurable chrome. URL params set the initial look; the Display button
   // and localStorage remember a per-browser preference after that.
@@ -149,12 +185,15 @@ export function renderLivePage() {
 
   function api(path) { return path + (path.indexOf('?') >= 0 ? '&' : '?') + 't=' + encodeURIComponent(token) + '&s=' + encodeURIComponent(current); }
 
-  function send(input) {
+  function send(input, quiet) {
     queue = queue.then(function () {
       return fetch(api('/api/input'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) })
         .then(function (r) { return r.json(); })
-        .then(function (res) { errorEl.textContent = res.ok ? (res.note || '') : res.error; })
-        .catch(function (err) { errorEl.textContent = String(err); });
+        .then(function (res) {
+          if (res.ok) { errorEl.textContent = res.note || ''; if (res.note) showToast(res.note, 'info'); }
+          else if (!quiet) { var m = friendlyError(res.error); errorEl.textContent = m; showToast(m, 'err'); }
+        })
+        .catch(function (err) { if (!quiet) { errorEl.textContent = String(err); showToast(String(err), 'err'); } });
     });
     return queue;
   }
@@ -164,7 +203,7 @@ export function renderLivePage() {
     var text = pending; pending = '';
     send({ text: text });
   }
-  function key(name) { flushText(); send({ keys: name }); }
+  function key(name, quiet) { flushText(); send({ keys: name }, quiet); }
 
   function render(view) {
     if (!view || view.missing) {
@@ -194,8 +233,14 @@ export function renderLivePage() {
     screenEl.appendChild(frag);
     cursorEl.style.left = (view.cursor.col - 1) + 'ch';
     cursorEl.style.top = ((view.cursor.row - 1) * 1.25) + 'em';
-    cursorEl.className = view.insertMode ? 'insert' : '';
+    cursorEl.className = (view.insertMode ? 'insert' : '') + (cursorEl.classList.contains('blink-off') ? ' blink-off' : '');
     screenEl.classList.toggle('closed', !view.connected);
+    // A blocked keyboard is shown even when the toolbar is hidden.
+    var blocked = view.inputInhibited ? 'Input blocked — press Reset (Ctrl, or the Reset button)'
+      : (view.keyboardLocked ? 'Host busy — X System' : '');
+    stateChip.textContent = blocked;
+    stateChip.classList.toggle('show', !!blocked);
+    if (resetBtn) resetBtn.classList.toggle('pulse', !!view.inputInhibited);
     var parts = [];
     parts.push(view.connected ? 'Connected to ' + view.host : 'Disconnected' + (view.closeReason ? ': ' + view.closeReason : ''));
     parts.push('Row ' + view.cursor.row + ', column ' + view.cursor.col);
@@ -246,12 +291,24 @@ export function renderLivePage() {
     return { row: Number(target.dataset.row), col: Number(target.dataset.col) + offset };
   }
   screenEl.addEventListener('click', function (ev) {
+    // If the person selected text (to copy), don't move the cursor.
+    if (window.getSelection && String(window.getSelection()).replace(/\s+/g, '').length) return;
     wrap.focus();
     var cell = cellFrom(ev);
     if (!cell) return;
     if (clickTimer) clearTimeout(clickTimer);
     clickTimer = setTimeout(function () { clickTimer = null; flushText(); send({ click: cell }); }, 260);
   });
+  // Mouse wheel scrolls (rolls) the screen, like dragging a scroll bar.
+  var lastWheel = 0;
+  wrap.addEventListener('wheel', function (ev) {
+    if (!last || !last.connected || last.keyboardLocked || last.inputInhibited) return;
+    ev.preventDefault();
+    var now = Date.now();
+    if (now - lastWheel < 350) return;
+    lastWheel = now;
+    key(ev.deltaY > 0 ? 'PageDown' : 'PageUp', true);
+  }, { passive: false });
   screenEl.addEventListener('dblclick', function (ev) {
     var cell = cellFrom(ev);
     if (clickTimer) { clearTimeout(clickTimer); clickTimer = null; }
@@ -309,6 +366,7 @@ export function renderLivePage() {
       var b = document.createElement('button');
       b.textContent = name;
       b.addEventListener('click', function () { key(name); wrap.focus(); });
+      if (name === 'Reset') resetBtn = b;
       keysEl.appendChild(b);
     });
 
