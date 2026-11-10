@@ -100,7 +100,9 @@ const SETTINGS_SCHEMA: JsonSchema = {
     tn5250Port: { type: "number", description: "TN5250 telnet port (default 23, or 992 when tn5250Tls is true)." },
     tn5250Tls: { type: "boolean", description: "Use TLS for TN5250 sessions (default true when the port is 992)." },
     tn5250DeviceName: { type: "string", description: "Virtual device name requested for TN5250 sessions." },
-    tn5250Ccsid: { type: "number", description: "Single-byte EBCDIC code page for TN5250 screen text (default 37)." }
+    tn5250Ccsid: { type: "number", description: "Single-byte EBCDIC code page for TN5250 screen text (default 37)." },
+    tn5250LiveView: { type: "boolean", description: "Serve the live 5250 view on localhost (default true)." },
+    tn5250LiveViewPort: { type: "number", description: "Preferred port for the live 5250 view (default 3981; another free port if taken, 0 for any)." }
   }
 };
 
@@ -4581,6 +4583,19 @@ function isReadOnlySql(sql: string) {
 export async function enforceWritable(ctx: McpContext, conn: any, operation: string, args: any) {
   if (conn.getConfig().readOnlyMode) throw new Error("Connection is in read-only mode");
   await enforcePolicyOperation(ctx, operation, args);
+}
+
+/**
+ * Checks for input the person types themselves (the live 5250 view): read-only
+ * connections, the read-only profile and deny lists still apply, but there is
+ * no approval prompt, because the person is the one approving.
+ */
+export async function enforceWritableForPerson(ctx: McpContext, conn: any, operation: string, args: any) {
+  if (conn.getConfig().readOnlyMode) throw new Error("Connection is in read-only mode");
+  const policy = ctx.getPolicy(args?.connectionName);
+  if (policy.profile === "read-only") throw new Error(`Blocked by policy (${policy.profile}): ${operation}`);
+  const deniedReason = isDeniedByPolicy(policy, operation, args);
+  if (deniedReason) throw new Error(`Blocked by policy: ${operation} (${deniedReason})`);
 }
 
 async function enforcePolicyOperation(ctx: McpContext, operation: string, args: any) {

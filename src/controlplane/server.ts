@@ -241,6 +241,11 @@ async function routeRequest(req: IncomingMessage, res: ServerResponse, services:
     return;
   }
 
+  if (method === "GET" && pathname === "/api/tn5250/live") {
+    sendJson(res, 200, { views: await readLiveViews() });
+    return;
+  }
+
   if (method === "GET" && pathname === "/api/runtime/status") {
     sendJson(res, 200, { jobs: services.runtime.getStatus() });
     return;
@@ -459,6 +464,38 @@ function parseNumberSetting(input: unknown, min: number, max: number, key: strin
     throw new Error(`${key} must be between ${min} and ${max}`);
   }
   return normalized;
+}
+
+/**
+ * Live 5250 views: each MCP process that serves one writes a file with its
+ * address and sessions. Entries whose server no longer answers are dropped.
+ */
+async function readLiveViews() {
+  const dir = path.join(getConfigDir(), "tn5250-live");
+  let names: string[] = [];
+  try {
+    names = (await fsp.readdir(dir)).filter(name => name.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const views: Array<Record<string, unknown>> = [];
+  for (const name of names) {
+    const file = path.join(dir, name);
+    try {
+      const entry = JSON.parse(await fsp.readFile(file, "utf8"));
+      if (!entry || typeof entry.url !== "string" || typeof entry.port !== "number") throw new Error("bad entry");
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 1000);
+      const alive = await fetch(`http://127.0.0.1:${entry.port}/api/sessions?t=${new URL(entry.url).searchParams.get("t")}`, { signal: controller.signal })
+        .then(r => r.ok).catch(() => false);
+      clearTimeout(timer);
+      if (!alive) throw new Error("gone");
+      views.push({ pid: entry.pid, port: entry.port, url: entry.url, sessions: entry.sessions || [], updatedAt: entry.updatedAt });
+    } catch {
+      await fsp.rm(file, { force: true }).catch(() => undefined);
+    }
+  }
+  return views;
 }
 
 async function readSessionSnapshot() {

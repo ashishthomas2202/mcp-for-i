@@ -1,11 +1,13 @@
 import type { McpContext } from "../context.js";
 import type { ToolModule } from "./index.js";
-import { clampNumber, enforceWritable, getConnectionName, json } from "../tools.js";
+import { EventEmitter } from "events";
+import { clampNumber, enforceWritable, enforceWritableForPerson, getConnectionName, json } from "../tools.js";
 import { getPassword } from "../../security/credentialStore.js";
 import { REDACTED } from "../../security/redact.js";
 import { Screen, Tn5250Client, Tn5250Field, TerminalType, aidForKey, checkTlsCertificate, hostKeyFor } from "../../ibmi/tn5250/index.js";
 import { SUPPORTED_CCSIDS } from "../../ibmi/tn5250/ebcdic.js";
 import { AID_WITHOUT_DATA } from "../../ibmi/tn5250/datastream.js";
+import { LiveInput, LiveServer, startLiveServer } from "./tn5250Live.js";
 
 /**
  * ibmi.tn5250.*: a real TN5250 (5250 telnet) session per saved connection.
@@ -24,9 +26,27 @@ type Session = {
   /** Virtual device shown on the sign-on screen, used to end the job on disconnect. */
   device?: string;
   signedOn?: boolean;
+  /** Who pressed or typed last: the agent (tools) or the person (live view). */
+  lastActor?: Actor;
+  /** When the person last typed or clicked in the live view. */
+  personInputAt?: number;
 };
 
+type Actor = "agent" | "person";
+
 const sessions = new Map<string, Session>();
+
+/** "changed" (connectionName) whenever a session's screen or state may have changed. */
+export const liveEvents = new EventEmitter();
+liveEvents.setMaxListeners(100);
+
+/** The agent waits this long after the person typed or clicked in the live view. */
+export const PERSON_HOLD_MS = 4000;
+
+let liveServer: LiveServer | undefined;
+let liveServerStarting: Promise<LiveServer | undefined> | undefined;
+/** Context of the MCP process, used for input that comes from the live view. */
+let liveCtx: McpContext | undefined;
 
 /** Replaceable dependencies (tests swap these). */
 export const tn5250Deps = {
@@ -196,6 +216,16 @@ const tools: ToolModule["tools"] = [
 ];
 
 async function handle(ctx: McpContext, name: string, args: any) {
+  liveCtx = ctx;
+  try {
+    return await handleTool(ctx, name, args);
+  } finally {
+    const connectionName = args?.connectionName || ctx.activeName;
+    if (connectionName && sessions.has(connectionName)) liveEvents.emit("changed", connectionName);
+  }
+}
+
+async function handleTool(ctx: McpContext, name: string, args: any) {
   switch (name) {
     case "ibmi.tn5250.connect":
       return connect(ctx, args || {});
@@ -270,6 +300,9 @@ async function connect(ctx: McpContext, args: any) {
   await client.connect();
   const session: Session = { connectionName, host: stored.host, port, tls: useTls, client, createdAt: new Date().toISOString() };
   sessions.set(connectionName, session);
+  client.on("update", () => liveEvents.emit("changed", connectionName));
+  client.on("close", () => liveEvents.emit("changed", connectionName));
+  if (settings.tn5250LiveView !== false) await ensureLiveServer(settings.tn5250LiveViewPort);
 
   try {
     let settled = await client.waitForSettled(timeoutMs);
@@ -309,6 +342,7 @@ function signOnFields(screen: Screen) {
 
 async function setField(ctx: McpContext, args: any) {
   const session = requireOpenSession(ctx, args);
+  holdForPerson(session);
   const screen = session.client.screen;
   const field = resolveField(screen, args);
   if (!field) throw new Error(`TN5250 field not found: ${describeFieldRef(args)}`);
@@ -325,11 +359,18 @@ async function setField(ctx: McpContext, args: any) {
   }
   if (screen.inputInhibited) screen.reset();
   screen.setFieldValue(field, value);
+  session.lastActor = "agent";
   return json(sessionView(session));
 }
 
 async function sendKeys(ctx: McpContext, args: any) {
   const session = requireOpenSession(ctx, args);
+  holdForPerson(session);
+  return json(await runInput(ctx, session, args, "agent"));
+}
+
+/** Type, press local keys and at most one host key; shared by the tools (agent) and the live view (person). */
+async function runInput(ctx: McpContext, session: Session, args: any, actor: Actor) {
   const { client } = session;
   const screen = client.screen;
   const keys = parseKeys(args.keys);
@@ -353,6 +394,7 @@ async function sendKeys(ctx: McpContext, args: any) {
     screen.setCursor(Number(args.cursorRow ?? screen.rowCol(screen.cursor).row), Number(args.cursorCol ?? screen.rowCol(screen.cursor).col));
   }
   if (text) screen.typeText(text);
+  session.lastActor = actor;
 
   const localKeys = aidIndex >= 0 ? keys.slice(0, aidIndex) : keys;
   for (const key of localKeys) applyLocalKey(screen, key);
@@ -368,11 +410,12 @@ async function sendKeys(ctx: McpContext, args: any) {
     const gateArgs = { ...args, connectionName: session.connectionName };
     const aid = aidForKey(aidKey);
     const commands = aid !== undefined && !AID_WITHOUT_DATA.has(aid) ? commandLineEntries(screen) : [];
+    const gate = actor === "person" ? enforceWritableForPerson : enforceWritable;
     if (commands.length > 0) {
       // Text on a command line is run as CL by the host, so it gets the cl.run checks.
-      for (const command of commands) await enforceWritable(ctx, conn, "cl.run", { ...gateArgs, command, environment: "ile" });
+      for (const command of commands) await gate(ctx, conn, "cl.run", { ...gateArgs, command, environment: "ile" });
     } else {
-      await enforceWritable(ctx, conn, "tn5250.sendKeys", gateArgs);
+      await gate(ctx, conn, "tn5250.sendKeys", gateArgs);
     }
     const hostKey = aidKey === "ATTN" || aidKey === "SYSREQ";
     const wasLocked = screen.keyboardLocked;
@@ -396,29 +439,106 @@ async function sendKeys(ctx: McpContext, args: any) {
       settled = await client.waitForSettled(timeoutMs);
     }
   }
-  return json({
+  return {
     ...sessionView(session),
     ...(aidKey ? { sent: aidKey, settled } : {}),
     ...(note ? { note } : {}),
     ...(autoReset ? { autoReset: true } : {})
-  });
+  };
 }
 
 async function click(ctx: McpContext, args: any) {
   const session = requireOpenSession(ctx, args);
+  holdForPerson(session);
+  return json(await runClick(ctx, session, args, "agent"));
+}
+
+async function runClick(ctx: McpContext, session: Session, args: any, actor: Actor) {
   const screen = session.client.screen;
   const row = Number(args.row);
   const col = Number(args.col);
   screen.address(row, col); // validates the position
   const key = args.doubleClick ? "ENTER" : args.hotspots === false ? undefined : screen.hotspotAt(row, col);
   if (key) {
-    const result = await sendKeys(ctx, { connectionName: session.connectionName, cursorRow: row, cursorCol: col, keys: key, timeoutMs: args.timeoutMs, approve: args.approve });
-    return result;
+    return runInput(ctx, session, { connectionName: session.connectionName, cursorRow: row, cursorCol: col, keys: key, timeoutMs: args.timeoutMs, approve: args.approve }, actor);
   }
   if (screen.inputInhibited) screen.reset();
   screen.setCursor(row, col);
   screen.version += 1;
-  return json(sessionView(session));
+  session.lastActor = actor;
+  return sessionView(session);
+}
+
+/** The agent must not type over the person: refuse while they are using the live view. */
+function holdForPerson(session: Session) {
+  if (session.personInputAt && Date.now() - session.personInputAt < PERSON_HOLD_MS) {
+    throw new Error("The person is typing in the live 5250 view. Wait a few seconds, read the screen again (ibmi.tn5250.readScreen) and then continue.");
+  }
+}
+
+async function ensureLiveServer(port?: unknown) {
+  if (liveServer) return liveServer;
+  if (!liveServerStarting) {
+    const preferred = Number.isInteger(Number(port)) && Number(port) >= 0 && Number(port) <= 65535 && port !== undefined ? Number(port) : 3981;
+    liveServerStarting = startLiveServer(liveProvider, preferred)
+      .then(server => { liveServer = server; return server; })
+      .catch(() => undefined)
+      .finally(() => { liveServerStarting = undefined; });
+  }
+  return liveServerStarting;
+}
+
+/** What the live view server reads and drives. */
+const liveProvider = {
+  events: liveEvents,
+  list: () => [...sessions.values()].map(session => ({
+    connectionName: session.connectionName,
+    host: session.host,
+    connected: !session.client.closed,
+    signedOn: Boolean(session.signedOn),
+    lastActor: session.lastActor
+  })),
+  screen: (connectionName: string) => {
+    const session = sessions.get(connectionName);
+    if (!session) return undefined;
+    const screen = session.client.screen;
+    return { ...sessionView(session), runs: screen.renderRuns(), personHoldMs: PERSON_HOLD_MS };
+  },
+  input: async (connectionName: string, input: LiveInput) => {
+    const session = sessions.get(connectionName);
+    if (!session) throw new Error(`No 5250 session for ${connectionName}`);
+    if (session.client.closed) throw new Error(`The 5250 session for ${connectionName} is closed`);
+    if (!liveCtx) throw new Error("The MCP server is not ready");
+    session.personInputAt = Date.now();
+    try {
+      if (input.click) {
+        return await runClick(liveCtx, session, { ...input.click, timeoutMs: 30000 }, "person");
+      }
+      return await runInput(liveCtx, session, {
+        connectionName,
+        text: input.text,
+        keys: input.keys,
+        cursorRow: input.cursorRow,
+        cursorCol: input.cursorCol,
+        timeoutMs: 30000
+      }, "person");
+    } finally {
+      session.personInputAt = Date.now();
+      liveEvents.emit("changed", connectionName);
+    }
+  }
+};
+
+/** Address of the live view for a session, once the live view server runs. */
+export function liveViewUrl(connectionName: string) {
+  return liveServer?.urlFor(connectionName);
+}
+
+/** For tests: stop the live view server. */
+export async function stopLiveServer() {
+  const server = liveServer;
+  liveServer = undefined;
+  await server?.close();
 }
 
 async function waitFor(ctx: McpContext, args: any) {
@@ -539,6 +659,9 @@ function sessionView(session: Session) {
     connected: !client.closed,
     ...(client.closed ? { closeReason: client.closeReason } : {}),
     lastKey: session.lastKey,
+    ...(session.lastActor ? { lastActor: session.lastActor } : {}),
+    ...(session.personInputAt && Date.now() - session.personInputAt < PERSON_HOLD_MS ? { personTyping: true } : {}),
+    ...(liveServer ? { liveViewUrl: liveServer.urlFor(session.connectionName) } : {}),
     ...client.screen.view(),
     ...(client.screen.warnings.length > 0 ? { warnings: client.screen.warnings.slice(-5) } : {})
   };
@@ -600,6 +723,7 @@ function closeSession(connectionName: string) {
   if (!session) return false;
   session.client.close();
   sessions.delete(connectionName);
+  liveEvents.emit("changed", connectionName);
   return true;
 }
 

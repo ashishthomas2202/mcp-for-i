@@ -34,6 +34,8 @@ Default settings (editable in the config file):
 - `tn5250Port`: number. TN5250 telnet port (default 23, or 992 when `tn5250Tls` is true).
 - `tn5250Tls`: boolean. Use TLS for TN5250 (default true when the port is 992).
 - `tn5250DeviceName`: string. Virtual device name requested for TN5250 sessions (1-10 characters).
+- `tn5250LiveView`: boolean. Serve the live 5250 view on localhost while a session is open (default true).
+- `tn5250LiveViewPort`: number. Preferred port for the live 5250 view (default 3981; the next free port when taken, 0 for any).
 - `tn5250Ccsid`: number. Single-byte EBCDIC code page for TN5250 screen text (default 37; also 273, 277, 278, 280, 284, 285, 297, 500, 871, 1047, 1140-1149).
 
 `tempLibrary` remains accepted for configuration compatibility. Source member reads and source-date writes now use job-local `QTEMP` objects and do not require a persistent `ILEDITOR` library.

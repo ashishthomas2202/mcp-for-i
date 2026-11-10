@@ -988,6 +988,33 @@ export class Screen {
     return rows;
   }
 
+  /**
+   * Screen rows as runs of text with the same display attribute (color,
+   * reverse, underline), for drawing the screen. Hidden text is blank.
+   */
+  renderRuns(): ScreenRun[][] {
+    const rows = this.renderRows();
+    const out: ScreenRun[][] = [];
+    let attr = 0x20;
+    for (let r = 0; r < this.rows; r += 1) {
+      const runs: ScreenRun[] = [];
+      for (let c = 0; c < this.cols; c += 1) {
+        const p = r * this.cols + c;
+        if (this.attrMap[p]) attr = this.buffer[p];
+        const style = attributeStyle(attr);
+        const last = runs[runs.length - 1];
+        const ch = rows[r][c];
+        if (last && last.color === style.color && last.reverse === style.reverse && last.underline === style.underline && !this.attrMap[p]) {
+          last.text += ch;
+        } else {
+          runs.push({ text: ch, ...style });
+        }
+      }
+      out.push(runs);
+    }
+    return out;
+  }
+
   fieldId(field: Tn5250Field) {
     const { row, col } = this.rowCol(field.start);
     return `r${row}c${col}`;
@@ -1063,6 +1090,20 @@ export class Screen {
     this.warnings.push(message);
     if (this.warnings.length > 20) this.warnings.shift();
   }
+}
+
+export type ScreenRun = { text: string; color: string; reverse: boolean; underline: boolean };
+
+/** Display style of a 5250 screen attribute byte (0x20-0x3F). */
+export function attributeStyle(attr: number) {
+  const group = attr & 0x38;
+  const alt = (attr & 0x02) !== 0;
+  const color = group === 0x20 ? (alt ? "white" : "green")
+    : group === 0x28 ? "red"
+    : group === 0x30 ? (alt ? "yellow" : "turquoise")
+    : alt ? "blue" : "pink";
+  const nonDisplay = (attr & 0x07) === 0x07;
+  return { color, reverse: !nonDisplay && (attr & 0x01) !== 0, underline: !nonDisplay && (attr & 0x04) !== 0 };
 }
 
 function hex(value: number | undefined) {

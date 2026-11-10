@@ -218,6 +218,10 @@ The existing member tools remain compatible: an unchanged `ibmi.qsys.members.lis
 
 Source-date reads use an ephemeral `QTEMP` alias in the same database job. If that path is unavailable, the server falls back to a complete UTF-8 `CPYTOSTMF` read; it never reconstructs a member from search matches.
 
+## 5250 Green Screen
+
+`ibmi.tn5250.*` gives the assistant a real 5250 session (a built-in TN5250 client, nothing to install on the IBM i). While a session is open the MCP server also serves a live view on `http://127.0.0.1:3981` (the link, with its token, is in every screen result and on the control plane's Runtime tab): you watch the screen the assistant is driving and can type and click in it yourself. Clients that support MCP Apps draw the same screen inside the chat. See [docs/tools.md](docs/tools.md#tn5250-notes).
+
 ## IBM i Documentation
 
 `ibmi.docs.search` and `ibmi.docs.open` provide a release-aware, cached catalog of allowlisted official IBM documentation. The same catalog and topic content are exposed as MCP resources under `ibmi-docs://`. Documentation results include their official canonical URL, content version/checksum, and observation time. When local coverage is insufficient, search results explicitly recommend a web fallback instead of presenting cached material as exhaustive.

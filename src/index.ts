@@ -21,6 +21,7 @@ import { appendAuditRecord } from "./mcp/audit.js";
 import { redactModuleArgs } from "./mcp/modules/index.js";
 import { runControlCommand } from "./controlplane/commands.js";
 import { ibmDocs } from "./ibmi/IbmDocs.js";
+import { MCP_APP_MIME_TYPE, TN5250_APP_TOOLS, TN5250_APP_URI, renderTn5250App } from "./mcp/modules/tn5250App.js";
 
 const argv = process.argv.slice(2);
 const firstArg = (argv[0] || "").toLowerCase();
@@ -51,7 +52,10 @@ const server = new Server(
 
 const ctx = new McpContext();
 ctx.confirm = createElicitationConfirm(server);
-const tools = getTools();
+// 5250 tools point MCP Apps clients at the screen view; other clients ignore _meta.
+const tools = getTools().map(tool => (TN5250_APP_TOOLS.has(tool.name)
+  ? { ...tool, _meta: { ...((tool as any)._meta || {}), ui: { resourceUri: TN5250_APP_URI } } }
+  : tool));
 const toolMap = new Map(tools.map(tool => [tool.name, tool]));
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -65,6 +69,12 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => ({
       name: "IBM i documentation catalog",
       description: "Release-aware allowlist of official IBM i documentation available through mcp-for-i.",
       mimeType: "application/json"
+    },
+    {
+      uri: TN5250_APP_URI,
+      name: "5250 screen view",
+      description: "Interactive 5250 screen for MCP Apps clients (used by the ibmi.tn5250 tools).",
+      mimeType: MCP_APP_MIME_TYPE
     },
     ...ibmDocs.listResources()
   ]
@@ -81,6 +91,11 @@ server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
 
 server.setRequestHandler(ReadResourceRequestSchema, async request => {
   const uri = request.params.uri;
+  if (uri === TN5250_APP_URI) {
+    return {
+      contents: [{ uri, mimeType: MCP_APP_MIME_TYPE, text: renderTn5250App(packageVersion), _meta: { ui: { prefersBorder: false } } }]
+    };
+  }
   const text = await ibmDocs.readResource(uri);
   return {
     contents: [{

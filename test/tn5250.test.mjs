@@ -6,7 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { EventEmitter } from "node:events";
-import { getTools, handleTool } from "../dist/mcp/tools.js";
+// Keep the live view registry out of the real config folder.
+const configRoot = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-for-i-tn5250-"));
+process.env.APPDATA = configRoot;
+process.env.XDG_CONFIG_HOME = configRoot;
+const { getTools, handleTool } = await import("../dist/mcp/tools.js");
 import { redactModuleArgs } from "../dist/mcp/modules/index.js";
 import { tn5250Deps, parseKeys } from "../dist/mcp/modules/tn5250.js";
 import {
@@ -721,6 +725,100 @@ test("tools: Esc sends Attention, an unanswered Attn unlocks the keyboard, click
     assert.deepEqual([...host.records[before + 1].data.subarray(0, 3)], [6, 13, 0xf1]);
   } finally {
     await handleTool(ctx, "ibmi.tn5250.disconnect", {}).catch(() => undefined);
+    await host.stop();
+  }
+});
+
+// ---------------------------------------------------------------- live view
+
+test("live view: token-protected page, screen stream, person input and the agent waits", async () => {
+  const { stopLiveServer, PERSON_HOLD_MS } = await import("../dist/mcp/modules/tn5250.js");
+  const { liveRegistryDir } = await import("../dist/mcp/modules/tn5250Live.js");
+  const host = await startFakeHost({
+    firstScreen: mainMenu(),
+    onRecord: record => (record.data[2] === 0xf1 ? mainMenu() : undefined)
+  });
+  const { ctx } = fakeContext(host.port);
+  try {
+    const view = data(await handleTool(ctx, "ibmi.tn5250.connect", { timeoutMs: 5000 }));
+    assert.match(view.liveViewUrl, /^http:\/\/127\.0\.0\.1:\d+\/\?t=[a-f0-9]{48}&s=DEV$/);
+    const live = new URL(view.liveViewUrl);
+    const token = live.searchParams.get("t");
+    const base = `${live.protocol}//${live.host}`;
+
+    const page = await fetch(view.liveViewUrl);
+    assert.equal(page.status, 200);
+    assert.match(await page.text(), /<title>Live 5250<\/title>/);
+    assert.equal((await fetch(`${base}/`)).status, 401);
+    assert.equal((await fetch(`${base}/?t=${"0".repeat(48)}`)).status, 401);
+
+    const screen = await (await fetch(`${base}/api/screen?t=${token}&s=DEV`)).json();
+    assert.match(screen.text[0], /IBM i Main Menu/);
+    assert.ok(Array.isArray(screen.runs[0]) && screen.runs[0].length > 0);
+
+    const sessionsList = await (await fetch(`${base}/api/sessions?t=${token}`)).json();
+    assert.deepEqual(sessionsList.sessions.map(s => s.connectionName), ["DEV"]);
+    const registry = JSON.parse(await fs.readFile(path.join(liveRegistryDir(), `${process.pid}.json`), "utf8"));
+    assert.equal(registry.url.startsWith(base), true);
+
+    // Server-sent events deliver the screen.
+    const controller = new AbortController();
+    const events = await fetch(`${base}/api/events?t=${token}&s=DEV`, { signal: controller.signal });
+    const reader = events.body.getReader();
+    const first = new TextDecoder().decode((await reader.read()).value);
+    assert.match(first, /event: screen/);
+    controller.abort();
+
+    const post = body => fetch(`${base}/api/input?t=${token}&s=DEV`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const crossSite = await fetch(`${base}/api/input?t=${token}&s=DEV`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: "https://evil.example" },
+      body: JSON.stringify({ keys: "Enter" })
+    });
+    assert.equal(crossSite.status, 403);
+
+    // The person types on the command line and presses Enter.
+    const typed = await (await post({ text: "WRKACTJOB", keys: "Enter" })).json();
+    assert.equal(typed.ok, true, typed.error);
+    assert.equal(typed.sent, "ENTER");
+    assert.ok(host.records[0].data.includes(E("WRKACTJOB")), "person input reached the host");
+
+    // Right after, the agent is asked to wait.
+    await assert.rejects(handleTool(ctx, "ibmi.tn5250.sendKeys", { keys: "F3" }), /person is typing/);
+    const read = data(await handleTool(ctx, "ibmi.tn5250.readScreen", {}));
+    assert.equal(read.lastActor, "person");
+    assert.equal(read.personTyping, true);
+    assert.ok(PERSON_HOLD_MS >= 1000);
+
+    // Read-only connections stay read-only for the person too.
+    const clicked = await (await post({ click: { row: 21, col: 10 } })).json();
+    assert.equal(clicked.ok, true);
+    assert.deepEqual(data(await handleTool(ctx, "ibmi.tn5250.readScreen", {})).cursor, { row: 21, col: 10 });
+  } finally {
+    await handleTool(ctx, "ibmi.tn5250.disconnect", {}).catch(() => undefined);
+    await stopLiveServer();
+    await host.stop();
+  }
+});
+
+test("live view: read-only connections refuse the person's host keys", async () => {
+  const { stopLiveServer } = await import("../dist/mcp/modules/tn5250.js");
+  const host = await startFakeHost({ firstScreen: mainMenu() });
+  const { ctx } = fakeContext(host.port, { readOnlyMode: true });
+  try {
+    const view = data(await handleTool(ctx, "ibmi.tn5250.connect", { timeoutMs: 5000 }));
+    const live = new URL(view.liveViewUrl);
+    const res = await (await fetch(`${live.protocol}//${live.host}/api/input?t=${live.searchParams.get("t")}&s=DEV`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ keys: "Enter" })
+    })).json();
+    assert.equal(res.ok, false);
+    assert.match(res.error, /read-only/);
+    assert.equal(host.records.length, 0);
+  } finally {
+    await handleTool(ctx, "ibmi.tn5250.disconnect", {}).catch(() => undefined);
+    await stopLiveServer();
     await host.stop();
   }
 });

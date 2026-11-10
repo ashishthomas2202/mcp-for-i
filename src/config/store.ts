@@ -56,6 +56,8 @@ export type Settings = {
   tn5250Tls?: boolean;
   tn5250DeviceName?: string;
   tn5250Ccsid?: number;
+  tn5250LiveView?: boolean;
+  tn5250LiveViewPort?: number;
 };
 
 export type ConnectionProfile = {

@@ -547,6 +547,20 @@ export function renderControlPlaneHtml(token = "") {
               </table>
             </div>
           </div>
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <h2>Live 5250 screens</h2>
+                <div class="sub">Green screens your coding assistant is driving. Open one to watch, type and click alongside it.</div>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Connection</th><th>Host</th><th>State</th><th>Last input</th><th></th></tr></thead>
+                <tbody id="liveBody"></tbody>
+              </table>
+            </div>
+          </div>
           <div class="help" id="versionCheckedAt"></div>
         </div>
       </section>
@@ -1327,6 +1341,32 @@ export function renderControlPlaneHtml(token = "") {
         body.appendChild(tr);
       }
     }
+    function renderLiveViews(views) {
+      const body = $("liveBody");
+      body.innerHTML = "";
+      const rows = [];
+      for (const view of Array.isArray(views) ? views : []) {
+        for (const s of view.sessions || []) rows.push({ view, s });
+      }
+      if (rows.length === 0) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td colspan='5' style='padding:0'><div class='empty compact'><div class='empty-icon'>" + icon("pulse") + "</div><h3>No 5250 session</h3><p>A screen appears here when your coding assistant opens one with ibmi.tn5250.connect.</p></div></td>";
+        body.appendChild(tr);
+        return;
+      }
+      for (const { view, s } of rows) {
+        const url = new URL(view.url);
+        url.searchParams.set("s", s.connectionName);
+        const tr = document.createElement("tr");
+        tr.innerHTML = "<td><span class='cell-primary'>" + escapeHtml(s.connectionName) + "</span></td>" +
+          "<td class='mono' style='font-size:12.5px'>" + escapeHtml(s.host || "") + "</td>" +
+          "<td><span class='chip " + (s.connected ? "ok" : "danger") + "'>" + (s.connected ? (s.signedOn ? "Signed on" : "Connected") : "Closed") + "</span></td>" +
+          "<td>" + escapeHtml(s.lastActor === "agent" ? "Agent" : s.lastActor === "person" ? "You" : "-") + "</td>" +
+          "<td style='text-align:right'><a class='btn' href='" + escapeHtml(url.toString()) + "' target='_blank' rel='noopener'>Open</a></td>";
+        body.appendChild(tr);
+      }
+    }
+    async function loadLiveViews() { renderLiveViews((await api("/api/tn5250/live")).views || []); }
     const SETTINGS_FIELDS = [
       ["sessionIdleMinutes", 1, 1440, 30],
       ["sessionPingSeconds", 5, 300, 15],
@@ -1673,6 +1713,7 @@ export function renderControlPlaneHtml(token = "") {
       if (heartbeatId) clearInterval(heartbeatId);
       heartbeatId = setInterval(async () => {
         const ok = await pingHealth();
+        if (ok && state.online && !state.busy) loadLiveViews().catch(() => {});
         if (ok && !state.online) {
           setServiceState("online", "Online", "Local control service");
           await refreshAll();
@@ -1689,7 +1730,7 @@ export function renderControlPlaneHtml(token = "") {
           return;
         }
         setServiceState("online", "Online", "Local control service");
-        await Promise.allSettled([loadConnections(), loadRuntimeStatus(), loadServiceStatus(), loadVersions(), loadSessions(), loadSettings(), loadClients()]);
+        await Promise.allSettled([loadConnections(), loadRuntimeStatus(), loadServiceStatus(), loadVersions(), loadSessions(), loadLiveViews(), loadSettings(), loadClients()]);
       });
     }
 
