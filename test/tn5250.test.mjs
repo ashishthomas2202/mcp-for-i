@@ -8,7 +8,7 @@ import fs from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import { getTools, handleTool } from "../dist/mcp/tools.js";
 import { redactModuleArgs } from "../dist/mcp/modules/index.js";
-import { tn5250Deps } from "../dist/mcp/modules/tn5250.js";
+import { tn5250Deps, parseKeys } from "../dist/mcp/modules/tn5250.js";
 import {
   Screen,
   Tn5250Client,
@@ -17,6 +17,7 @@ import {
   datastream,
   ebcdicToString,
   stringToEbcdic,
+  SUPPORTED_CCSIDS,
   telnet
 } from "../dist/ibmi/tn5250/index.js";
 
@@ -555,7 +556,7 @@ test("plain telnet never offers the password in the telnet negotiation", async (
 test("tn5250 tool definitions are annotated and describe a real 5250 session", () => {
   const tools = getTools().filter(t => t.name.startsWith("ibmi.tn5250."));
   assert.deepEqual(tools.map(t => t.name).sort(), [
-    "ibmi.tn5250.connect", "ibmi.tn5250.disconnect", "ibmi.tn5250.readScreen", "ibmi.tn5250.sendKeys",
+    "ibmi.tn5250.click", "ibmi.tn5250.connect", "ibmi.tn5250.disconnect", "ibmi.tn5250.readScreen", "ibmi.tn5250.sendKeys",
     "ibmi.tn5250.setField", "ibmi.tn5250.snapshot", "ibmi.tn5250.waitFor"
   ]);
   for (const tool of tools) {
@@ -566,4 +567,160 @@ test("tn5250 tool definitions are annotated and describe a real 5250 session", (
     assert.doesNotMatch(tool.description, /simulated/i);
   }
   assert.equal(tools.find(t => t.name === "ibmi.tn5250.sendKeys").annotations.destructiveHint, true);
+});
+
+// ------------------------------------------------- keys, code pages, clicks
+
+// Data-entry screen: numeric-only, right-adjust zero-fill, Dup-enabled field at
+// row 5 col 11 (5 long); signed numeric field at row 6 col 11 (5 long);
+// function-key legend on row 23.
+function entryScreen() {
+  return Buffer.concat([
+    B([0x04, 0x40, 0x04, 0x11, 0x00, 0x18]),
+    B([0x01, 0x07, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00]),
+    B(sba(5, 2)), E("Qty"),
+    B([...sba(5, 10), 0x1d, 0x53, 0x05, 0x20, 0x00, 0x05]),
+    B([...sba(5, 16), 0x20]),
+    B(sba(6, 2)), E("Amount"),
+    B([...sba(6, 10), 0x1d, 0x47, 0x00, 0x20, 0x00, 0x05]),
+    B([...sba(6, 16), 0x20]),
+    B(sba(23, 2)), E("F3=Exit   F12=Cancel"), B(sba(23, 70)), E("More..."),
+    B([0x13, 5, 11]),
+    B([0x04, 0x52, 0x00, 0x00])
+  ]);
+}
+
+test("single-byte code pages beyond CCSID 37", () => {
+  assert.ok(SUPPORTED_CCSIDS.length >= 20);
+  for (const ccsid of [37, 273, 277, 278, 280, 284, 285, 297, 500, 871, 1047, 1140, 1141, 1148]) assert.ok(SUPPORTED_CCSIDS.includes(ccsid), String(ccsid));
+  assert.equal(ebcdicToString([0x4a, 0x5a, 0xc0, 0xa1], 273), "ÄÜäß");
+  assert.equal(ebcdicToString([0x4a, 0x5a], 500), "[]");
+  assert.equal(ebcdicToString([0x5b], 285), "£");
+  assert.equal(ebcdicToString([0x9f], 1140), "€");
+  assert.equal(ebcdicToString([0xc1, 0xf1], 297), "A1");
+  assert.deepEqual([...stringToEbcdic("Ä", 273)], [0x4a]);
+  assert.throws(() => stringToEbcdic("A", 930), /not supported/);
+
+  const screen = new Screen({ ccsid: 273 });
+  apply(screen, Buffer.concat([B([0x04, 0x40, 0x04, 0x11, 0x00, 0x18]), B(sba(1, 1)), B([0x4a, 0x5a])]));
+  assert.equal(screen.view().text[0].substring(0, 2), "ÄÜ");
+
+  const german = new Tn5250Client({ host: "h", port: 23, ccsid: 1141 }).environment();
+  const env = Object.fromEntries(german.map(v => [v.name, Buffer.from(v.value).toString("ascii")]));
+  assert.deepEqual({ KBDTYPE: env.KBDTYPE, CODEPAGE: env.CODEPAGE, CHARSET: env.CHARSET }, { KBDTYPE: "AGB", CODEPAGE: "1141", CHARSET: "695" });
+});
+
+test("key names: Esc is Attn, Shift+Esc is SysReq, Field+/-, chords and repeats", () => {
+  assert.deepEqual(parseKeys("Esc"), ["ATTN"]);
+  assert.deepEqual(parseKeys("escape"), ["ATTN"]);
+  assert.deepEqual(parseKeys("Attention"), ["ATTN"]);
+  assert.deepEqual(parseKeys("Shift+Esc"), ["SYSREQ"]);
+  assert.deepEqual(parseKeys("shift + esc"), ["SYSREQ"]);
+  assert.deepEqual(parseKeys("SysRq"), ["SYSREQ"]);
+  assert.deepEqual(parseKeys("Shift+Tab Field+ Field- Down*3 Tab+Enter"), [
+    "BACKTAB", "FIELDPLUS", "FIELDMINUS", "DOWN", "DOWN", "DOWN", "TAB", "ENTER"
+  ]);
+  assert.deepEqual(parseKeys("Page-Down Ins Del Dup NewLine End Erase_Input"), ["PAGEDOWN", "INSERT", "DELETE", "DUP", "NEWLINE", "END", "ERASEINPUT"]);
+  assert.throws(() => parseKeys("Enter*2"), /Only a single local key/);
+});
+
+test("local keys: insert, delete, end, arrows, erase input, Field+/-, Dup and hotspots", () => {
+  const screen = new Screen();
+  apply(screen, mainMenu());
+  screen.typeText("WRKACTJOB");
+  screen.home();
+  screen.toggleInsert();
+  assert.equal(screen.view().insertMode, true);
+  screen.typeText("X");
+  assert.equal(screen.fieldText(screen.fields[0]).trim(), "XWRKACTJOB");
+  screen.toggleInsert();
+  screen.home();
+  screen.deleteChar();
+  assert.equal(screen.fieldText(screen.fields[0]).trim(), "WRKACTJOB");
+  screen.endOfField();
+  assert.deepEqual(screen.view().cursor, { row: 21, col: 16 });
+  screen.moveCursor(-1, -1);
+  assert.deepEqual(screen.view().cursor, { row: 20, col: 15 });
+  screen.moveCursor(0, -15 - 19 * 80);
+  assert.deepEqual(screen.view().cursor, { row: 24, col: 80 }, "wraps like a terminal");
+  screen.home();
+  screen.eraseInput();
+  assert.equal(screen.fieldText(screen.fields[0]).trim(), "");
+
+  const entry = new Screen();
+  apply(entry, entryScreen());
+  const [qty, amount] = entry.fields;
+  entry.typeText("42");
+  entry.fieldSign(true);
+  assert.deepEqual([...entry.buffer.subarray(qty.start, qty.start + 5)], [0xf0, 0xf0, 0xf0, 0xf4, 0xd2]);
+  assert.deepEqual(entry.view().cursor, { row: 6, col: 11 }, "Field- moves to the next field");
+  entry.typeText("12");
+  entry.fieldSign(true);
+  assert.deepEqual([...entry.buffer.subarray(amount.start, amount.start + 5)], [0x40, 0x40, 0xf1, 0xf2, 0x60]);
+  entry.home();
+  entry.dup();
+  assert.equal(entry.view().text[4].substring(10, 15), "*****");
+  assert.equal(entry.fields[0].modified, true);
+  assert.throws(() => entry.dup(), /does not allow the Dup key/);
+  entry.home();
+  entry.typeText("7");
+  entry.fieldExit();
+  assert.deepEqual([...entry.buffer.subarray(qty.start, qty.start + 5)], [0xf0, 0xf0, 0xf0, 0xf0, 0xf7], "Field Exit right-adjusts");
+
+  assert.equal(entry.hotspotAt(23, 3), "F3");
+  assert.equal(entry.hotspotAt(23, 13), "F12");
+  assert.equal(entry.hotspotAt(23, 72), "PAGEDOWN");
+  assert.equal(entry.hotspotAt(23, 40), undefined);
+});
+
+test("tools: Esc sends Attention, an unanswered Attn unlocks the keyboard, clicks press hotspots", async () => {
+  let answerAttention = true;
+  const host = await startFakeHost({
+    firstScreen: entryScreen(),
+    onRecord: record => {
+      if (record.flags & datastream.FLAG_ATN) return answerAttention ? mainMenu() : undefined;
+      if (record.flags & datastream.FLAG_SRQ) return undefined;
+      return entryScreen();
+    }
+  });
+  const { ctx } = fakeContext(host.port);
+  try {
+    await handleTool(ctx, "ibmi.tn5250.connect", { timeoutMs: 5000 });
+
+    const attn = data(await handleTool(ctx, "ibmi.tn5250.sendKeys", { keys: "Esc", timeoutMs: 5000 }));
+    assert.equal(attn.sent, "ATTN");
+    assert.equal(attn.settled, true);
+    assert.equal(host.records[0].flags, datastream.FLAG_ATN);
+    assert.equal(host.records[0].data.length, 0);
+    assert.match(attn.text[0], /IBM i Main Menu/);
+
+    answerAttention = false;
+    const silent = data(await handleTool(ctx, "ibmi.tn5250.sendKeys", { keys: "Attn", timeoutMs: 300 }));
+    assert.equal(silent.keyboardLocked, false);
+    assert.match(silent.note, /did not answer Attn/);
+
+    const sysreq = data(await handleTool(ctx, "ibmi.tn5250.sendKeys", { keys: "Shift+Esc", timeoutMs: 300 }));
+    assert.equal(sysreq.sent, "SYSREQ");
+    assert.equal(host.records[2].flags, datastream.FLAG_SRQ);
+
+    await assert.rejects(handleTool(ctx, "ibmi.tn5250.sendKeys", { keys: "Hyper" }), /Esc is Attn/);
+
+    // Back to the entry screen, then click the F12 legend.
+    await handleTool(ctx, "ibmi.tn5250.sendKeys", { keys: "Enter", timeoutMs: 5000 });
+    const before = host.records.length;
+    const clicked = data(await handleTool(ctx, "ibmi.tn5250.click", { row: 23, col: 14, timeoutMs: 5000 }));
+    assert.equal(clicked.sent, "F12");
+    assert.equal(host.records[before].data[2], 0x3c);
+
+    const moved = data(await handleTool(ctx, "ibmi.tn5250.click", { row: 6, col: 12 }));
+    assert.deepEqual(moved.cursor, { row: 6, col: 12 });
+    assert.equal(host.records.length, before + 1, "a plain click sends nothing");
+
+    const double = data(await handleTool(ctx, "ibmi.tn5250.click", { row: 6, col: 13, doubleClick: true, timeoutMs: 5000 }));
+    assert.equal(double.sent, "ENTER");
+    assert.deepEqual([...host.records[before + 1].data.subarray(0, 3)], [6, 13, 0xf1]);
+  } finally {
+    await handleTool(ctx, "ibmi.tn5250.disconnect", {}).catch(() => undefined);
+    await host.stop();
+  }
 });

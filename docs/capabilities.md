@@ -208,12 +208,13 @@ Version context: `0.2.0`.
 - `ibmi.journal.receivers.retention`
 
 ### TN5250 (5250 green-screen sessions)
-A real TN5250 client: connects to the saved connection's host on port 23 (or 992 with TLS), reads the actual screen and fields, fills fields and presses keys (Enter, F1-F24, PageUp/PageDown, Clear, Help, Attn, SysReq). Optional sign-on uses the stored credentials. AID keys go through the write gate: read-only connections cannot press them, and text on a `===>` command line is checked against the command policy. See [tools](tools.md#tn5250-notes) for details and limits.
+A real TN5250 client: connects to the saved connection's host on port 23 (or 992 with TLS), reads the actual screen and fields, fills fields and presses keys (Enter, F1-F24, PageUp/PageDown, Clear, Help, Attn/Esc, SysReq/Shift+Esc, plus local keys such as Field+/-, Dup, Insert and the arrows) and clicks like an emulator mouse. Supports 21 single-byte code pages. Optional sign-on uses the stored credentials. AID keys go through the write gate: read-only connections cannot press them, and text on a `===>` command line is checked against the command policy. See [tools](tools.md#tn5250-notes) for details and limits.
 
 - `ibmi.tn5250.connect`
 - `ibmi.tn5250.readScreen`
 - `ibmi.tn5250.setField`
 - `ibmi.tn5250.sendKeys`
+- `ibmi.tn5250.click`
 - `ibmi.tn5250.waitFor`
 - `ibmi.tn5250.snapshot`
 - `ibmi.tn5250.disconnect`

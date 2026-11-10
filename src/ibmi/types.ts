@@ -91,6 +91,7 @@ export interface ConnectionConfig {
   tn5250Port?: number;
   tn5250Tls?: boolean;
   tn5250DeviceName?: string;
+  tn5250Ccsid?: number;
 }
 
 export interface ObjectFilter {

@@ -3,7 +3,8 @@ import type { ToolModule } from "./index.js";
 import { clampNumber, enforceWritable, getConnectionName, json } from "../tools.js";
 import { getPassword } from "../../security/credentialStore.js";
 import { REDACTED } from "../../security/redact.js";
-import { Screen, Tn5250Client, Tn5250Field, TerminalType, aidForKey, checkTlsCertificate } from "../../ibmi/tn5250/index.js";
+import { Screen, Tn5250Client, Tn5250Field, TerminalType, aidForKey, checkTlsCertificate, hostKeyFor } from "../../ibmi/tn5250/index.js";
+import { SUPPORTED_CCSIDS } from "../../ibmi/tn5250/ebcdic.js";
 import { AID_WITHOUT_DATA } from "../../ibmi/tn5250/datastream.js";
 
 /**
@@ -34,7 +35,30 @@ export const tn5250Deps = {
     checkTlsCertificate({ host: info.host, port: info.port, certificate: info.certificate, authorized: info.authorized })
 };
 
-const LOCAL_KEYS = new Set(["TAB", "BACKTAB", "HOME", "RESET", "ERASEEOF", "FIELDEXIT"]);
+/** Keys handled on the local screen (nothing is sent to the IBM i), by every name they go by. */
+const LOCAL_KEY_ALIASES: Record<string, string> = {
+  TAB: "TAB", FIELDADVANCE: "TAB",
+  BACKTAB: "BACKTAB", SHIFTTAB: "BACKTAB", FIELDBACKSPACE: "BACKTAB",
+  HOME: "HOME",
+  END: "END", ENDOFFIELD: "END",
+  RESET: "RESET",
+  ERASEEOF: "ERASEEOF", ERASEEOFIELD: "ERASEEOF", ERASEENDOFFIELD: "ERASEEOF",
+  ERASEINPUT: "ERASEINPUT",
+  FIELDEXIT: "FIELDEXIT",
+  FIELDPLUS: "FIELDPLUS",
+  FIELDMINUS: "FIELDMINUS",
+  DUP: "DUP", DUPLICATE: "DUP",
+  INSERT: "INSERT", INS: "INSERT",
+  DELETE: "DELETE", DEL: "DELETE",
+  UP: "UP", ARROWUP: "UP", CURSORUP: "UP",
+  DOWN: "DOWN", ARROWDOWN: "DOWN", CURSORDOWN: "DOWN",
+  LEFT: "LEFT", ARROWLEFT: "LEFT", CURSORLEFT: "LEFT", BACKSPACE: "LEFT",
+  RIGHT: "RIGHT", ARROWRIGHT: "RIGHT", CURSORRIGHT: "RIGHT",
+  NEWLINE: "NEWLINE"
+};
+const LOCAL_KEYS = new Set(Object.values(LOCAL_KEY_ALIASES));
+/** How long Attn / SysReq wait for any answer before the keyboard is unlocked again. */
+const HOST_KEY_ANSWER_MS = 5000;
 const CONNECTION_NAME = { type: "string", description: "Saved IBM i connection name (defaults to the active connection)." };
 const TIMEOUT_MS = { type: "number", description: "How long to wait for the host, in milliseconds." };
 const FIELD_ID = {
@@ -58,6 +82,10 @@ const tools: ToolModule["tools"] = [
         signOn: { type: "boolean", default: false, description: "Sign on with the stored credentials." },
         deviceName: { type: "string", description: "Virtual device name to request (1-10 characters)." },
         screenSize: { type: "string", enum: ["24x80", "27x132"], description: "27x132 announces an IBM-3477-FC display." },
+        ccsid: {
+          type: "number",
+          description: `Single-byte EBCDIC code page for screen text (default: the tn5250Ccsid setting, else 37). Supported: ${SUPPORTED_CCSIDS.join(", ")}.`
+        },
         timeoutMs: TIMEOUT_MS,
         approve: { type: "boolean", description: "Set true to approve guarded-policy operations (signOn)." }
       },
@@ -96,7 +124,9 @@ const tools: ToolModule["tools"] = [
     name: "ibmi.tn5250.sendKeys",
     description:
       "Type text at the cursor and/or press keys, then wait for the host to answer. keys is a space-separated list: local keys " +
-      "(Tab, BackTab, Home, Reset, EraseEOF, FieldExit) and at most one AID key at the end (Enter, F1-F24, PageUp, PageDown, Clear, Help, Print, Attn, SysReq). " +
+      "(Tab, BackTab, Home, End, Reset, EraseEOF, EraseInput, FieldExit, Field+, Field-, Dup, Insert, Delete, Up, Down, Left, Right, NewLine; " +
+      "add *N to repeat, for example Down*3) and at most one host key at the end (Enter, F1-F24, PageUp, PageDown, Clear, Help, Print, Attn, SysReq). " +
+      "As in IBM emulators, Esc is Attn (Attention, which opens the job's attention menu or program) and Shift+Esc is SysReq (System Request). " +
       "Pressing an AID key sends the screen to the IBM i: read-only connections refuse it, and text on a recognised command line (===>) is checked against the command policy as cl.run.",
     inputSchema: {
       type: "object",
@@ -109,6 +139,28 @@ const tools: ToolModule["tools"] = [
         timeoutMs: TIMEOUT_MS,
         approve: { type: "boolean", description: "Set true to approve guarded-policy operations." }
       },
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
+  },
+  {
+    name: "ibmi.tn5250.click",
+    description:
+      "Click on the 5250 screen the way an emulator mouse does: a click moves the cursor to row/col; a click on a function-key legend " +
+      "(for example \"F3=Exit\") presses that key, and on \"More...\" presses PageDown; doubleClick moves the cursor and presses Enter. " +
+      "Pressing a key goes through the same checks as sendKeys.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        connectionName: CONNECTION_NAME,
+        row: { type: "number", description: "1-based row." },
+        col: { type: "number", description: "1-based column." },
+        doubleClick: { type: "boolean", default: false, description: "Move the cursor and press Enter." },
+        hotspots: { type: "boolean", default: true, description: "Press the key named by a function-key legend under the click." },
+        timeoutMs: TIMEOUT_MS,
+        approve: { type: "boolean", description: "Set true to approve guarded-policy operations." }
+      },
+      required: ["row", "col"],
       additionalProperties: false
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
@@ -153,6 +205,8 @@ async function handle(ctx: McpContext, name: string, args: any) {
       return setField(ctx, args || {});
     case "ibmi.tn5250.sendKeys":
       return sendKeys(ctx, args || {});
+    case "ibmi.tn5250.click":
+      return click(ctx, args || {});
     case "ibmi.tn5250.waitFor":
       return waitFor(ctx, args || {});
     case "ibmi.tn5250.snapshot": {
@@ -191,6 +245,7 @@ async function connect(ctx: McpContext, args: any) {
   const deviceName = optionalDeviceName(args.deviceName ?? settings.tn5250DeviceName);
   const terminalType: TerminalType = args.screenSize === "27x132" ? "IBM-3477-FC" : "IBM-3179-2";
   const timeoutMs = clampNumber(args.timeoutMs, 20000, 1000, 120000);
+  const ccsid = requireCcsid(args.ccsid ?? settings.tn5250Ccsid ?? 37);
 
   let password: string | undefined;
   if (args.signOn) {
@@ -206,6 +261,7 @@ async function connect(ctx: McpContext, args: any) {
     tls: useTls,
     terminalType,
     deviceName,
+    ccsid,
     // The password is only offered in the telnet negotiation when it is encrypted by TLS.
     autoSignOn: password && useTls ? { user: stored.username, password } : undefined,
     connectTimeoutMs: timeoutMs,
@@ -282,7 +338,9 @@ async function sendKeys(ctx: McpContext, args: any) {
 
   const aidIndex = keys.findIndex(isAidKey);
   for (const key of keys) {
-    if (!LOCAL_KEYS.has(key) && !isAidKey(key)) throw new Error(`Unsupported key: ${key}`);
+    if (!LOCAL_KEYS.has(key) && !isAidKey(key)) {
+      throw new Error(`Unsupported key: ${key}. Esc is Attn and Shift+Esc is SysReq; see the tool description for the key names.`);
+    }
   }
   if (aidIndex >= 0 && aidIndex !== keys.length - 1) {
     throw new Error("Only one AID key (Enter, F1-F24, PageUp, ...) is allowed, and it must be the last key");
@@ -300,6 +358,7 @@ async function sendKeys(ctx: McpContext, args: any) {
   for (const key of localKeys) applyLocalKey(screen, key);
 
   let settled: boolean | undefined;
+  let note: string | undefined;
   const aidKey = aidIndex >= 0 ? keys[aidIndex] : undefined;
   if (aidKey) {
     if (screen.keyboardLocked && !screen.inputInhibited && !["ATTN", "SYSREQ"].includes(aidKey)) {
@@ -315,15 +374,51 @@ async function sendKeys(ctx: McpContext, args: any) {
     } else {
       await enforceWritable(ctx, conn, "tn5250.sendKeys", gateArgs);
     }
+    const hostKey = aidKey === "ATTN" || aidKey === "SYSREQ";
+    const wasLocked = screen.keyboardLocked;
+    const recordsBefore = client.recordsReceived;
     client.sendKey(aidKey);
     session.lastKey = aidKey;
-    settled = await client.waitForSettled(timeoutMs);
+    if (hostKey) {
+      // The host may not answer Attn (no attention program) or SysReq; don't leave the keyboard locked forever.
+      const startedAt = Date.now();
+      const answered = await client.waitFor(() => client.recordsReceived > recordsBefore, Math.min(timeoutMs, HOST_KEY_ANSWER_MS));
+      if (!answered) {
+        screen.keyboardLocked = wasLocked;
+        settled = !wasLocked;
+        note = aidKey === "ATTN"
+          ? "The host did not answer Attn: this job may have no attention program (ATNPGM *NONE or SETATNPGM not used). The keyboard was unlocked again."
+          : "The host did not answer SysReq. The keyboard was unlocked again.";
+      } else {
+        settled = await client.waitForSettled(Math.max(250, timeoutMs - (Date.now() - startedAt)));
+      }
+    } else {
+      settled = await client.waitForSettled(timeoutMs);
+    }
   }
   return json({
     ...sessionView(session),
     ...(aidKey ? { sent: aidKey, settled } : {}),
+    ...(note ? { note } : {}),
     ...(autoReset ? { autoReset: true } : {})
   });
+}
+
+async function click(ctx: McpContext, args: any) {
+  const session = requireOpenSession(ctx, args);
+  const screen = session.client.screen;
+  const row = Number(args.row);
+  const col = Number(args.col);
+  screen.address(row, col); // validates the position
+  const key = args.doubleClick ? "ENTER" : args.hotspots === false ? undefined : screen.hotspotAt(row, col);
+  if (key) {
+    const result = await sendKeys(ctx, { connectionName: session.connectionName, cursorRow: row, cursorCol: col, keys: key, timeoutMs: args.timeoutMs, approve: args.approve });
+    return result;
+  }
+  if (screen.inputInhibited) screen.reset();
+  screen.setCursor(row, col);
+  screen.version += 1;
+  return json(sessionView(session));
 }
 
 async function waitFor(ctx: McpContext, args: any) {
@@ -344,9 +439,21 @@ function applyLocalKey(screen: Screen, key: string) {
     case "TAB": screen.tab(); break;
     case "BACKTAB": screen.backTab(); break;
     case "HOME": screen.home(); break;
+    case "END": screen.endOfField(); break;
     case "RESET": screen.reset(); break;
     case "ERASEEOF": screen.eraseToEndOfField(); break;
+    case "ERASEINPUT": screen.eraseInput(); break;
     case "FIELDEXIT": screen.fieldExit(); break;
+    case "FIELDPLUS": screen.fieldSign(false); break;
+    case "FIELDMINUS": screen.fieldSign(true); break;
+    case "DUP": screen.dup(); break;
+    case "INSERT": screen.toggleInsert(); break;
+    case "DELETE": screen.deleteChar(); break;
+    case "UP": screen.moveCursor(-1, 0); break;
+    case "DOWN": screen.moveCursor(1, 0); break;
+    case "LEFT": screen.moveCursor(0, -1); break;
+    case "RIGHT": screen.moveCursor(0, 1); break;
+    case "NEWLINE": screen.newLine(); break;
   }
 }
 
@@ -354,12 +461,37 @@ function isAidKey(key: string) {
   return key === "ATTN" || key === "SYSREQ" || aidForKey(key) !== undefined;
 }
 
-function parseKeys(value: unknown): string[] {
+/**
+ * Key names to canonical keys. Accepts "Field+", "Field-", "Shift+Tab",
+ * "Shift+Esc", "Tab+Enter" style chords and "Down*3" repeats.
+ */
+export function parseKeys(value: unknown): string[] {
   if (value === undefined || value === null) return [];
-  return String(value)
-    .split(/[\s,+]+/)
-    .map(part => part.trim().toUpperCase().replace(/[_-]/g, ""))
-    .filter(Boolean);
+  const text = String(value).replace(/\bshift\s*\+\s*/gi, "SHIFT+");
+  const out: string[] = [];
+  for (const raw of text.split(/[\s,]+/).filter(Boolean)) {
+    const repeat = /^(.+?)\*(\d{1,3})$/.exec(raw);
+    const token = repeat ? repeat[1] : raw;
+    const count = repeat ? Number(repeat[2]) : 1;
+    const keys = canonicalKeys(token);
+    if (repeat && (keys.length !== 1 || !LOCAL_KEYS.has(keys[0]))) throw new Error(`Only a single local key can be repeated: ${raw}`);
+    if (count < 1 || count > 200) throw new Error(`Repeat count must be 1-200: ${raw}`);
+    for (let n = 0; n < count; n += 1) out.push(...keys);
+  }
+  return out;
+}
+
+function canonicalKeys(token: string): string[] {
+  const upper = token.toUpperCase().replace(/_/g, "");
+  if (upper === "FIELD+") return ["FIELDPLUS"];
+  if (upper === "FIELD-") return ["FIELDMINUS"];
+  if (upper.startsWith("SHIFT+")) return [canonicalKey(`SHIFT${upper.substring(6)}`)];
+  return upper.split("+").filter(Boolean).map(canonicalKey);
+}
+
+function canonicalKey(name: string) {
+  const key = name.replace(/-/g, "");
+  return LOCAL_KEY_ALIASES[key] || hostKeyFor(key) || key;
 }
 
 /**
@@ -469,6 +601,14 @@ function closeSession(connectionName: string) {
   session.client.close();
   sessions.delete(connectionName);
   return true;
+}
+
+function requireCcsid(value: unknown) {
+  const ccsid = Number(value);
+  if (!SUPPORTED_CCSIDS.includes(ccsid)) {
+    throw new Error(`Unsupported TN5250 CCSID: ${value}. Supported single-byte code pages: ${SUPPORTED_CCSIDS.join(", ")}`);
+  }
+  return ccsid;
 }
 
 function requirePort(value: unknown) {

@@ -153,7 +153,24 @@ function summarizeResult(result: any) {
   return {
     isError: Boolean(result?.isError),
     contentCount,
-    hasStructuredContent: typeof result?.structuredContent !== "undefined"
+    hasStructuredContent: typeof result?.structuredContent !== "undefined",
+    ...summarizeScreen(result?.structuredContent)
+  };
+}
+
+/** For 5250 results: the screen's first text line and state, so the audit shows where a session went. */
+function summarizeScreen(structured: any) {
+  const content = structured?.data ?? structured;
+  const screen = content && Array.isArray(content.text) ? content : content?.screen;
+  if (!screen || !Array.isArray(screen.text) || typeof screen.version !== "number") return {};
+  const title = String(screen.text.find((line: unknown) => typeof line === "string" && line.trim()) || "").trim().substring(0, 80);
+  return {
+    screen: {
+      title: redactSecretsInText(title),
+      keyboardLocked: Boolean(screen.keyboardLocked),
+      ...(screen.errorLine ? { errorLine: redactSecretsInText(String(screen.errorLine).substring(0, 80)) } : {}),
+      ...(typeof content.sent === "string" ? { sent: content.sent } : {})
+    }
   };
 }
 

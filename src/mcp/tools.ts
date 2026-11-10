@@ -99,7 +99,8 @@ const SETTINGS_SCHEMA: JsonSchema = {
     sessionReconnectAttempts: { type: "number" },
     tn5250Port: { type: "number", description: "TN5250 telnet port (default 23, or 992 when tn5250Tls is true)." },
     tn5250Tls: { type: "boolean", description: "Use TLS for TN5250 sessions (default true when the port is 992)." },
-    tn5250DeviceName: { type: "string", description: "Virtual device name requested for TN5250 sessions." }
+    tn5250DeviceName: { type: "string", description: "Virtual device name requested for TN5250 sessions." },
+    tn5250Ccsid: { type: "number", description: "Single-byte EBCDIC code page for TN5250 screen text (default 37)." }
   }
 };
 

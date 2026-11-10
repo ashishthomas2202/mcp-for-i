@@ -3,6 +3,7 @@ import net from "net";
 import tls from "tls";
 import { AID, FLAG_ATN, FLAG_SRQ, OP_NO_OP, buildGdsRecord, parseGdsRecord } from "./datastream.js";
 import { Screen } from "./screen.js";
+import { charsetFor, keyboardTypeFor } from "./ebcdic.js";
 import {
   DO,
   DONT,
@@ -58,6 +59,27 @@ const AID_ALIASES: Record<string, number> = {
   RECORDBACKSPACE: AID.RECORD_BACKSPACE
 };
 
+/**
+ * Other names for the two non-AID host keys. In IBM emulators (ACS, PC5250)
+ * Esc is Attention and Shift+Esc is System Request.
+ */
+const HOST_KEY_ALIASES: Record<string, "ATTN" | "SYSREQ"> = {
+  ATTN: "ATTN",
+  ATTENTION: "ATTN",
+  ESC: "ATTN",
+  ESCAPE: "ATTN",
+  SYSREQ: "SYSREQ",
+  SYSRQ: "SYSREQ",
+  SYSTEMREQUEST: "SYSREQ",
+  SHIFTESC: "SYSREQ",
+  SHIFTESCAPE: "SYSREQ"
+};
+
+/** "ATTN" or "SYSREQ" for Attention / System Request key names (including Esc and Shift+Esc). */
+export function hostKeyFor(name: string): "ATTN" | "SYSREQ" | undefined {
+  return HOST_KEY_ALIASES[name.toUpperCase().replace(/[\s_+-]/g, "")];
+}
+
 /** AID byte for a key name, or undefined when it is not an AID key. */
 export function aidForKey(name: string): number | undefined {
   const key = name.toUpperCase().replace(/[\s_-]/g, "");
@@ -83,6 +105,8 @@ export class Tn5250Client extends EventEmitter {
   private willSent = new Set<number>();
   private doSent = new Set<number>();
   private lastUpdateAt = 0;
+  /** Host records received so far; lets callers tell whether the host answered. */
+  recordsReceived = 0;
 
   constructor(readonly options: Tn5250ClientOptions) {
     super();
@@ -244,9 +268,10 @@ export class Tn5250Client extends EventEmitter {
     const ascii = (text: string) => Buffer.from(text, "ascii");
     const values: EnvValue[] = [];
     if (this.options.deviceName) values.push({ kind: "uservar", name: "DEVNAME", value: ascii(this.options.deviceName) });
-    values.push({ kind: "uservar", name: "KBDTYPE", value: ascii("USB") });
-    values.push({ kind: "uservar", name: "CODEPAGE", value: ascii("37") });
-    values.push({ kind: "uservar", name: "CHARSET", value: ascii("697") });
+    const ccsid = this.screen.ccsid;
+    values.push({ kind: "uservar", name: "KBDTYPE", value: ascii(keyboardTypeFor(ccsid)) });
+    values.push({ kind: "uservar", name: "CODEPAGE", value: ascii(String(ccsid)) });
+    values.push({ kind: "uservar", name: "CHARSET", value: ascii(String(charsetFor(ccsid))) });
     const signOn = this.options.autoSignOn;
     if (signOn) {
       // RFC 4777: an empty IBMRSEED means IBMSUBSPW carries the password unencrypted.
@@ -266,12 +291,13 @@ export class Tn5250Client extends EventEmitter {
       this.screen.warnings.push(err?.message || String(err));
     }
     this.lastUpdateAt = Date.now();
+    this.recordsReceived += 1;
     this.emit("update");
   }
 
   /** Send an AID key (Enter, F1-F24, PageUp, ...) or Attn / SysReq. */
   sendKey(name: string) {
-    const key = name.toUpperCase().replace(/[\s_-]/g, "");
+    const key = hostKeyFor(name) || name.toUpperCase().replace(/[\s_-]/g, "");
     if (key === "ATTN") {
       this.write(frameRecord(buildGdsRecord(OP_NO_OP, new Uint8Array(0), FLAG_ATN)));
       this.screen.keyboardLocked = true;

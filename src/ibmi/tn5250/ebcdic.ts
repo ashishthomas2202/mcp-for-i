@@ -1,14 +1,36 @@
 /**
  * EBCDIC conversion for the 5250 data stream.
  *
- * Only CCSID 37 (US/Canada) is built in. The table maps every byte from
- * 0x40 to 0xFE to its Unicode character; bytes below 0x40 are controls,
- * attributes and orders in the 5250 data stream and render as blanks.
+ * Single-byte (SBCS) code pages: CCSID 37 is the base table and the others
+ * are stored as differences from it. Each table maps every byte from 0x40 to
+ * 0xFE to its Unicode character; bytes below 0x40 are controls, attributes
+ * and orders in the 5250 data stream and render as blanks. Double-byte
+ * (DBCS) code pages are not supported.
  */
 
-export type Ccsid = 37;
+import { CCSID_DELTAS } from "./ebcdicTables.js";
 
-export const SUPPORTED_CCSIDS: Ccsid[] = [37];
+export type Ccsid = number;
+
+export const SUPPORTED_CCSIDS: number[] = [37, ...Object.keys(CCSID_DELTAS).map(Number)].sort((a, b) => a - b);
+
+/** Graphic character set (GCSGID) announced with the code page: 695 for the euro code pages, else 697. */
+export function charsetFor(ccsid: number) {
+  return ccsid >= 1140 && ccsid <= 1149 ? 695 : 697;
+}
+
+/** Keyboard type (KBDTYPE) that matches the code page's country. */
+export function keyboardTypeFor(ccsid: number) {
+  const base = ccsid >= 1140 && ccsid <= 1149 ? [37, 273, 277, 278, 280, 284, 285, 297, 500, 871][ccsid - 1140] : ccsid;
+  const map: Record<number, string> = {
+    37: "USB", 273: "AGB", 277: "DMB", 278: "SWB", 280: "ITB", 284: "SPB", 285: "UKB", 297: "FAB", 500: "BLB", 871: "ICB", 1047: "USB"
+  };
+  return map[base] || "USB";
+}
+
+export function isSupportedCcsid(ccsid: number) {
+  return SUPPORTED_CCSIDS.includes(ccsid);
+}
 
 // Unicode code points for EBCDIC 0x40..0xFE, 16 per row.
 const CCSID37_FROM_40: number[] = [
@@ -31,11 +53,12 @@ type Table = { toChar: string[]; fromChar: Map<string, number> };
 const tables = new Map<number, Table>();
 
 function buildTable(ccsid: number): Table {
-  if (ccsid !== 37) throw new Error(`CCSID ${ccsid} is not supported for TN5250 (supported: ${SUPPORTED_CCSIDS.join(", ")})`);
+  if (!isSupportedCcsid(ccsid)) throw new Error(`CCSID ${ccsid} is not supported for TN5250 (supported: ${SUPPORTED_CCSIDS.join(", ")})`);
+  const delta = CCSID_DELTAS[ccsid] || {};
   const toChar: string[] = new Array(256).fill(" ");
   const fromChar = new Map<string, number>();
   for (let i = 0; i < CCSID37_FROM_40.length; i += 1) {
-    const ch = String.fromCodePoint(CCSID37_FROM_40[i]);
+    const ch = String.fromCodePoint(delta[0x40 + i] ?? CCSID37_FROM_40[i]);
     toChar[0x40 + i] = ch;
     if (!fromChar.has(ch)) fromChar.set(ch, 0x40 + i);
   }

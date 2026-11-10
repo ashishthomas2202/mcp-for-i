@@ -74,6 +74,8 @@ export class Tn5250Field {
     return value === 5 ? "zero" : value === 6 ? "blank" : undefined;
   }
   get end() { return this.start + this.length - 1; }
+  /** The Dup key is allowed in this field. */
+  get dupEnabled() { return (this.ffw & 0x1000) !== 0; }
 
   contains(address: number) {
     return address >= this.start && address <= this.end;
@@ -112,6 +114,7 @@ export type ScreenView = {
   inputInhibited: boolean;
   messageWaiting: boolean;
   readPending: boolean;
+  insertMode: boolean;
   errorLine?: string;
   text: string[];
   fields: FieldView[];
@@ -156,6 +159,8 @@ export class Screen {
   keyboardLocked = true;
   inputInhibited = false;
   messageWaiting = false;
+  /** Insert mode: typing shifts the rest of the field right instead of overwriting. */
+  insertMode = false;
   pendingRead: number | null = null;
   errorRow = 23;
   version = 0;
@@ -732,6 +737,15 @@ export class Screen {
     if (offset + bytes.length > field.length) {
       throw new Error(`Text is ${bytes.length} characters but only ${field.length - offset} fit in the field from the cursor`);
     }
+    if (this.insertMode) {
+      const tail = this.fieldBytes(field).slice(offset);
+      let used = tail.length;
+      while (used > 0 && (tail[used - 1] === 0 || tail[used - 1] === 0x40)) used -= 1;
+      if (offset + bytes.length + used > field.length) {
+        throw new Error("Insert mode: the field has no room to shift its text right");
+      }
+      tail.slice(0, used).forEach((byte, n) => { this.buffer[(field.start + offset + bytes.length + n) % this.size] = byte; });
+    }
     bytes.forEach((byte, n) => {
       const p = (field.start + offset + n) % this.size;
       this.buffer[p] = byte;
@@ -801,9 +815,146 @@ export class Screen {
     this.version += 1;
   }
 
+  /** Field Exit: erase to the end of the field, right-adjust it if the field asks for that, go to the next field. */
   fieldExit() {
+    const field = this.currentInputField();
     this.eraseToEndOfField();
+    const adjust = field.rightAdjust;
+    if (adjust) this.rightAdjustField(field, adjust === "zero" ? 0xf0 : 0x40);
     this.tab();
+  }
+
+  /** Field+ and Field-: like Field Exit; numeric fields are right-adjusted and Field- marks them negative. */
+  fieldSign(negative: boolean) {
+    const field = this.currentInputField();
+    if (negative && !field.numeric) throw new Error("Field- is only valid in a numeric field");
+    this.eraseToEndOfField();
+    if (field.numeric || field.rightAdjust) {
+      const fill = field.rightAdjust === "zero" ? 0xf0 : 0x40;
+      if (field.shift === 7) {
+        // Signed numeric: the last position holds the sign.
+        this.rightAdjustField(field, fill, 1);
+        this.buffer[field.end % this.size] = negative ? 0x60 : 0x40;
+      } else {
+        this.rightAdjustField(field, fill);
+        if (negative) {
+          const last = field.end % this.size;
+          const byte = this.buffer[last];
+          if (byte < 0xf0 || byte > 0xf9) throw new Error("Field- needs a digit in the last position of the field");
+          this.buffer[last] = 0xd0 | (byte & 0x0f);
+        }
+      }
+    }
+    field.modified = true;
+    this.version += 1;
+    this.tab();
+  }
+
+  /** Dup: fill the field from the cursor with the DUP character (the host repeats the previous value). */
+  dup() {
+    this.requireInputAllowed();
+    const field = this.currentInputField();
+    if (!field.dupEnabled) throw new Error("This field does not allow the Dup key");
+    for (let p = this.cursor; p <= field.end; p += 1) {
+      this.buffer[p % this.size] = 0x1c;
+      this.attrMap[p % this.size] = 0;
+    }
+    field.modified = true;
+    this.version += 1;
+    this.tab();
+  }
+
+  /** Delete the character at the cursor; the rest of the field shifts left. */
+  deleteChar() {
+    this.requireInputAllowed();
+    const field = this.currentInputField();
+    const offset = this.cursor - field.start;
+    const bytes = this.fieldBytes(field);
+    const shifted = [...bytes.slice(0, offset), ...bytes.slice(offset + 1), 0];
+    shifted.forEach((byte, n) => { this.buffer[(field.start + n) % this.size] = byte; });
+    field.modified = true;
+    this.version += 1;
+  }
+
+  /** Erase Input: clear every input field and put the cursor in the first one. */
+  eraseInput() {
+    this.requireInputAllowed();
+    for (const field of this.inputFields()) {
+      if (this.fieldHasValue(field)) field.modified = true;
+      this.nullField(field);
+    }
+    this.home();
+    this.version += 1;
+  }
+
+  toggleInsert() {
+    this.insertMode = !this.insertMode;
+  }
+
+  /** Move the cursor by rows and columns, wrapping around the screen like a terminal. */
+  moveCursor(rowDelta: number, colDelta: number) {
+    const size = this.size;
+    this.cursor = (((this.cursor + rowDelta * this.cols + colDelta) % size) + size) % size;
+  }
+
+  /** New Line: the first input field on a following row (or the first field on the screen). */
+  newLine() {
+    const inputs = this.inputFields();
+    const nextRow = (Math.floor(this.cursor / this.cols) + 1) * this.cols;
+    const next = inputs.find(f => f.start >= nextRow) || inputs[0];
+    this.cursor = next ? next.start : nextRow % this.size;
+  }
+
+  /** End: just after the last character entered in the current field. */
+  endOfField() {
+    const field = this.currentInputField();
+    const bytes = this.fieldBytes(field);
+    let used = bytes.length;
+    while (used > 0 && (bytes[used - 1] === 0 || bytes[used - 1] === 0x40)) used -= 1;
+    this.cursor = field.start + Math.min(used, field.length - 1);
+  }
+
+  private currentInputField() {
+    const field = this.fieldAt(this.cursor);
+    if (!field || field.bypass) {
+      const { row, col } = this.rowCol(this.cursor);
+      throw new Error(`The cursor (row ${row}, column ${col}) is not in an input field`);
+    }
+    return field;
+  }
+
+  private fieldBytes(field: Tn5250Field) {
+    const out: number[] = [];
+    for (let n = 0; n < field.length; n += 1) out.push(this.buffer[(field.start + n) % this.size]);
+    return out;
+  }
+
+  /** Move the field's text to the right end (leaving `reserve` positions free) and fill the left with `fill`. */
+  private rightAdjustField(field: Tn5250Field, fill: number, reserve = 0) {
+    const bytes = this.fieldBytes(field).filter(b => b !== 0 && b !== 0x40);
+    const width = field.length - reserve;
+    if (bytes.length > width) throw new Error("The field's text does not fit when right-adjusted");
+    const adjusted = [...new Array(width - bytes.length).fill(fill), ...bytes];
+    adjusted.forEach((byte, n) => { this.buffer[(field.start + n) % this.size] = byte; });
+    field.modified = true;
+  }
+
+  /**
+   * What a mouse click on this position presses, as emulator "hotspots" do:
+   * a function-key legend such as "F3=Exit" gives that key, "More..." gives PageDown.
+   */
+  hotspotAt(row: number, col: number): string | undefined {
+    const line = this.renderRows()[row - 1] || "";
+    const index = col - 1;
+    for (const match of line.matchAll(/\b(F(?:[1-9]|1[0-9]|2[0-4]))=\S+/g)) {
+      const start = match.index ?? 0;
+      if (index >= start && index < start + match[0].length) return match[1];
+    }
+    for (const match of line.matchAll(/More\.\.\./g)) {
+      const start = match.index ?? 0;
+      if (index >= start && index < start + match[0].length) return "PAGEDOWN";
+    }
+    return undefined;
   }
 
   // ------------------------------------------------------------------- views
@@ -824,6 +975,8 @@ export class Screen {
         line += " ";
       } else if ((attr & 0x07) === 0x07 || hiddenMask[p]) {
         line += " ";
+      } else if (this.buffer[p] === 0x1c) {
+        line += "*";
       } else {
         line += ebcdicToChar(this.buffer[p], this.ccsid);
       }
@@ -897,6 +1050,7 @@ export class Screen {
       inputInhibited: this.inputInhibited,
       messageWaiting: this.messageWaiting,
       readPending: this.pendingRead !== null,
+      insertMode: this.insertMode,
       text: rows,
       fields,
       version: this.version
