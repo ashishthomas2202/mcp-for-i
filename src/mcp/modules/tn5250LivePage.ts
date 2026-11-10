@@ -15,9 +15,10 @@ export function renderLivePage() {
 <title>Live 5250</title>
 <style>
   :root {
-    --bg: #0b0f0c; --panel: #121915; --line: #24312a; --text: #d7e4dc; --muted: #8aa094;
-    --green: #33ff66; --white: #f2f5f3; --red: #ff5a5a; --turquoise: #3fe0d0; --yellow: #ffe066;
-    --pink: #ff7ad9; --blue: #6aa8ff; --accent: #33ff66; --warn: #ffb347;
+    --bg: #000000; --panel: #0d130f; --line: #24312a; --text: #d7e4dc; --muted: #8aa094;
+    /* 5250 base colours, tuned to a real green-screen / ACS palette. */
+    --green: #2fe02f; --white: #ffffff; --red: #ff564d; --turquoise: #2fd4d4; --yellow: #ffd93b;
+    --pink: #ff5fd0; --blue: #6f8dff; --accent: #2fe02f; --warn: #ffb347;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -32,16 +33,18 @@ export function renderLivePage() {
   #wrap { position: relative; outline: none; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: #000; max-width: 100%; overflow-x: auto; }
   #wrap:focus { border-color: var(--accent); }
   #screen { position: relative; font: 16px/1.25 "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace; white-space: pre; user-select: none; }
-  .row { height: 1.25em; }
+  .row { height: 1.25em; position: relative; z-index: 1; }
   .row span { cursor: text; }
   .c-green { color: var(--green); } .c-white { color: var(--white); } .c-red { color: var(--red); }
   .c-turquoise { color: var(--turquoise); } .c-yellow { color: var(--yellow); } .c-pink { color: var(--pink); } .c-blue { color: var(--blue); }
   .rev { background: currentColor; }
   .rev > i { color: #000; font-style: normal; }
   .ul { text-decoration: underline; }
-  #cursor { position: absolute; width: 1ch; height: 1.25em; background: var(--accent); opacity: .55; pointer-events: none; animation: blink 1.1s steps(1) infinite; }
-  #cursor.insert { height: .3em; margin-top: .95em; }
-  @keyframes blink { 50% { opacity: .15; } }
+  /* Block cursor (overwrite): a white box that inverts the character under it, like a real 5250. */
+  #cursor { position: absolute; width: 1ch; height: 1.25em; background: #ffffff; mix-blend-mode: difference; pointer-events: none; z-index: 3; animation: blink 1.06s steps(1, start) infinite; }
+  /* Underline cursor (insert mode). */
+  #cursor.insert { height: 2px; margin-top: calc(1.25em - 2px); background: var(--accent); mix-blend-mode: normal; }
+  @keyframes blink { 50% { opacity: 0; } }
   #status { display: flex; gap: 14px; flex-wrap: wrap; width: 100%; max-width: 1100px; color: var(--muted); font-size: 12px; justify-content: center; }
   #status .on { color: var(--warn); }
   #error { color: var(--red); min-height: 1.2em; font-size: 12px; text-align: center; }
@@ -49,9 +52,20 @@ export function renderLivePage() {
   #keys button { min-width: 44px; font-size: 12px; }
   .hint { color: var(--muted); font-size: 12px; text-align: center; max-width: 900px; }
   .closed { opacity: .5; }
+  /* Configurable chrome: hide parts of the UI via URL params or the toggle. */
+  body.hide-header header { display: none; }
+  body.hide-keys #keys { display: none; }
+  body.hide-hint .hint { display: none; }
+  body.hide-status #status, body.hide-status #error { display: none; }
+  body.bare #wrap { border: none; border-radius: 0; padding: 0; }
+  body.bare main { padding: 0; gap: 0; }
+  #display-toggle { position: fixed; top: 8px; right: 8px; z-index: 10; opacity: .35; }
+  #display-toggle:hover { opacity: 1; }
+  body.hide-header #display-toggle { opacity: .18; }
 </style>
 </head>
 <body>
+<button id="display-toggle" title="Show or hide the toolbar, keys and help (screen-only mode)">Display</button>
 <header>
   <h1>Live 5250</h1>
   <select id="session" aria-label="Session"></select>
@@ -85,6 +99,53 @@ export function renderLivePage() {
   var pending = '';
   var flushTimer = null;
   var queue = Promise.resolve();
+
+  // Configurable chrome. URL params set the initial look; the Display button
+  // and localStorage remember a per-browser preference after that.
+  // ?view=screen (or ?bare=1) shows only the screen. ?keys=0 / ?header=0 /
+  // ?hint=0 / ?status=0 hide individual parts. ?chrome=full forces everything on.
+  var CHROME_KEY = 'tn5250.chrome';
+  function truthyParam(name, def) {
+    var v = params.get(name);
+    if (v === null) return def;
+    return !(v === '0' || v === 'false' || v === 'no' || v === 'off');
+  }
+  function applyChrome(c) {
+    document.body.classList.toggle('hide-header', !c.header);
+    document.body.classList.toggle('hide-keys', !c.keys);
+    document.body.classList.toggle('hide-hint', !c.hint);
+    document.body.classList.toggle('hide-status', !c.status);
+    document.body.classList.toggle('bare', !!c.bare);
+  }
+  function defaultChrome() {
+    var screenOnly = params.get('view') === 'screen' || truthyParam('bare', false);
+    var base = screenOnly
+      ? { header: false, keys: false, hint: false, status: false, bare: true }
+      : { header: true, keys: true, hint: true, status: true, bare: false };
+    if (params.get('chrome') === 'full') base = { header: true, keys: true, hint: true, status: true, bare: false };
+    // Individual overrides win over the preset.
+    base.header = truthyParam('header', truthyParam('bar', base.header));
+    base.keys = truthyParam('keys', base.keys);
+    base.hint = truthyParam('hint', base.hint);
+    base.status = truthyParam('status', base.status);
+    return base;
+  }
+  var chrome;
+  var hasParam = ['view', 'bare', 'chrome', 'header', 'bar', 'keys', 'hint', 'status'].some(function (n) { return params.get(n) !== null; });
+  try {
+    var saved = hasParam ? null : window.localStorage.getItem(CHROME_KEY);
+    chrome = saved ? JSON.parse(saved) : defaultChrome();
+  } catch (e) { chrome = defaultChrome(); }
+  applyChrome(chrome);
+  document.getElementById('display-toggle').addEventListener('click', function () {
+    var full = chrome.header && chrome.keys && chrome.hint && chrome.status && !chrome.bare;
+    chrome = full
+      ? { header: false, keys: false, hint: false, status: false, bare: true }
+      : { header: true, keys: true, hint: true, status: true, bare: false };
+    applyChrome(chrome);
+    try { window.localStorage.setItem(CHROME_KEY, JSON.stringify(chrome)); } catch (e) {}
+    wrap.focus();
+  });
 
   function api(path) { return path + (path.indexOf('?') >= 0 ? '&' : '?') + 't=' + encodeURIComponent(token) + '&s=' + encodeURIComponent(current); }
 
