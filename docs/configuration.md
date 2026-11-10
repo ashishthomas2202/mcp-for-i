@@ -36,6 +36,7 @@ Default settings (editable in the config file):
 - `tn5250DeviceName`: string. Virtual device name requested for TN5250 sessions (1-10 characters).
 - `tn5250LiveView`: boolean. Serve the live 5250 view on localhost while a session is open (default true).
 - `tn5250LiveViewPort`: number. Preferred port for the live 5250 view (default 3981; the next free port when taken, 0 for any).
+- `tn5250AttnWaitMs`: number. How long Attn/SysReq wait for the host before unlocking the keyboard, in milliseconds (default 2000, range 250-15000).
 - `tn5250Ccsid`: number. Single-byte EBCDIC code page for TN5250 screen text (default 37; also 273, 277, 278, 280, 284, 285, 297, 500, 871, 1047, 1140-1149).
 
 `tempLibrary` remains accepted for configuration compatibility. Source member reads and source-date writes now use job-local `QTEMP` objects and do not require a persistent `ILEDITOR` library.

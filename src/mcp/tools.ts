@@ -102,7 +102,8 @@ const SETTINGS_SCHEMA: JsonSchema = {
     tn5250DeviceName: { type: "string", description: "Virtual device name requested for TN5250 sessions." },
     tn5250Ccsid: { type: "number", description: "Single-byte EBCDIC code page for TN5250 screen text (default 37)." },
     tn5250LiveView: { type: "boolean", description: "Serve the live 5250 view on localhost (default true)." },
-    tn5250LiveViewPort: { type: "number", description: "Preferred port for the live 5250 view (default 3981; another free port if taken, 0 for any)." }
+    tn5250LiveViewPort: { type: "number", description: "Preferred port for the live 5250 view (default 3981; another free port if taken, 0 for any)." },
+    tn5250AttnWaitMs: { type: "number", description: "How long Attn/SysReq wait for the host before unlocking the keyboard, in ms (default 2000)." }
   }
 };
 

@@ -94,6 +94,7 @@ export interface ConnectionConfig {
   tn5250Ccsid?: number;
   tn5250LiveView?: boolean;
   tn5250LiveViewPort?: number;
+  tn5250AttnWaitMs?: number;
 }
 
 export interface ObjectFilter {

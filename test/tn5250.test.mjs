@@ -701,7 +701,7 @@ test("tools: Esc sends Attention, an unanswered Attn unlocks the keyboard, click
     answerAttention = false;
     const silent = data(await handleTool(ctx, "ibmi.tn5250.sendKeys", { keys: "Attn", timeoutMs: 300 }));
     assert.equal(silent.keyboardLocked, false);
-    assert.match(silent.note, /did not answer Attn/);
+    assert.match(silent.note, /no attention (menu|program)/i);
 
     const sysreq = data(await handleTool(ctx, "ibmi.tn5250.sendKeys", { keys: "Shift+Esc", timeoutMs: 300 }));
     assert.equal(sysreq.sent, "SYSREQ");

@@ -58,6 +58,7 @@ export type Settings = {
   tn5250Ccsid?: number;
   tn5250LiveView?: boolean;
   tn5250LiveViewPort?: number;
+  tn5250AttnWaitMs?: number;
 };
 
 export type ConnectionProfile = {

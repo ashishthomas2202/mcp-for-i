@@ -62,6 +62,11 @@ export function renderLivePage() {
   #toast.info { background: #122019; color: #d7f5e2; border: 1px solid var(--accent); }
   #state-chip { position: fixed; top: 8px; left: 8px; z-index: 12; padding: 3px 10px; border-radius: 999px; font-size: 12px; background: #2a1e0a; color: var(--warn); border: 1px solid var(--warn); display: none; }
   #state-chip.show { display: block; }
+  /* Shown while a key is in flight to the host, so a wait reads as progress, not a freeze. */
+  #working { position: fixed; left: 50%; bottom: 52px; transform: translateX(-50%); z-index: 19; display: none; padding: 5px 12px; border-radius: 999px; font-size: 12px; background: #11271f; color: var(--accent); border: 1px solid var(--accent); }
+  #working.show { display: block; }
+  #working::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-right: 7px; vertical-align: middle; animation: pulse2 .8s ease-in-out infinite; }
+  @keyframes pulse2 { 50% { opacity: .2; } }
   /* Configurable chrome: hide parts of the UI via URL params or the toggle. */
   body.hide-header header { display: none; }
   body.hide-keys #keys { display: none; }
@@ -77,6 +82,7 @@ export function renderLivePage() {
 <body>
 <button id="display-toggle" title="Show or hide the toolbar, keys and help (screen-only mode)">Display</button>
 <div id="state-chip" aria-live="polite"></div>
+<div id="working">Waiting for the host…</div>
 <div id="toast" role="status"></div>
 <header>
   <h1>Live 5250</h1>
@@ -108,7 +114,17 @@ export function renderLivePage() {
   var sessionEl = document.getElementById('session');
   var toastEl = document.getElementById('toast');
   var stateChip = document.getElementById('state-chip');
+  var workingEl = document.getElementById('working');
   var resetBtn = null;
+  var inflight = 0, workTimer = null;
+  function workStart() {
+    inflight += 1;
+    if (!workTimer) workTimer = setTimeout(function () { workTimer = null; if (inflight > 0) workingEl.classList.add('show'); }, 300);
+  }
+  function workEnd() {
+    inflight = Math.max(0, inflight - 1);
+    if (inflight === 0) { if (workTimer) { clearTimeout(workTimer); workTimer = null; } workingEl.classList.remove('show'); }
+  }
   var source = null;
   var last = null;
   var pending = '';
@@ -187,13 +203,15 @@ export function renderLivePage() {
 
   function send(input, quiet) {
     queue = queue.then(function () {
+      workStart();
       return fetch(api('/api/input'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) })
         .then(function (r) { return r.json(); })
         .then(function (res) {
           if (res.ok) { errorEl.textContent = res.note || ''; if (res.note) showToast(res.note, 'info'); }
           else if (!quiet) { var m = friendlyError(res.error); errorEl.textContent = m; showToast(m, 'err'); }
         })
-        .catch(function (err) { if (!quiet) { errorEl.textContent = String(err); showToast(String(err), 'err'); } });
+        .catch(function (err) { if (!quiet) { errorEl.textContent = String(err); showToast(String(err), 'err'); } })
+        .then(function () { workEnd(); });
     });
     return queue;
   }

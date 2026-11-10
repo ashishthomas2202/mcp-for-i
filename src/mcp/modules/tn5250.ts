@@ -28,6 +28,8 @@ type Session = {
   signedOn?: boolean;
   /** Who pressed or typed last: the agent (tools) or the person (live view). */
   lastActor?: Actor;
+  /** How long Attn / SysReq wait for the host before the keyboard is unlocked again. */
+  attnWaitMs?: number;
   /** When the person last typed or clicked in the live view. */
   personInputAt?: number;
 };
@@ -78,7 +80,7 @@ const LOCAL_KEY_ALIASES: Record<string, string> = {
 };
 const LOCAL_KEYS = new Set(Object.values(LOCAL_KEY_ALIASES));
 /** How long Attn / SysReq wait for any answer before the keyboard is unlocked again. */
-const HOST_KEY_ANSWER_MS = 5000;
+const HOST_KEY_ANSWER_MS = 2000;
 const CONNECTION_NAME = { type: "string", description: "Saved IBM i connection name (defaults to the active connection)." };
 const TIMEOUT_MS = { type: "number", description: "How long to wait for the host, in milliseconds." };
 const FIELD_ID = {
@@ -298,7 +300,8 @@ async function connect(ctx: McpContext, args: any) {
     checkCertificate: info => tn5250Deps.checkCertificate(info)
   });
   await client.connect();
-  const session: Session = { connectionName, host: stored.host, port, tls: useTls, client, createdAt: new Date().toISOString() };
+  const attnWaitMs = settings.tn5250AttnWaitMs !== undefined ? clampNumber(settings.tn5250AttnWaitMs, HOST_KEY_ANSWER_MS, 250, 15000) : HOST_KEY_ANSWER_MS;
+  const session: Session = { connectionName, host: stored.host, port, tls: useTls, client, createdAt: new Date().toISOString(), attnWaitMs };
   sessions.set(connectionName, session);
   client.on("update", () => liveEvents.emit("changed", connectionName));
   client.on("close", () => liveEvents.emit("changed", connectionName));
@@ -425,13 +428,14 @@ async function runInput(ctx: McpContext, session: Session, args: any, actor: Act
     if (hostKey) {
       // The host may not answer Attn (no attention program) or SysReq; don't leave the keyboard locked forever.
       const startedAt = Date.now();
-      const answered = await client.waitFor(() => client.recordsReceived > recordsBefore, Math.min(timeoutMs, HOST_KEY_ANSWER_MS));
+      const waitMs = Math.min(timeoutMs, session.attnWaitMs ?? HOST_KEY_ANSWER_MS);
+      const answered = await client.waitFor(() => client.recordsReceived > recordsBefore, waitMs);
       if (!answered) {
         screen.keyboardLocked = wasLocked;
         settled = !wasLocked;
         note = aidKey === "ATTN"
-          ? "The host did not answer Attn: this job may have no attention program (ATNPGM *NONE or SETATNPGM not used). The keyboard was unlocked again."
-          : "The host did not answer SysReq. The keyboard was unlocked again.";
+          ? "This screen has no attention menu: no attention program is active here. Use F3 to exit or F12 to cancel to go back. The keyboard was unlocked again."
+          : "The host did not answer System Request on this screen. The keyboard was unlocked again.";
       } else {
         settled = await client.waitForSettled(Math.max(250, timeoutMs - (Date.now() - startedAt)));
       }
