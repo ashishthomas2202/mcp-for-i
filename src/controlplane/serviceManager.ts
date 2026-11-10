@@ -4,7 +4,7 @@ import path from "path";
 import { spawn } from "child_process";
 import { getConfigDir } from "../config/store.js";
 import { getPlatformDescriptor } from "./platform.js";
-import { getControlPlanePort, isControlPlaneRunning } from "./serverShared.js";
+import { getControlPlaneAuthHeaders, getControlPlanePort, getControlPlaneUrl, isControlPlaneRunning } from "./serverShared.js";
 
 const SERVICE_ID = "mcp-for-i-controlplane";
 const MAC_LABEL = "com.mcpfori.controlplane";
@@ -100,6 +100,46 @@ export async function disableBackgroundService(scriptPath: string, nodePath = pr
   }
 
   return getServiceStatus(scriptPath, nodePath);
+}
+
+/**
+ * Stop the running control plane. A launchd agent is unloaded first (it has
+ * KeepAlive and would start it again) and a systemd user service is stopped;
+ * anything else is asked to shut down over its token-protected API.
+ */
+export type StopResult = { wasRunning: boolean; stopped: boolean; serviceEnabled: boolean; managedBy?: string; detail?: string };
+
+export async function stopControlPlane(scriptPath: string, nodePath = process.execPath, timeoutMs = 10000): Promise<StopResult> {
+  const status = await getServiceStatus(scriptPath, nodePath).catch(() => undefined);
+  const base = { serviceEnabled: Boolean(status?.enabled), managedBy: status?.managedBy };
+  if (!(await isControlPlaneRunning())) return { ...base, wasRunning: false, stopped: true };
+
+  if (process.platform === "darwin" && (await pathExists(getMacLaunchAgentPath()))) {
+    await runQuiet("launchctl", ["unload", getMacLaunchAgentPath()]);
+  } else if (process.platform === "linux" && (await canUseSystemdUser()) && (await isSystemdActive())) {
+    await runQuiet("systemctl", ["--user", "stop", SERVICE_ID]);
+  }
+
+  let detail: string | undefined;
+  if (await isControlPlaneRunning()) {
+    try {
+      const res = await fetch(`${getControlPlaneUrl()}/api/shutdown`, {
+        method: "POST",
+        headers: { ...getControlPlaneAuthHeaders(), "Content-Type": "application/json" },
+        body: "{}"
+      });
+      if (!res.ok) detail = `shutdown request failed with HTTP ${res.status}`;
+    } catch {
+      // the server may drop the connection while it stops
+    }
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await isControlPlaneRunning())) return { ...base, wasRunning: true, stopped: true };
+    await wait(250);
+  }
+  return { ...base, wasRunning: true, stopped: false, detail };
 }
 
 export async function ensureControlPlaneRunning(scriptPath: string, nodePath = process.execPath, timeoutMs = 15000) {

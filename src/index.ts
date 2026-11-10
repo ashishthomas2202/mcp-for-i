@@ -194,6 +194,8 @@ function printHelp() {
   process.stderr.write(`  mcp-for-i                 Start MCP stdio server\n`);
   process.stderr.write(`  mcp-for-i control         Start/open control plane UI\n`);
   process.stderr.write(`  mcp-for-i control status  Show control plane and background-service status\n`);
+  process.stderr.write(`  mcp-for-i control stop    Stop the running control plane\n`);
+  process.stderr.write(`  mcp-for-i control restart Stop the control plane and start it again\n`);
   process.stderr.write(`  mcp-for-i control enable  Enable background service for this platform\n`);
   process.stderr.write(`  mcp-for-i control disable Disable background service for this platform\n`);
   process.stderr.write(`  mcp-for-i --version       Print package version\n`);

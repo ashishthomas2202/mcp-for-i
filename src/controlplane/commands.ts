@@ -5,7 +5,8 @@ import {
   disableBackgroundService,
   enableBackgroundService,
   ensureControlPlaneRunning,
-  getServiceStatus
+  getServiceStatus,
+  stopControlPlane
 } from "./serviceManager.js";
 
 type RunOptions = {
@@ -30,6 +31,13 @@ export async function runControlCommand(args: string[], options: RunOptions) {
       return;
     case "open":
       await openControlUi(stderr, scriptPath, nodePath);
+      return;
+    case "stop":
+      await stop(stderr, scriptPath, nodePath);
+      return;
+    case "restart":
+      await stop(stderr, scriptPath, nodePath);
+      await openControlUi(stderr, scriptPath, nodePath, false);
       return;
     case "enable":
       await enableService(stderr, scriptPath, nodePath);
@@ -70,6 +78,27 @@ async function serve(stderr: NodeJS.WriteStream) {
   process.once("SIGTERM", shutdown);
 
   await server.closed;
+  if (await server.shutdownRequested) {
+    stderr.write("mcp-for-i control plane stopped\n");
+    // Background timers (update checks, client probes) must not keep a stopped server's process alive.
+    process.exit(0);
+  }
+}
+
+async function stop(stderr: NodeJS.WriteStream, scriptPath: string, nodePath: string) {
+  const url = getControlPlaneUrl();
+  const result = await stopControlPlane(scriptPath, nodePath);
+  if (!result.wasRunning) {
+    stderr.write(`Control plane is not running at ${url}\n`);
+  } else if (result.stopped) {
+    stderr.write(`Stopped control plane at ${url}\n`);
+  } else {
+    stderr.write(`Control plane at ${url} did not stop: ${result.detail || "it is still answering"}\n`);
+    process.exitCode = 1;
+  }
+  if (result.serviceEnabled) {
+    stderr.write(`The background service is still enabled (${result.managedBy}), so it starts again at the next login. Run "mcp-for-i control disable" to turn that off.\n`);
+  }
 }
 
 async function printStatus(stderr: NodeJS.WriteStream, scriptPath: string, nodePath: string) {
@@ -84,11 +113,15 @@ async function printStatus(stderr: NodeJS.WriteStream, scriptPath: string, nodeP
   if (status.detail) stderr.write(`Detail: ${status.detail}\n`);
 }
 
-async function openControlUi(stderr: NodeJS.WriteStream, scriptPath: string, nodePath: string) {
+async function openControlUi(stderr: NodeJS.WriteStream, scriptPath: string, nodePath: string, openBrowser = true) {
   const url = getControlPlaneUrl();
   const result = await ensureControlPlaneRunning(scriptPath, nodePath);
   if (result.started) {
     stderr.write(`Started control plane at ${url}\n`);
+  }
+  if (!openBrowser) {
+    if (!result.started) stderr.write(`Control plane is running at ${url}\n`);
+    return;
   }
 
   try {
@@ -117,6 +150,8 @@ function printHelp(stderr: NodeJS.WriteStream) {
   stderr.write(`mcp-for-i-control commands:\n`);
   stderr.write(`  serve      Start control plane server in the foreground\n`);
   stderr.write(`  open       Start control plane in the background if needed, then open UI\n`);
+  stderr.write(`  stop       Stop the running control plane\n`);
+  stderr.write(`  restart    Stop the control plane, then start it again in the background\n`);
   stderr.write(`  status     Show running and background-service status\n`);
   stderr.write(`  enable     Enable background service for this platform\n`);
   stderr.write(`  disable    Disable background service for this platform\n`);

@@ -28,6 +28,8 @@ export type ControlPlaneServer = {
   port: number;
   host: string;
   token: string;
+  /** Resolves true once a client asked the server to stop (POST /api/shutdown). */
+  shutdownRequested: Promise<boolean>;
 };
 
 /** Largest accepted request body. Bigger bodies get 413. */
@@ -45,6 +47,7 @@ type Services = {
   runtime: RuntimeService;
   clients: ClientIntegrationService;
   token: string;
+  requestShutdown: () => void;
 };
 
 export async function startControlPlaneServer(opts?: { host?: string; port?: number; rootDir?: string; token?: string }) {
@@ -60,11 +63,18 @@ export async function startControlPlaneServer(opts?: { host?: string; port?: num
   const runtime = new RuntimeService(rootDir);
   const clients = new ClientIntegrationService(rootDir);
   const guard: RequestGuard = { token, port, extraHosts: extraAllowedHosts(host) };
+  let markShutdown: (value: boolean) => void = () => undefined;
+  const shutdownRequested = new Promise<boolean>(resolve => { markShutdown = resolve; });
+  const requestShutdown = () => {
+    markShutdown(true);
+    server.close();
+    server.closeAllConnections();
+  };
 
   const server = http.createServer(async (req, res) => {
     try {
       if (!checkRequest(req, res, guard)) return;
-      await routeRequest(req, res, { store, connections, runtime, clients, token });
+      await routeRequest(req, res, { store, connections, runtime, clients, token, requestShutdown });
     } catch (err: any) {
       if (res.headersSent) {
         res.destroy();
@@ -82,13 +92,17 @@ export async function startControlPlaneServer(opts?: { host?: string; port?: num
   });
   guard.port = (server.address() as AddressInfo).port;
 
-  const closed = new Promise<void>(resolve => server.once("close", () => resolve()));
+  const closed = new Promise<void>(resolve => server.once("close", () => {
+    markShutdown(false);
+    resolve();
+  }));
 
   return {
     host,
     port: guard.port,
     token,
     closed,
+    shutdownRequested,
     close: () =>
       new Promise<void>((resolve, reject) => {
         server.close(err => (err ? reject(err) : resolve()));
@@ -212,6 +226,13 @@ async function routeRequest(req: IncomingMessage, res: ServerResponse, services:
     await services.store.updateSettings(update);
     const settings = await services.store.getSettings();
     sendJson(res, 200, { settings });
+    return;
+  }
+
+  if (method === "POST" && pathname === "/api/shutdown") {
+    // Answer first, then stop listening and drop the remaining connections.
+    res.once("finish", () => setImmediate(services.requestShutdown));
+    sendJson(res, 200, { stopping: true });
     return;
   }
 

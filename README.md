@@ -50,6 +50,8 @@ From an npm install or a git checkout build, these commands are the supported co
 ```bash
 mcp-for-i control
 mcp-for-i control status
+mcp-for-i control stop
+mcp-for-i control restart
 mcp-for-i control enable
 mcp-for-i control disable
 ```
@@ -59,10 +61,14 @@ Equivalent direct control-plane binary commands:
 ```bash
 mcp-for-i-control open
 mcp-for-i-control status
+mcp-for-i-control stop
+mcp-for-i-control restart
 mcp-for-i-control enable
 mcp-for-i-control disable
 mcp-for-i-control serve
 ```
+
+`stop` shuts down the running control plane (it works for one started by `control`, `serve` or the background service). If the background service is enabled, the control plane starts again at the next login; `disable` turns that off. `restart` stops it and starts it again in the background.
 
 Behavior by environment:
 - Windows: `enable` registers a Startup entry.

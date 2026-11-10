@@ -319,3 +319,49 @@ test("mcp-for-i control serve keeps running until stopped", async () => {
 test.after(async () => {
   await fsp.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
 });
+
+test("POST /api/shutdown needs the token, then stops the server", async () => {
+  const server = await startControlPlaneServer({ port: 0, rootDir: tempRoot });
+  const { port, token } = server;
+  const json = { "Content-Type": "application/json" };
+  assert.equal((await request(port, { method: "POST", path: "/api/shutdown", headers: json, body: "{}" })).status, 401);
+  const crossOrigin = await request(port, {
+    method: "POST",
+    path: "/api/shutdown",
+    headers: { ...json, Origin: "https://evil.example", [TOKEN_HEADER]: token },
+    body: "{}"
+  });
+  assert.equal(crossOrigin.status, 403);
+  const stopped = await request(port, { method: "POST", path: "/api/shutdown", headers: { ...json, [TOKEN_HEADER]: token }, body: "{}" });
+  assert.equal(stopped.status, 200);
+  assert.deepEqual(stopped.json, { stopping: true });
+  await server.closed;
+  assert.equal(await server.shutdownRequested, true);
+});
+
+test("mcp-for-i-control stop ends a running control plane process", { timeout: 60000 }, async () => {
+  const port = await freePort();
+  const env = { ...process.env, MCP_FOR_I_CONTROL_PORT: String(port), MCP_FOR_I_CONTROL_HOST: "127.0.0.1" };
+  const script = path.join(repoRoot, "dist", "controlplane", "index.js");
+  const child = spawn(process.execPath, [script, "serve"], { env, stdio: ["ignore", "ignore", "pipe"] });
+  const exited = new Promise(resolve => child.once("exit", code => resolve(code)));
+  let stderr = "";
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  const deadline = Date.now() + 20000;
+  while (!stderr.includes("running at") && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 100));
+  assert.match(stderr, /running at/);
+
+  const runStop = () => new Promise(resolve => {
+    const stop = spawn(process.execPath, [script, "stop"], { env, stdio: ["ignore", "ignore", "pipe"] });
+    let out = "";
+    stop.stderr.on("data", chunk => { out += chunk; });
+    stop.once("exit", code => resolve({ code, out }));
+  });
+  const first = await runStop();
+  assert.equal(first.code, 0, first.out);
+  assert.match(first.out, /Stopped control plane/);
+  assert.equal(await exited, 0, "the server process exits");
+
+  const second = await runStop();
+  assert.match(second.out, /not running/);
+});
