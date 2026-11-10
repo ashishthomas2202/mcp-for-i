@@ -1000,14 +1000,18 @@ export class Screen {
       const runs: ScreenRun[] = [];
       for (let c = 0; c < this.cols; c += 1) {
         const p = r * this.cols + c;
-        if (this.attrMap[p]) attr = this.buffer[p];
+        const isAttr = this.attrMap[p] !== 0;
+        if (isAttr) attr = this.buffer[p];
         const style = attributeStyle(attr);
-        const last = runs[runs.length - 1];
+        // The attribute byte itself is a blank and is never underlined, so a
+        // field's underline starts on its first data cell, under the cursor.
+        const underline = isAttr ? false : style.underline;
         const ch = rows[r][c];
-        if (last && last.color === style.color && last.reverse === style.reverse && last.underline === style.underline && !this.attrMap[p]) {
+        const last = runs[runs.length - 1];
+        if (last && last.color === style.color && last.reverse === style.reverse && last.underline === underline && !isAttr) {
           last.text += ch;
         } else {
-          runs.push({ text: ch, ...style });
+          runs.push({ text: ch, color: style.color, reverse: style.reverse, underline });
         }
       }
       out.push(runs);
