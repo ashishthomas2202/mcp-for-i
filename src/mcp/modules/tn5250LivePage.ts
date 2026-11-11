@@ -13,8 +13,6 @@
  * The client script below must not contain backticks or "${", because it
  * sits inside a template literal.
  */
-import { FONT_3270_WOFF_BASE64 } from "./tn5250Font.js";
-
 export function renderLivePage() {
   return `<!doctype html>
 <html lang="en">
@@ -23,9 +21,6 @@ export function renderLivePage() {
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
 <title>Live 5250</title>
 <style>
-  /* 3270font (Ricardo Banffy and the 3270font Authors, BSD-3-Clause) embedded so
-     the screen renders with authentic IBM-terminal type on every machine. */
-  @font-face { font-family: "IBM3270"; src: url("data:font/woff;base64,${FONT_3270_WOFF_BASE64}") format("woff"); font-display: block; }
   :root {
     /* Chrome neutrals (a tuned ramp, not pure grey). */
     --bg: #000000; --panel: #0c110e; --elevated: #141b16; --border: rgba(255,255,255,.09);
@@ -60,7 +55,7 @@ export function renderLivePage() {
   #wrap { position: relative; outline: none; border: 1px solid var(--border); border-radius: var(--r-md); background: #000; padding: 4px 6px; }
   #wrap:focus-visible { border-color: color-mix(in srgb, var(--ui-accent) 55%, var(--border)); }
   /* No padding on #screen: the cursor is positioned from its edge, so text and cursor must share that origin. */
-  #screen { position: relative; font-family: "IBM3270", "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace; font-size: 16px; line-height: var(--lh); white-space: pre; -webkit-user-select: text; user-select: text; }
+  #screen { position: relative; font-family: "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace; font-size: 16px; line-height: var(--lh); white-space: pre; -webkit-user-select: text; user-select: text; }
   .row { height: calc(1em * var(--lh)); }
   /* Cells are inline-block the full line height so reverse-video blocks fill solidly. */
   .row span { cursor: text; display: inline-block; height: calc(1em * var(--lh)); line-height: calc(1em * var(--lh)); vertical-align: top; }
@@ -251,7 +246,7 @@ export function renderLivePage() {
   function charRatio() {
     if (charRatioCache) return charRatioCache;
     var probe = document.createElement('span');
-    probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;letter-spacing:normal;font:100px "IBM3270","Cascadia Mono",Consolas,"DejaVu Sans Mono",Menlo,monospace;';
+    probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;letter-spacing:normal;font:100px "Cascadia Mono",Consolas,"DejaVu Sans Mono",Menlo,monospace;';
     probe.textContent = '0000000000';
     document.body.appendChild(probe);
     var w = probe.getBoundingClientRect().width / 10 / 100;
