@@ -31,7 +31,7 @@ export function renderLivePage() {
     --pink: #ff5fd0; --blue: #6f8dff;
     --cursor: #ffffff;
     --r-sm: 6px; --r-md: 8px;
-    --lh: 1.34; /* line spacing (row height as a multiple of the font size) */
+    --lh: 1.25; /* line spacing (row height as a multiple of the font size) */
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
@@ -58,7 +58,7 @@ export function renderLivePage() {
   #screen { position: relative; font-family: "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace; font-size: 16px; line-height: var(--lh); white-space: pre; -webkit-user-select: text; user-select: text; }
   .row { height: calc(1em * var(--lh)); }
   /* Cells are inline-block the full line height so reverse-video blocks fill solidly. */
-  .row span { cursor: text; display: inline-block; height: 1.25em; line-height: 1.25em; vertical-align: top; }
+  .row span { cursor: text; display: inline-block; height: calc(1em * var(--lh)); line-height: calc(1em * var(--lh)); vertical-align: top; }
   .c-green { color: var(--green); } .c-white { color: var(--white); } .c-red { color: var(--red); }
   .c-turquoise { color: var(--turquoise); } .c-yellow { color: var(--yellow); } .c-pink { color: var(--pink); } .c-blue { color: var(--blue); }
   .rev { background: currentColor; }
@@ -253,7 +253,7 @@ export function renderLivePage() {
   // size), enforced with letter-spacing, so the layout is identical on every
   // machine no matter which monospace font the browser falls back to.
   var CELL = 0.6;
-  var LINE = 1.34; // keep in sync with the --lh CSS variable
+  var LINE = 1.25; // keep in sync with the --lh CSS variable
   function applyMetrics() {
     var fs = parseFloat(screenEl.style.fontSize) || 16;
     screenEl.style.letterSpacing = ((CELL - charRatio()) * fs) + 'px';
