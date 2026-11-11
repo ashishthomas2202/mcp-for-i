@@ -31,6 +31,7 @@ export function renderLivePage() {
     --pink: #ff5fd0; --blue: #6f8dff;
     --cursor: #ffffff;
     --r-sm: 6px; --r-md: 8px;
+    --lh: 1.34; /* line spacing (row height as a multiple of the font size) */
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
@@ -54,8 +55,8 @@ export function renderLivePage() {
   #wrap { position: relative; outline: none; border: 1px solid var(--border); border-radius: var(--r-md); background: #000; padding: 4px 6px; }
   #wrap:focus-visible { border-color: color-mix(in srgb, var(--ui-accent) 55%, var(--border)); }
   /* No padding on #screen: the cursor is positioned from its edge, so text and cursor must share that origin. */
-  #screen { position: relative; font: 16px/1.25 "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace; white-space: pre; -webkit-user-select: text; user-select: text; }
-  .row { height: 1.25em; }
+  #screen { position: relative; font-family: "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace; font-size: 16px; line-height: var(--lh); white-space: pre; -webkit-user-select: text; user-select: text; }
+  .row { height: calc(1em * var(--lh)); }
   /* Cells are inline-block the full line height so reverse-video blocks fill solidly. */
   .row span { cursor: text; display: inline-block; height: 1.25em; line-height: 1.25em; vertical-align: top; }
   .c-green { color: var(--green); } .c-white { color: var(--white); } .c-red { color: var(--red); }
@@ -64,8 +65,8 @@ export function renderLivePage() {
   .rev > i { color: #000; font-style: normal; }
   .ul { text-decoration: underline; }
   /* Cursor: white underline (overwrite) or white block (insert), blinking from script. */
-  #cursor { position: absolute; width: .6em; height: 2px; margin-top: calc(1.25em - 5px); background: var(--cursor); pointer-events: none; z-index: 3; box-shadow: 0 0 4px var(--cursor); }
-  #cursor.insert { height: 1.25em; margin-top: 0; background: #fff; mix-blend-mode: difference; box-shadow: none; }
+  #cursor { position: absolute; width: .6em; height: 2px; margin-top: calc(1em * var(--lh) - 4px); background: var(--cursor); pointer-events: none; z-index: 3; box-shadow: 0 0 4px var(--cursor); }
+  #cursor.insert { height: calc(1em * var(--lh)); margin-top: 0; background: #fff; mix-blend-mode: difference; box-shadow: none; }
   #cursor.blink-off { opacity: 0; }
 
   /* Bottom bar (chrome): status, keys, hint. */
@@ -91,7 +92,7 @@ export function renderLivePage() {
   body.hide-keys #keys { display: none; }
   body.hide-hint .hint { display: none; }
   body.hide-status #status { display: none; }
-  body.bare #stage { padding: 0; }
+  body.bare #stage { padding: 6px; }
   body.bare #wrap { border: none; border-radius: 0; padding: 0; }
   footer:empty, body.hide-keys.hide-hint.hide-status footer { display: none; }
 
@@ -252,6 +253,7 @@ export function renderLivePage() {
   // size), enforced with letter-spacing, so the layout is identical on every
   // machine no matter which monospace font the browser falls back to.
   var CELL = 0.6;
+  var LINE = 1.34; // keep in sync with the --lh CSS variable
   function applyMetrics() {
     var fs = parseFloat(screenEl.style.fontSize) || 16;
     screenEl.style.letterSpacing = ((CELL - charRatio()) * fs) + 'px';
@@ -262,7 +264,7 @@ export function renderLivePage() {
     if (availW < 10 || availH < 10) return;
     // Leave room for the wrap border (1px each side) and its padding.
     availW -= 16; availH -= 12;
-    var f = Math.min(availW / (cols * CELL), availH / (rows * 1.25));
+    var f = Math.min(availW / (cols * CELL), availH / (rows * LINE));
     f = Math.max(7, Math.floor(f * 100) / 100);
     screenEl.style.fontSize = f + 'px';
     applyMetrics();
@@ -322,7 +324,7 @@ export function renderLivePage() {
     screenEl.querySelectorAll('.row').forEach(function (n) { n.remove(); });
     screenEl.appendChild(frag);
     cursorEl.style.left = ((view.cursor.col - 1) * CELL) + 'em';
-    cursorEl.style.top = ((view.cursor.row - 1) * 1.25) + 'em';
+    cursorEl.style.top = ((view.cursor.row - 1) * LINE) + 'em';
     cursorEl.style.width = CELL + 'em';
     cursorEl.className = (view.insertMode ? 'insert' : '') + (cursorEl.classList.contains('blink-off') ? ' blink-off' : '');
     if (sizeChanged) fit();
