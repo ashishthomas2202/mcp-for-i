@@ -51,9 +51,10 @@ export function renderLivePage() {
 
   /* The stage holds the screen and scales it to fill. */
   #stage { flex: 1 1 auto; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; padding: 16px; background: var(--bg); }
-  #wrap { position: relative; outline: none; border: 1px solid var(--border); border-radius: var(--r-md); background: #000; }
+  #wrap { position: relative; outline: none; border: 1px solid var(--border); border-radius: var(--r-md); background: #000; padding: 4px 6px; }
   #wrap:focus-visible { border-color: color-mix(in srgb, var(--ui-accent) 55%, var(--border)); }
-  #screen { position: relative; font: 16px/1.25 "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace; white-space: pre; -webkit-user-select: text; user-select: text; padding: 2px 4px; }
+  /* No padding on #screen: the cursor is positioned from its edge, so text and cursor must share that origin. */
+  #screen { position: relative; font: 16px/1.25 "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace; white-space: pre; -webkit-user-select: text; user-select: text; }
   .row { height: 1.25em; }
   /* Cells are inline-block the full line height so reverse-video blocks fill solidly. */
   .row span { cursor: text; display: inline-block; height: 1.25em; line-height: 1.25em; vertical-align: top; }
@@ -63,7 +64,7 @@ export function renderLivePage() {
   .rev > i { color: #000; font-style: normal; }
   .ul { text-decoration: underline; }
   /* Cursor: white underline (overwrite) or white block (insert), blinking from script. */
-  #cursor { position: absolute; width: 1ch; height: 3px; margin-top: calc(1.25em - 3px); background: var(--cursor); pointer-events: none; z-index: 3; box-shadow: 0 0 4px var(--cursor); }
+  #cursor { position: absolute; width: .6em; height: 2px; margin-top: calc(1.25em - 5px); background: var(--cursor); pointer-events: none; z-index: 3; box-shadow: 0 0 4px var(--cursor); }
   #cursor.insert { height: 1.25em; margin-top: 0; background: #fff; mix-blend-mode: difference; box-shadow: none; }
   #cursor.blink-off { opacity: 0; }
 
@@ -91,7 +92,7 @@ export function renderLivePage() {
   body.hide-hint .hint { display: none; }
   body.hide-status #status { display: none; }
   body.bare #stage { padding: 0; }
-  body.bare #wrap { border: none; border-radius: 0; }
+  body.bare #wrap { border: none; border-radius: 0; padding: 0; }
   footer:empty, body.hide-keys.hide-hint.hide-status footer { display: none; }
 
   /* Floating controls toggle. */
@@ -247,16 +248,24 @@ export function renderLivePage() {
     charRatioCache = w || 0.6;
     return charRatioCache;
   }
+  // Every character sits on a fixed grid CELL wide (as a fraction of the font
+  // size), enforced with letter-spacing, so the layout is identical on every
+  // machine no matter which monospace font the browser falls back to.
+  var CELL = 0.6;
+  function applyMetrics() {
+    var fs = parseFloat(screenEl.style.fontSize) || 16;
+    screenEl.style.letterSpacing = ((CELL - charRatio()) * fs) + 'px';
+  }
   function fit() {
     var cols = (last && last.cols) || 80, rows = (last && last.rows) || 24;
     var availW = stage.clientWidth, availH = stage.clientHeight;
     if (availW < 10 || availH < 10) return;
-    // Leave room for the wrap border (1px) and screen padding (a few px each side).
-    availW -= 12; availH -= 8;
-    var r = charRatio();
-    var f = Math.min(availW / (cols * r), availH / (rows * 1.25));
-    f = Math.max(7, Math.floor(f * 10) / 10);
+    // Leave room for the wrap border (1px each side) and its padding.
+    availW -= 16; availH -= 12;
+    var f = Math.min(availW / (cols * CELL), availH / (rows * 1.25));
+    f = Math.max(7, Math.floor(f * 100) / 100);
     screenEl.style.fontSize = f + 'px';
+    applyMetrics();
   }
   var fitTimer = null;
   window.addEventListener('resize', function () { if (fitTimer) clearTimeout(fitTimer); fitTimer = setTimeout(fit, 60); });
@@ -312,8 +321,9 @@ export function renderLivePage() {
     });
     screenEl.querySelectorAll('.row').forEach(function (n) { n.remove(); });
     screenEl.appendChild(frag);
-    cursorEl.style.left = (view.cursor.col - 1) + 'ch';
+    cursorEl.style.left = ((view.cursor.col - 1) * CELL) + 'em';
     cursorEl.style.top = ((view.cursor.row - 1) * 1.25) + 'em';
+    cursorEl.style.width = CELL + 'em';
     cursorEl.className = (view.insertMode ? 'insert' : '') + (cursorEl.classList.contains('blink-off') ? ' blink-off' : '');
     if (sizeChanged) fit();
     var blocked = view.inputInhibited ? 'Input blocked — press Reset (Ctrl, or the Reset button)'
