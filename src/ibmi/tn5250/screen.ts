@@ -995,6 +995,15 @@ export class Screen {
   renderRuns(): ScreenRun[][] {
     const rows = this.renderRows();
     const out: ScreenRun[][] = [];
+    // Underline follows the field's defined length, not the attribute span: a
+    // real emulator underlines only the enterable positions, so a one-character
+    // field shows a one-character line, however far the host's underline
+    // attribute happens to run before the next attribute byte.
+    const underlineMask = new Uint8Array(this.size);
+    for (const field of this.fields) {
+      if (!attributeStyle(field.attr).underline) continue;
+      for (let n = 0; n < field.length; n += 1) underlineMask[(field.start + n) % this.size] = 1;
+    }
     let attr = 0x20;
     for (let r = 0; r < this.rows; r += 1) {
       const runs: ScreenRun[] = [];
@@ -1003,9 +1012,7 @@ export class Screen {
         const isAttr = this.attrMap[p] !== 0;
         if (isAttr) attr = this.buffer[p];
         const style = attributeStyle(attr);
-        // The attribute byte itself is a blank and is never underlined, so a
-        // field's underline starts on its first data cell, under the cursor.
-        const underline = isAttr ? false : style.underline;
+        const underline = underlineMask[p] === 1;
         const ch = rows[r][c];
         const last = runs[runs.length - 1];
         if (last && last.color === style.color && last.reverse === style.reverse && last.underline === underline && !isAttr) {

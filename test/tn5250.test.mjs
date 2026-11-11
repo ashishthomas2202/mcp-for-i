@@ -822,3 +822,21 @@ test("live view: read-only connections refuse the person's host keys", async () 
     await host.stop();
   }
 });
+
+test("underline follows the field length, not the attribute span", () => {
+  const screen = new Screen();
+  // Underlined 2-char input field at col 11 (attr 0x24 at col 10), with the
+  // next attribute byte far to the right at col 30.
+  apply(screen, Buffer.concat([
+    B([0x04, 0x40, 0x04, 0x11, 0x00, 0x18]), B([0x01, 0x07, 0, 0, 0, 0x18, 0, 0, 0]),
+    B(sba(1, 2)), E("Qty"),
+    B([...sba(1, 10), 0x1d, 0x40, 0x20, 0x24, 0x00, 0x02]),
+    B([...sba(1, 30), 0x20]),
+    B([0x13, 1, 11]), B([0x04, 0x52, 0x00, 0x00])
+  ]));
+  assert.equal(screen.view().fields[0].length, 2);
+  const underlined = [];
+  let col = 1;
+  for (const run of screen.renderRuns()[0]) { if (run.underline) underlined.push({ col, len: run.text.length }); col += run.text.length; }
+  assert.deepEqual(underlined, [{ col: 11, len: 2 }], "underline spans only the 2-char field, not to the next attribute");
+});
