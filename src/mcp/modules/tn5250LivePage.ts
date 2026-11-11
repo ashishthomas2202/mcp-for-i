@@ -13,6 +13,8 @@
  * The client script below must not contain backticks or "${", because it
  * sits inside a template literal.
  */
+import { FONT_3270_WOFF_BASE64 } from "./tn5250Font.js";
+
 export function renderLivePage() {
   return `<!doctype html>
 <html lang="en">
@@ -21,6 +23,9 @@ export function renderLivePage() {
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
 <title>Live 5250</title>
 <style>
+  /* 3270font (Ricardo Banffy and the 3270font Authors, BSD-3-Clause) embedded so
+     the screen renders with authentic IBM-terminal type on every machine. */
+  @font-face { font-family: "IBM3270"; src: url("data:font/woff;base64,${FONT_3270_WOFF_BASE64}") format("woff"); font-display: block; }
   :root {
     /* Chrome neutrals (a tuned ramp, not pure grey). */
     --bg: #000000; --panel: #0c110e; --elevated: #141b16; --border: rgba(255,255,255,.09);
@@ -55,7 +60,7 @@ export function renderLivePage() {
   #wrap { position: relative; outline: none; border: 1px solid var(--border); border-radius: var(--r-md); background: #000; padding: 4px 6px; }
   #wrap:focus-visible { border-color: color-mix(in srgb, var(--ui-accent) 55%, var(--border)); }
   /* No padding on #screen: the cursor is positioned from its edge, so text and cursor must share that origin. */
-  #screen { position: relative; font-family: "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace; font-size: 16px; line-height: var(--lh); white-space: pre; -webkit-user-select: text; user-select: text; }
+  #screen { position: relative; font-family: "IBM3270", "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace; font-size: 16px; line-height: var(--lh); white-space: pre; -webkit-user-select: text; user-select: text; }
   .row { height: calc(1em * var(--lh)); }
   /* Cells are inline-block the full line height so reverse-video blocks fill solidly. */
   .row span { cursor: text; display: inline-block; height: calc(1em * var(--lh)); line-height: calc(1em * var(--lh)); vertical-align: top; }
@@ -236,29 +241,27 @@ export function renderLivePage() {
   });
 
   // Fit the 80x24 (or 27x132) grid to fill the stage: scale the font so the
-  // grid fills whichever of width or height runs out first.
+  // grid fills whichever of width or height runs out first. The embedded 3270
+  // font gives one fixed character shape on every machine, so the grid is the
+  // font's own natural advance (no letter-spacing distortion) and is identical
+  // everywhere.
+  var CELL = 0.5; // the screen font's natural character-width ratio (measured)
+  var LINE = 1.25; // keep in sync with the --lh CSS variable
   var charRatioCache = 0;
   function charRatio() {
     if (charRatioCache) return charRatioCache;
     var probe = document.createElement('span');
-    probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;font:100px/1.25 "Cascadia Mono",Consolas,"DejaVu Sans Mono",Menlo,monospace;';
+    probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;letter-spacing:normal;font:100px "IBM3270","Cascadia Mono",Consolas,"DejaVu Sans Mono",Menlo,monospace;';
     probe.textContent = '0000000000';
     document.body.appendChild(probe);
     var w = probe.getBoundingClientRect().width / 10 / 100;
     document.body.removeChild(probe);
-    charRatioCache = w || 0.6;
+    charRatioCache = w || 0.5;
+    CELL = charRatioCache;
     return charRatioCache;
   }
-  // Every character sits on a fixed grid CELL wide (as a fraction of the font
-  // size), enforced with letter-spacing, so the layout is identical on every
-  // machine no matter which monospace font the browser falls back to.
-  var CELL = 0.6;
-  var LINE = 1.25; // keep in sync with the --lh CSS variable
-  function applyMetrics() {
-    var fs = parseFloat(screenEl.style.fontSize) || 16;
-    screenEl.style.letterSpacing = ((CELL - charRatio()) * fs) + 'px';
-  }
   function fit() {
+    charRatio();
     var cols = (last && last.cols) || 80, rows = (last && last.rows) || 24;
     var availW = stage.clientWidth, availH = stage.clientHeight;
     if (availW < 10 || availH < 10) return;
@@ -267,8 +270,9 @@ export function renderLivePage() {
     var f = Math.min(availW / (cols * CELL), availH / (rows * LINE));
     f = Math.max(7, Math.floor(f * 100) / 100);
     screenEl.style.fontSize = f + 'px';
-    applyMetrics();
   }
+  // Re-measure and re-fit once the embedded font has actually loaded.
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { charRatioCache = 0; fit(); });
   var fitTimer = null;
   window.addEventListener('resize', function () { if (fitTimer) clearTimeout(fitTimer); fitTimer = setTimeout(fit, 60); });
 
