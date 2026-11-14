@@ -11,7 +11,7 @@ import {
   ListToolsRequestSchema,
   ReadResourceRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { getTools, handleTool } from "./mcp/tools.js";
+import { getTools, handleToolCall, ToolCallState } from "./mcp/tools.js";
 import { McpContext } from "./mcp/context.js";
 import { createElicitationConfirm } from "./mcp/confirm.js";
 import { log } from "./mcp/logger.js";
@@ -112,6 +112,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const startedAt = Date.now();
   // Computed before the call: module redaction depends on the state the call starts from.
   let redactedArgs: unknown;
+  // Filled in during the call: in host mode, who approved it.
+  const callState: ToolCallState = { toolName: name };
   try {
     const toolDef = toolMap.get(name);
     if (!toolDef) throw new Error(`Unknown tool: ${name}`);
@@ -121,7 +123,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     redactedArgs = redactSensitive(redactModuleArgs(ctx, name, args || {}));
     log("info", "tool.call", { name, correlationId, args: redactedArgs });
-    const result = await handleTool(ctx, name, args || {});
+    const result = await handleToolCall(ctx, name, args || {}, callState);
     const durationMs = Date.now() - startedAt;
     log("debug", "tool.result", { name, correlationId, durationMs });
     await safeAppendAudit({
@@ -130,6 +132,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       args: redactedArgs,
       connectionName: resolveConnectionName(name, args || {}, ctx.activeName),
       approve: Boolean(args && typeof args === "object" && (args as any).approve),
+      approvedBy: callState.approvedBy,
       durationMs,
       correlationId,
       resultSummary: summarizeResult(result)
@@ -145,6 +148,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       args: redactedArgs ?? redactSensitive(redactModuleArgs(ctx, name, args || {})),
       connectionName: resolveConnectionName(name, args || {}, ctx.activeName),
       approve: Boolean(args && typeof args === "object" && (args as any).approve),
+      approvedBy: callState.approvedBy,
       durationMs,
       correlationId,
       error: redactSecretsInText(errorMessage)

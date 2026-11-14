@@ -188,3 +188,18 @@ test("a second test of the same endpoint while one runs is refused", async () =>
   release({ ok: true });
   await first;
 });
+
+test("policy: a profile-only update keeps host mode settings; bad policies are refused", async () => {
+  const service = new ConnectionService(new ConfigStore(), async () => ({ ok: true }));
+  const policy = { profile: "guarded", approvalMode: "host", trustedLibraries: ["DEVME", "QTEMP"], alwaysConfirm: ["shell.run"] };
+  await service.add({ name: "HOSTPOL", host: "h.example.com", username: "ME", policy });
+  // The web UI sends only the profile.
+  await service.update("HOSTPOL", { policy: { profile: "guarded" } });
+  const saved = await service.get("HOSTPOL");
+  assert.equal(saved.policy.approvalMode, "host");
+  assert.deepEqual(saved.policy.trustedLibraries, ["DEVME", "QTEMP"]);
+
+  await assert.rejects(service.update("HOSTPOL", { policy: { profile: "guarded", approvalMode: "auto" } }), err => err.status === 400 || err.statusCode === 400);
+  await assert.rejects(service.add({ name: "BAD", host: "b.example.com", username: "ME", policy: { profile: "guarded", trustedLibraries: "DEVME" } }), /trustedLibraries/);
+  await service.delete("HOSTPOL");
+});

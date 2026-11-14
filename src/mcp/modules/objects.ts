@@ -244,10 +244,25 @@ const tools: ToolModule["tools"] = [
   }
 ];
 
+/**
+ * The operation each tool is checked as. Removing, moving and renaming get
+ * their own names so a host-mode policy can list them; "prompt" and "agent"
+ * mode treat them as qsys.write, as before.
+ */
+export function objectOperation(name: string, args: any) {
+  switch (name) {
+    case "ibmi.objects.delete":
+      return String(args?.objectType ?? "").trim().toUpperCase() === "*LIB" ? "qsys.deleteLibrary" : "objects.delete";
+    case "ibmi.objects.move": return "objects.move";
+    case "ibmi.objects.rename": return "objects.rename";
+    default: return "qsys.write";
+  }
+}
+
 async function handle(ctx: McpContext, name: string, args: any) {
   args = args || {};
   const conn = await ctx.ensureActive(args.connectionName);
-  await enforceWritable(ctx, conn, "qsys.write", args);
+  await enforceWritable(ctx, conn, objectOperation(name, args), args);
 
   switch (name) {
     case "ibmi.objects.copy": {

@@ -19,6 +19,7 @@ export function createElicitationConfirm(server: Server, timeoutMs = CONFIRMATIO
         params: {
           mode: "form",
           message: confirmationMessage(request),
+          _meta: confirmationMeta(request),
           requestedSchema: request.allowSession
             ? {
               type: "object",
@@ -40,6 +41,21 @@ export function createElicitationConfirm(server: Server, timeoutMs = CONFIRMATIO
       allowed: result.action === "accept",
       forSession: result.action === "accept" && result.content?.allowForSession === true
     };
+  };
+}
+
+/**
+ * Machine-readable facts about the prompt, so a host can decide or display
+ * it without parsing the message text.
+ */
+export function confirmationMeta(request: ConfirmationRequest) {
+  return {
+    "mcp-for-i/operation": request.specificOperation || request.operation,
+    "mcp-for-i/tool": request.toolName || "",
+    "mcp-for-i/connection": request.connectionName || "",
+    "mcp-for-i/libraries": (request.libraries || []).map(lib => String(lib).toUpperCase()),
+    "mcp-for-i/critical": Boolean(request.critical),
+    "mcp-for-i/reason": request.reason || `${request.operation} needs approval under the guarded policy.`
   };
 }
 

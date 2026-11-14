@@ -205,6 +205,40 @@ OTP is only needed when the npm account has two-factor authentication enabled fo
 - Tool schemas are strict (`additionalProperties: false`) with runtime argument validation, including nested connection/action/filter/profile payloads.
 - QSYS object names and source settings are validated before command execution to reduce interpolation and injection risk.
 
+### Approval modes
+
+Under the default `guarded` profile, each connection's `policy.approvalMode` decides how guarded operations are approved:
+
+- `"prompt"` (default): the MCP client asks the person (MCP elicitation) before each guarded operation. The agent's `approve` flag is ignored.
+- `"agent"`: `approve: true` from the agent is enough, for clients that cannot show prompts.
+- `"host"`: for MCP clients that run **their own approval layer** (they already approve each tool call, for example per chat). Routine guarded operations run without a prompt and without `approve`. Only critical operations still ask the person, every time, with an empty form (no "allow for this session" checkbox). A host that is told not to ask the person may accept an empty form by itself; a host that shows prompts shows it. Use it only with such a client: with any other client it removes the approval step for routine writes.
+
+In host mode an operation is critical when:
+
+1. its operation is in `alwaysConfirm` (default: `shell.run`, `ifs.delete`, `audit.purge`, `journal.receivers.delete`, `deploy.sync`, `members.delete`, `members.rename`, `objects.delete`, `objects.move`, `objects.rename`, `qsys.deleteLibrary`, `jobs.end`, `subsystems.end`, `spool.delete`, `spool.move`, `journal.end`, `debug.end`, `dataqueue.remove`);
+2. it is `ibmi.cl.run` (or an action, or a 5250 command line) whose command is in `confirmClCommands` (default: `DLT*`, `CLR*`, `RMV*`, `RNM*`, `MOV*`, `END*`, `RST*`, `PWRDWNSYS`, `RCLSTG`, `INZSYS`, `CRTUSRPRF`, `CHGUSRPRF`, `CHGUSRAUD`, `CHGOBJAUD`, `GRTOBJAUT`, `RVKOBJAUT`, `GRTUSRAUT`, `CHGOBJOWN`, `CHGAUT`, `CHGOWN`, `CHGPGP`, `CHGSYSVAL`, `CHGNETA`, `CHGTCPA`, `CHGIPLA`, `RUNSQLSTM`, with the exceptions `!RMVLIBLE`, `!DLTOVR`, `!ENDDBG`). Commands inside `SBMJOB CMD(...)`, `CALL QCMDEXC` and `RUNSQL` are checked too;
+3. it is `ibmi.sql.execute` with a statement in `confirmSqlVerbs` (default: `DELETE`, `TRUNCATE`, `DROP TABLE`, `DROP SCHEMA`, `DROP COLLECTION`, `ALTER`, `GRANT`, `REVOKE`, `CALL`, `RENAME`), or with embedded CL that is critical or built at run time;
+4. `trustedLibraries` is set and the operation writes to a library outside it, or its target library cannot be determined (an unqualified `CALL`, `*LIBL`, an unqualified SQL name).
+
+Builds (`CRT*`), `CALL`, `SBMJOB` of a `CALL`, library list and override commands, `CREATE`/`DROP ALIAS`, `CREATE`/`DROP VIEW`, `CREATE TABLE`, `INSERT`, `UPDATE` and `MERGE` stay routine (subject to rule 4). Everything else in the policy still applies in host mode: the `read-only` profile, `readOnlyMode`, allow/deny lists for commands, libraries and paths, the shell checks and the safe IFS delete paths. The audit log records `approvedBy: "host"` for routine operations and `approvedBy: "person"` for confirmed ones. Every prompt, in every mode, carries `_meta` keys (`mcp-for-i/operation`, `mcp-for-i/tool`, `mcp-for-i/connection`, `mcp-for-i/libraries`, `mcp-for-i/critical`, `mcp-for-i/reason`) so a host does not have to parse the message.
+
+Example connection:
+
+```json
+{
+  "name": "DEV400",
+  "host": "dev400.myco.com",
+  "username": "DEVUSER",
+  "policy": {
+    "profile": "guarded",
+    "approvalMode": "host",
+    "trustedLibraries": ["DEVUSER", "PGMUSER", "DTAUSER", "QTEMP"]
+  }
+}
+```
+
+`alwaysConfirm`, `confirmClCommands` and `confirmSqlVerbs` replace their defaults when set. See [configuration](docs/configuration.md) for the exact rules.
+
 ## Fast Source Investigation
 
 The existing member tools remain compatible: an unchanged `ibmi.qsys.members.list` call still returns an array, and an unchanged `ibmi.qsys.members.read` call still returns source text. New callers can opt into faster, bounded workflows:

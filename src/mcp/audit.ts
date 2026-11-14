@@ -15,6 +15,8 @@ export type AppendAuditInput = {
   args: unknown;
   connectionName?: string;
   approve?: boolean;
+  /** approvalMode "host": "host" when the client's approval was enough, "person" when the person confirmed. */
+  approvedBy?: "host" | "person";
   durationMs: number;
   correlationId: string;
   error?: string;
@@ -38,6 +40,7 @@ export type AuditRecord = {
   status: AuditStatus;
   connectionName?: string;
   approve?: boolean;
+  approvedBy?: "host" | "person";
   durationMs: number;
   correlationId: string;
   argsHash: string;
@@ -137,6 +140,7 @@ export async function appendAuditRecord(input: AppendAuditInput): Promise<AuditR
         status: input.status,
         connectionName: input.connectionName,
         approve: input.approve,
+        approvedBy: input.approvedBy,
         durationMs: input.durationMs,
         correlationId: input.correlationId,
         argsHash,
@@ -356,7 +360,8 @@ export async function exportAuditRecords(options: {
       "argsHash",
       "prevHash",
       "hash",
-      "error"
+      "error",
+      "approvedBy"
     ];
     const lines = [header.join(",")];
     for (const row of records) {
@@ -372,7 +377,8 @@ export async function exportAuditRecords(options: {
         row.argsHash,
         row.prevHash,
         row.hash,
-        row.error || ""
+        row.error || "",
+        row.approvedBy || ""
       ];
       lines.push(values.map(value => csvEscape(String(value ?? ""))).join(","));
     }

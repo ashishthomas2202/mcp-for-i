@@ -324,3 +324,24 @@ test("several processes appending at once extend one chain", async () => {
     assert.equal(verify.anchor.lastSeq, 40);
   });
 });
+
+test("approvedBy is stored, hashed with the record, listed and exported", async () => {
+  await withAuditLog(async ({ tempDir, logPath }) => {
+    await append(1, { approvedBy: "host" });
+    await append(2, { approvedBy: "person" });
+    await append(3);
+    const lines = (await readLines(logPath)).map(line => JSON.parse(line));
+    assert.deepEqual(lines.map(r => r.approvedBy), ["host", "person", undefined]);
+    assert.equal((await verifyAuditChain()).ok, true);
+
+    // Changing who approved breaks the chain.
+    lines[0].approvedBy = "person";
+    await fs.writeFile(logPath, lines.map(r => JSON.stringify(r)).join("\n") + "\n");
+    assert.equal((await verifyAuditChain()).ok, false);
+
+    const csvPath = path.join(tempDir, "audit.csv");
+    await exportAuditRecords({ format: "csv", outputPath: csvPath });
+    const header = (await fs.readFile(csvPath, "utf8")).split("\n")[0];
+    assert.ok(header.endsWith(",approvedBy"));
+  });
+});

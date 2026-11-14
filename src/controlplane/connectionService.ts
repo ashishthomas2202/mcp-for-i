@@ -1,4 +1,4 @@
-import { ConfigStore, ConnectionPolicy, StoredConnection } from "../config/store.js";
+import { ConfigStore, ConnectionPolicy, StoredConnection, validatePolicy } from "../config/store.js";
 import { deletePassword, getPassword, setPassword } from "../security/credentialStore.js";
 import { ControlPlaneError } from "./errors.js";
 import { ConnectionTestResult, ConnectionTestTarget, testConnection } from "./connectionTest.js";
@@ -14,6 +14,11 @@ export function connectionEndpointChanged(
   return host(before.host) !== host(after.host)
     || port(before.port) !== port(after.port)
     || user(before.username) !== user(after.username);
+}
+
+function assertValidPolicy(policy: unknown) {
+  const errors = validatePolicy(policy);
+  if (errors.length > 0) throw new ControlPlaneError(400, `Invalid policy: ${errors.join("; ")}`);
 }
 
 export type ConnectionUpsertInput = {
@@ -121,6 +126,7 @@ export class ConnectionService {
     if (await this.store.getConnection(input.name)) {
       throw new ControlPlaneError(409, `Connection ${input.name} already exists`);
     }
+    assertValidPolicy(input.policy);
     await this.store.upsertConnection({
       name: input.name,
       host: input.host,
@@ -139,6 +145,7 @@ export class ConnectionService {
   async update(name: string, input: Partial<ConnectionUpsertInput>) {
     const existing = await this.store.getConnection(name);
     if (!existing) throw new ControlPlaneError(404, `Connection ${name} not found`);
+    assertValidPolicy(input.policy);
 
     const next: StoredConnection = {
       ...existing,
@@ -147,7 +154,9 @@ export class ConnectionService {
       username: input.username ?? existing.username,
       privateKeyPath: input.privateKeyPath ?? existing.privateKeyPath,
       settings: input.settings ? { ...(existing.settings || {}), ...input.settings } : existing.settings,
-      policy: input.policy ?? existing.policy
+      // Merge, so a caller that sends only the profile (the web UI) keeps the
+      // other policy settings, such as approvalMode and trustedLibraries.
+      policy: input.policy ? { ...(existing.policy || {}), ...input.policy } as ConnectionPolicy : existing.policy
     };
 
     // A saved password must never follow the connection to a different

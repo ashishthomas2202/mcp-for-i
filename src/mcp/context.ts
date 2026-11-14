@@ -38,6 +38,14 @@ export type ConfirmationRequest = {
   details: string[];
   /** Whether "allow for the rest of this session" may be offered. */
   allowSession: boolean;
+  /** The specific operation (e.g. "members.delete"), for the prompt metadata. Defaults to `operation`. */
+  specificOperation?: string;
+  /** Libraries the operation writes to, upper case. */
+  libraries?: string[];
+  /** Whether the operation is critical under the host-mode rules. */
+  critical?: boolean;
+  /** One short sentence: why the person is asked. */
+  reason?: string;
 };
 
 export type ConfirmationAnswer =

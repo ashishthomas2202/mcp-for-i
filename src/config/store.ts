@@ -12,9 +12,14 @@ export type PolicyProfile = "read-only" | "guarded" | "power-user";
 /**
  * How guarded operations are approved. "prompt" (default) asks the person
  * through the MCP client. "agent" accepts approve=true from the agent, for
- * clients that cannot show prompts.
+ * clients that cannot show prompts. "host" is for clients that run their own
+ * approval layer: routine operations run without a prompt and only critical
+ * ones (alwaysConfirm, confirmClCommands, confirmSqlVerbs, trustedLibraries)
+ * ask the person.
  */
-export type ApprovalMode = "prompt" | "agent";
+export type ApprovalMode = "prompt" | "agent" | "host";
+
+export const APPROVAL_MODES: ApprovalMode[] = ["prompt", "agent", "host"];
 
 export type ConnectionPolicy = {
   profile: PolicyProfile;
@@ -26,7 +31,59 @@ export type ConnectionPolicy = {
   denyLibraries?: string[];
   allowPaths?: string[];
   denyPaths?: string[];
+  /** Host mode: operations that always ask the person. */
+  alwaysConfirm?: string[];
+  /** Host mode: CL commands that ask the person (`*` generic, `!` exception). */
+  confirmClCommands?: string[];
+  /** Host mode: SQL statements that ask the person, by leading keywords ("DELETE", "DROP TABLE"). */
+  confirmSqlVerbs?: string[];
+  /** Host mode: writes to any other library ask the person. Unset means no library check. */
+  trustedLibraries?: string[];
 };
+
+const POLICY_STRING_LISTS = [
+  "requireApprovalFor", "allowCommands", "denyCommands", "allowLibraries", "denyLibraries", "allowPaths", "denyPaths",
+  "alwaysConfirm", "confirmClCommands", "confirmSqlVerbs", "trustedLibraries"
+] as const;
+
+const OPERATION_NAME = /^[a-z][a-zA-Z0-9]*(?:\.[a-zA-Z][a-zA-Z0-9]*)+$/;
+const CL_COMMAND_ENTRY = /^!?(?:[A-Z#@$*][A-Z0-9#@$_*]{0,9}\/)?[A-Z#@$][A-Z0-9#@$_]{0,9}\*?$/i;
+const SQL_VERB_ENTRY = /^[A-Z]+(?:\s+[A-Z]+){0,2}$/i;
+const LIBRARY_ENTRY = /^[A-Z#@$][A-Z0-9#@$_.]{0,9}\*?$/i;
+
+/**
+ * Problems with a connection policy, for callers that reject bad input
+ * (the control plane). An empty array means the policy is valid.
+ */
+export function validatePolicy(value: unknown): string[] {
+  const errors: string[] = [];
+  if (value === undefined) return errors;
+  if (!isPlainObject(value)) return ["policy must be an object"];
+  const profile = value.profile;
+  if (profile !== undefined && profile !== "read-only" && profile !== "guarded" && profile !== "power-user") {
+    errors.push(`policy.profile must be "read-only", "guarded" or "power-user"`);
+  }
+  if (value.approvalMode !== undefined && !APPROVAL_MODES.includes(value.approvalMode as ApprovalMode)) {
+    errors.push(`policy.approvalMode must be "prompt", "agent" or "host"`);
+  }
+  for (const key of POLICY_STRING_LISTS) {
+    const list = value[key];
+    if (list === undefined) continue;
+    if (!Array.isArray(list) || list.some(item => typeof item !== "string" || !item.trim())) {
+      errors.push(`policy.${key} must be an array of non-empty strings`);
+      continue;
+    }
+    const pattern = key === "alwaysConfirm" ? OPERATION_NAME
+      : key === "confirmClCommands" ? CL_COMMAND_ENTRY
+        : key === "confirmSqlVerbs" ? SQL_VERB_ENTRY
+          : key === "trustedLibraries" ? LIBRARY_ENTRY
+            : undefined;
+    if (!pattern) continue;
+    const bad = (list as string[]).filter(item => !pattern.test(item.trim()));
+    if (bad.length > 0) errors.push(`policy.${key} has invalid entries: ${bad.join(", ")}`);
+  }
+  return errors;
+}
 
 export type Settings = {
   readOnlyMode: boolean;
@@ -534,7 +591,19 @@ function normalizePolicy(value: unknown): ConnectionPolicy | undefined {
   if (!Array.isArray(policy.denyLibraries)) delete policy.denyLibraries;
   if (!Array.isArray(policy.allowPaths)) delete policy.allowPaths;
   if (!Array.isArray(policy.denyPaths)) delete policy.denyPaths;
-  if (policy.approvalMode !== "prompt" && policy.approvalMode !== "agent") delete policy.approvalMode;
+  if (!APPROVAL_MODES.includes(policy.approvalMode as ApprovalMode)) delete policy.approvalMode;
+  // Bad host-mode lists fall back to the safe side: a bad confirm list is
+  // dropped (its default, which asks more, applies), and a bad trustedLibraries
+  // keeps only valid names, so nothing outside what was meant becomes trusted.
+  const errors = validatePolicy({ ...policy, profile: normalizedProfile });
+  for (const key of ["alwaysConfirm", "confirmClCommands", "confirmSqlVerbs"] as const) {
+    if (policy[key] !== undefined && errors.some(e => e.startsWith(`policy.${key} `))) delete policy[key];
+  }
+  if (policy.trustedLibraries !== undefined) {
+    policy.trustedLibraries = Array.isArray(policy.trustedLibraries)
+      ? policy.trustedLibraries.filter(item => typeof item === "string" && LIBRARY_ENTRY.test(item.trim())).map(item => item.trim().toUpperCase())
+      : [];
+  }
   return policy;
 }
 

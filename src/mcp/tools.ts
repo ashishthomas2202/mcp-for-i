@@ -16,6 +16,7 @@ import { checkReadOnlySql, getSqlStatementType as parseSqlStatementType } from "
 import { ConnectionPolicy } from "../config/store.js";
 import { ConnectionService } from "../controlplane/connectionService.js";
 import { log } from "./logger.js";
+import { baseOperation, classifyHostOperation } from "./hostApproval.js";
 import {
   assertAgentConnectionChangeAllowed,
   assertSafeIfsDeletePath,
@@ -1395,13 +1396,28 @@ export function getTools() {
   ];
   return [...tools, ...toolModules.flatMap(module => module.tools)]
     .map(withGuardedApprovalHint)
+    .map(withApproveHostNote)
     .map(withSourceConnectionName)
     .map(withStrictInputSchema)
     .map(withAnnotations);
 }
 
 /** The outermost tool call being handled, so confirmation prompts can name it. */
-const toolCallStore = new AsyncLocalStorage<{ toolName: string }>();
+const toolCallStore = new AsyncLocalStorage<ToolCallState>();
+
+/** Per tool call: its name, and in host mode who approved it. */
+export type ToolCallState = {
+  toolName: string;
+  /** Host mode: "host" when the client's approval was enough, "person" when the person confirmed. */
+  approvedBy?: "host" | "person";
+  /** Host mode: the person already confirmed this call, so later checks in it don't ask again. */
+  personConfirmed?: boolean;
+};
+
+/** Run a tool call with a state object the caller can read afterwards (for the audit). */
+export function handleToolCall(ctx: McpContext, name: string, args: any, state: ToolCallState = { toolName: name }) {
+  return toolCallStore.run(state, () => handleTool(ctx, name, args));
+}
 
 export async function handleTool(ctx: McpContext, name: string, args: any): Promise<any> {
   if (!toolCallStore.getStore()) {
@@ -1610,13 +1626,13 @@ export async function handleTool(ctx: McpContext, name: string, args: any): Prom
     }
     case "ibmi.qsys.members.rename": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      await enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "members.rename", args);
       await conn.content.renameMember(args.library, args.sourceFile, args.member, args.newMember);
       return result("OK");
     }
     case "ibmi.qsys.members.delete": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      await enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "members.delete", args);
       await conn.content.deleteMember(args.library, args.sourceFile, args.member);
       return result("OK");
     }
@@ -2043,7 +2059,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any): Prom
     }
     case "ibmi.debug.stopService": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      await enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "debug.end", args);
       const res = await conn.sendCommand({ command: `/QIBM/ProdData/IBMiDebugService/bin/stopDebugService.sh` });
       return commandOutcome({ ok: res.code === 0, ...res });
     }
@@ -2337,14 +2353,14 @@ export async function handleTool(ctx: McpContext, name: string, args: any): Prom
     }
     case "ibmi.spool.delete": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      await enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "spool.delete", args);
       const command = buildSpoolCommand("DLTSPLF", args);
       const cmdResult = await runClCommand(conn, command, "ile", undefined, 45000);
       return commandOutcome({ ok: cmdResult.code === 0, command, ...cmdResult });
     }
     case "ibmi.spool.move": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      await enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "spool.move", args);
       const baseCommand = buildSpoolCommand("CHGSPLFA", args);
       const outQueueLibrary = requireIbmObjectName(args.outQueueLibrary, "outQueueLibrary");
       const outQueue = requireIbmObjectName(args.outQueue, "outQueue");
@@ -2382,7 +2398,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any): Prom
     }
     case "ibmi.jobs.end": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      await enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "jobs.end", args);
       const jobName = requireJobName(args.jobName);
       const option = String(args?.option || "*CNTRLD").toUpperCase();
       if (option !== "*CNTRLD" && option !== "*IMMED") {
@@ -2420,7 +2436,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any): Prom
     }
     case "ibmi.subsystems.end": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      await enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "subsystems.end", args);
       const subsystem = requireIbmObjectName(args.subsystem, "subsystem");
       const option = String(args?.option || "*CNTRLD").toUpperCase();
       if (option !== "*CNTRLD" && option !== "*IMMED") {
@@ -2536,7 +2552,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any): Prom
       // Peek by default. Removing an entry changes the queue, so it goes
       // through the same write gate as the other write tools.
       const remove = args?.remove === true;
-      if (remove) await enforceWritable(ctx, conn, "qsys.write", args);
+      if (remove) await enforceWritable(ctx, conn, "dataqueue.remove", args);
       const rows = await queryDataQueueEntries(conn, { library, queue, waitSeconds, remove });
       return json(rows);
     }
@@ -2733,7 +2749,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any): Prom
     }
     case "ibmi.journal.endPf": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      await enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "journal.end", args);
       const lib = requireIbmObjectName(args.library, "library");
       const file = requireIbmObjectName(args.file, "file");
       const command = `ENDJRNPF FILE(${lib}/${file})`;
@@ -2761,7 +2777,7 @@ export async function handleTool(ctx: McpContext, name: string, args: any): Prom
     }
     case "ibmi.journal.endIfs": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      await enforceWritable(ctx, conn, "qsys.write", args);
+      await enforceWritable(ctx, conn, "journal.end", args);
       const objectType = requireIfsJournalObjectType(args?.objectType);
       const objectPath = requireIfsPath(args.path, "path");
       const command = `ENDJRNOBJ OBJ((${quoteClString(objectPath)} ${objectType}))`;
@@ -4630,7 +4646,7 @@ function isReadOnlySql(sql: string) {
 
 export async function enforceWritable(ctx: McpContext, conn: any, operation: string, args: any) {
   if (conn.getConfig().readOnlyMode) throw new Error("Connection is in read-only mode");
-  await enforcePolicyOperation(ctx, operation, args);
+  await enforcePolicyOperation(ctx, operation, args, conn);
 }
 
 /**
@@ -4641,28 +4657,97 @@ export async function enforceWritable(ctx: McpContext, conn: any, operation: str
 export async function enforceWritableForPerson(ctx: McpContext, conn: any, operation: string, args: any) {
   if (conn.getConfig().readOnlyMode) throw new Error("Connection is in read-only mode");
   const policy = ctx.getPolicy(args?.connectionName);
-  if (policy.profile === "read-only") throw new Error(`Blocked by policy (${policy.profile}): ${operation}`);
-  const deniedReason = isDeniedByPolicy(policy, operation, args);
-  if (deniedReason) throw new Error(`Blocked by policy: ${operation} (${deniedReason})`);
+  const base = baseOperation(operation);
+  if (policy.profile === "read-only") throw new Error(`Blocked by policy (${policy.profile}): ${base}`);
+  const deniedReason = isDeniedByPolicy(policy, base, args);
+  if (deniedReason) throw new Error(`Blocked by policy: ${base} (${deniedReason})`);
 }
 
-async function enforcePolicyOperation(ctx: McpContext, operation: string, args: any) {
+async function enforcePolicyOperation(ctx: McpContext, operation: string, args: any, conn?: any) {
   const policy = ctx.getPolicy(args?.connectionName);
+  // Tools pass a specific operation (members.delete, jobs.end, ...). The policy
+  // lists, session approvals and prompt text of "prompt" and "agent" mode know
+  // these by their base operation (qsys.write), as before.
+  const base = baseOperation(operation);
   if (policy.profile === "read-only") {
-    throw new Error(`Blocked by policy (${policy.profile}): ${operation}`);
+    throw new Error(`Blocked by policy (${policy.profile}): ${base}`);
   }
-  const deniedReason = isDeniedByPolicy(policy, operation, args);
+  const deniedReason = isDeniedByPolicy(policy, base, args);
   if (deniedReason) {
-    throw new Error(`Blocked by policy: ${operation} (${deniedReason})`);
+    throw new Error(`Blocked by policy: ${base} (${deniedReason})`);
   }
   if (policy.profile !== "guarded") return;
+  if (policy.approvalMode === "host") {
+    await hostApprove(ctx, policy, operation, args, conn);
+    return;
+  }
   // Shell text can do anything the profile can, so under guarded it always
   // needs the person's say, whatever requireApprovalFor lists.
   if (isShellOperation(args)) {
-    await requireConfirmation(ctx, policy, "shell.run", args, false);
-  } else if (requiresApproval(policy, operation)) {
-    await requireConfirmation(ctx, policy, operation, args, operation !== "ifs.delete");
+    await requireConfirmation(ctx, policy, "shell.run", args, false, promptFacts(policy, "shell.run", args, conn));
+  } else if (requiresApproval(policy, base) || (base !== operation && requiresApproval(policy, operation))) {
+    await requireConfirmation(ctx, policy, base, args, base !== "ifs.delete", promptFacts(policy, operation, args, conn));
   }
+}
+
+/** Facts for the prompt metadata in "prompt" and "agent" mode: the host-mode classification of the operation. */
+function promptFacts(policy: ConnectionPolicy, operation: string, args: any, conn?: any): PromptFacts {
+  // Metadata only: a failure here must never change whether the prompt is shown.
+  let decision: { critical: boolean; libraries: string[] };
+  try {
+    decision = classify(policy, operation, args, conn);
+  } catch {
+    decision = { critical: false, libraries: [] };
+  }
+  return {
+    specificOperation: operation,
+    libraries: decision.libraries,
+    critical: decision.critical,
+    reason: operation === "shell.run"
+      ? "Shell commands always need approval under the guarded policy."
+      : `${baseOperation(operation)} needs approval under the guarded policy (requireApprovalFor).`
+  };
+}
+
+function classify(policy: ConnectionPolicy, operation: string, args: any, conn?: any) {
+  const shell = operation === "shell.run" || isShellOperation(args);
+  let currentLibrary: string | undefined;
+  try {
+    currentLibrary = conn?.getConfig?.()?.currentLibrary;
+  } catch {
+    currentLibrary = undefined;
+  }
+  return classifyHostOperation({
+    policy,
+    operation: shell ? "shell.run" : operation,
+    toolName: toolCallStore.getStore()?.toolName,
+    args,
+    currentLibrary,
+    shell
+  });
+}
+
+/**
+ * approvalMode "host": the client approves routine operations itself, so they
+ * run without a prompt; critical ones ask the person with an empty form (no
+ * session allowance), every time.
+ */
+async function hostApprove(ctx: McpContext, policy: ConnectionPolicy, operation: string, args: any, conn?: any) {
+  const decision = classify(policy, operation, args, conn);
+  const state = toolCallStore.getStore();
+  if (!decision.critical) {
+    if (state && !state.approvedBy) state.approvedBy = "host";
+    return;
+  }
+  // One answer from the person covers the whole tool call, which the prompt describes.
+  if (state?.personConfirmed) return;
+  const shown = operation === "shell.run" || isShellOperation(args) ? "shell.run" : operation;
+  await requireConfirmation(ctx, policy, shown, args, false, {
+    specificOperation: shown,
+    libraries: decision.libraries,
+    critical: true,
+    reason: decision.reason
+  });
 }
 
 /**
@@ -4675,9 +4760,13 @@ export async function requireConfirmation(
   policy: ConnectionPolicy,
   operation: string,
   args: any,
-  allowSession: boolean
+  allowSession: boolean,
+  facts: PromptFacts = {}
 ) {
-  if (policy.approvalMode === "agent") {
+  if (policy.approvalMode === "host") {
+    // Host mode never offers a session allowance: the form stays empty.
+    allowSession = false;
+  } else if (policy.approvalMode === "agent") {
     if (!Boolean(args?.approve)) {
       throw new Error(`Operation '${operation}' requires approve=true under '${policy.profile}' policy.`);
     }
@@ -4688,24 +4777,43 @@ export async function requireConfirmation(
   if (allowSession && ctx.sessionApprovals?.has(sessionKey)) return;
 
   const unsupported = new Error(
-    `Operation '${operation}' needs the user's confirmation, but this MCP client cannot show confirmation prompts. ` +
-    "Ask the user to run it from a client that supports MCP elicitation, or to set this connection's approval mode " +
-    "to \"agent\" in config.json (approve=true is then accepted)."
+    policy.approvalMode === "host"
+      ? `Operation '${operation}' is critical and needs the user's confirmation, but this MCP client cannot show confirmation prompts.`
+      : `Operation '${operation}' needs the user's confirmation, but this MCP client cannot show confirmation prompts. ` +
+        "Ask the user to run it from a client that supports MCP elicitation, or to set this connection's approval mode " +
+        "to \"agent\" in config.json (approve=true is then accepted)."
   );
   if (!ctx.confirm) throw unsupported;
+  const state = toolCallStore.getStore();
   const answer = await ctx.confirm({
     operation,
     connectionName,
-    toolName: toolCallStore.getStore()?.toolName,
+    toolName: state?.toolName,
     details: describeOperation(args),
-    allowSession
+    allowSession,
+    specificOperation: facts.specificOperation || operation,
+    libraries: facts.libraries || [],
+    critical: Boolean(facts.critical),
+    reason: facts.reason || `${operation} needs approval under the guarded policy.`
   });
   if (answer === "unsupported") throw unsupported;
   if (!answer.allowed) {
     throw new Error(`Operation '${operation}' was not confirmed by the user, so it did not run.`);
   }
+  if (policy.approvalMode === "host" && state) {
+    state.approvedBy = "person";
+    state.personConfirmed = true;
+  }
   if (allowSession && answer.forSession) ctx.sessionApprovals?.add(sessionKey);
 }
+
+/** What a prompt's metadata says about the operation. */
+type PromptFacts = {
+  specificOperation?: string;
+  libraries?: string[];
+  critical?: boolean;
+  reason?: string;
+};
 
 /**
  * Approval for operations that always need it, whatever requireApprovalFor
@@ -4715,7 +4823,15 @@ export async function requireConfirmation(
 export async function requireDangerousApproval(ctx: McpContext, operation: string, args: any, approveMessage: string) {
   const policy = ctx.getPolicy(args?.connectionName);
   if (policy.profile === "guarded") {
-    await requireConfirmation(ctx, policy, operation, args, false);
+    if (policy.approvalMode === "host") {
+      await hostApprove(ctx, policy, operation, args);
+      return;
+    }
+    await requireConfirmation(ctx, policy, operation, args, false, {
+      specificOperation: operation,
+      critical: true,
+      reason: `${operation} always needs approval under the guarded policy.`
+    });
     return;
   }
   if (!Boolean(args?.approve)) throw new Error(approveMessage);
@@ -4988,8 +5104,12 @@ export function actionCommandGuard(ctx: McpContext, environment: string | undefi
       ? checkClCommands(policy, expanded)
       : checkShellCommand(policy, expanded);
     if (reason) throw new Error(`Blocked by policy: actions.run (${reason})`);
-    if (policy.profile === "guarded" && (env !== "ile" || clStartsShell(expanded))) {
-      await requireConfirmation(ctx, policy, "shell.run", { ...args, command: expanded, environment: env }, false);
+    if (policy.profile === "guarded" && policy.approvalMode === "host") {
+      // The expanded command decides: shell, a critical CL command or a target outside trustedLibraries.
+      await hostApprove(ctx, policy, "cl.run", { ...args, command: expanded, environment: env });
+    } else if (policy.profile === "guarded" && (env !== "ile" || clStartsShell(expanded))) {
+      const shellArgs = { ...args, command: expanded, environment: env };
+      await requireConfirmation(ctx, policy, "shell.run", shellArgs, false, promptFacts(policy, "shell.run", shellArgs));
     }
     return expanded;
   };
@@ -5053,6 +5173,23 @@ const APPROVAL_HINT_TOOLS = new Set([
   "ibmi.cl.run"
 ]);
 
+const APPROVE_DESCRIPTION = "Only used when the connection's approvalMode is \"agent\". By default the user is asked to confirm guarded operations and this flag is ignored.";
+const APPROVE_HOST_NOTE = "Ignored when the connection's approvalMode is \"host\".";
+
+/** Every approve parameter says that host mode ignores it. */
+function withApproveHostNote(tool: any) {
+  const approve = tool.inputSchema?.properties?.approve;
+  if (!approve) return tool;
+  const description = approve.description ? `${String(approve.description).trim()} ${APPROVE_HOST_NOTE}` : APPROVE_HOST_NOTE;
+  return {
+    ...tool,
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: { ...tool.inputSchema.properties, approve: { ...approve, description } }
+    }
+  };
+}
+
 function withGuardedApprovalHint(tool: any) {
   if (!APPROVAL_HINT_TOOLS.has(tool.name)) return tool;
   const schema = tool.inputSchema || { type: "object", properties: {} };
@@ -5060,7 +5197,7 @@ function withGuardedApprovalHint(tool: any) {
   if (!schema.properties.approve) {
     schema.properties.approve = {
       type: "boolean",
-      description: "Only used when the connection's approvalMode is \"agent\". By default the user is asked to confirm guarded operations and this flag is ignored."
+      description: APPROVE_DESCRIPTION
     };
   }
   return { ...tool, inputSchema: schema };

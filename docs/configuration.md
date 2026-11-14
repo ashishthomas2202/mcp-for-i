@@ -135,8 +135,22 @@ Policy lists (all optional, matched case-insensitively):
 
 Approvals under `guarded`:
 - `requireApprovalFor`: operations that ask the user first (default `["sql.write", "cl.run", "deploy.sync", "ifs.delete", "qsys.write"]`).
-- `approvalMode`: `"prompt"` (default) asks the user through the MCP client and ignores the agent's `approve` flag. `"agent"` accepts `approve: true` from the agent instead, for clients that can't show prompts.
+- `approvalMode`: `"prompt"` (default) asks the user through the MCP client and ignores the agent's `approve` flag. `"agent"` accepts `approve: true` from the agent instead, for clients that can't show prompts. `"host"` is for clients that run their own approval layer: routine operations run without a prompt (the client has approved them) and only critical ones ask the user, with an empty form and no "allow until restart" option. `approve` is ignored in host mode. `requireApprovalFor` is not used in host mode; the lists below decide.
+- `alwaysConfirm` (host mode): operations that always ask. Default `["shell.run", "ifs.delete", "audit.purge", "journal.receivers.delete", "deploy.sync", "members.delete", "members.rename", "objects.delete", "objects.move", "objects.rename", "qsys.deleteLibrary", "jobs.end", "subsystems.end", "spool.delete", "spool.move", "journal.end", "debug.end", "dataqueue.remove"]`. Listing a base operation such as `qsys.write` also covers the specific operations under it.
+- `confirmClCommands` (host mode): CL command names that ask, with a trailing `*` for generic names and a leading `!` for exceptions. Default `["DLT*", "CLR*", "RMV*", "RNM*", "MOV*", "END*", "RST*", "PWRDWNSYS", "RCLSTG", "INZSYS", "CRTUSRPRF", "CHGUSRPRF", "CHGUSRAUD", "CHGOBJAUD", "GRTOBJAUT", "RVKOBJAUT", "GRTUSRAUT", "CHGOBJOWN", "CHGAUT", "CHGOWN", "CHGPGP", "CHGSYSVAL", "CHGNETA", "CHGTCPA", "CHGIPLA", "RUNSQLSTM", "!RMVLIBLE", "!DLTOVR", "!ENDDBG"]`. It applies to `ibmi.cl.run`, the expanded command of `ibmi.actions.run`, 5250 command lines, commands inside `SBMJOB CMD(...)`, literal commands passed to `CALL QCMDEXC`, and CL embedded in SQL. `RUNSQL` statements are checked against `confirmSqlVerbs`.
+- `confirmSqlVerbs` (host mode): SQL statements that ask, by their leading keywords (one to three words). Default `["DELETE", "TRUNCATE", "DROP TABLE", "DROP SCHEMA", "DROP COLLECTION", "ALTER", "GRANT", "REVOKE", "CALL", "RENAME"]`. Data-change table references (`FINAL TABLE (DELETE ...)`) are checked too. Compound statements (`BEGIN`), `EXECUTE`, `PREPARE` and `QCMDEXC` with a command built at run time always ask.
+- `trustedLibraries` (host mode): library names (trailing `*` allowed). When set, a write, compile or SQL change whose target library is outside the list, or cannot be determined, asks. Targets are read from the tool's library arguments (only the destination for copies), `/QSYS.LIB/` paths, the object parameters of CL commands (`PGM(LIB/X)`, `FILE`, `OBJ`, `LIB`, `TOLIB`, `OUTFILE`, ...; an unqualified name is `*CURLIB` for `CRT*` commands and unknown otherwise) and the object an SQL statement creates, drops or changes. Library list, job, spool, message and debug-service tools are not library writes and are not checked. An empty list trusts no library.
+- Host-mode lists replace their defaults when set. The control plane refuses a policy with a bad `approvalMode` or bad list entries; on load, a bad confirm list falls back to its default and bad `trustedLibraries` entries are dropped.
 - The policy can only be changed in the web UI or in this file, not by the agent.
+
+Host mode example (a client with its own approval layer):
+```json
+"policy": {
+  "profile": "guarded",
+  "approvalMode": "host",
+  "trustedLibraries": ["DEVUSER", "PGMUSER", "DTAUSER", "QTEMP"]
+}
+```
 
 Example:
 ```json
