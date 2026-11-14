@@ -2317,14 +2317,8 @@ export async function handleTool(ctx: McpContext, name: string, args: any): Prom
     case "ibmi.spool.read": {
       const conn = await ctx.ensureActive(args?.connectionName);
       const limit = clampNumber(args?.limit, 200, 1, 5000);
-      const jobName = Tools.sqlString(String(args.jobName));
-      const fileName = Tools.sqlString(String(args.spooledFileName));
       const fileNbr = clampNumber(args.spooledFileNumber, 1, 1, 999999999);
-      // DISPLAY_SPOOLED_FILE_DATA returns ORDINAL_POSITION and SPOOLED_DATA.
-      const rows = await conn.runSQL(
-        `select ordinal_position, spooled_data from table(qsys2.display_spooled_file_data(${jobName}, ${fileName}, ${fileNbr})) ` +
-        `order by ordinal_position fetch first ${limit} rows only`
-      );
+      const rows = await readSpooledFileData(conn, String(args.jobName), String(args.spooledFileName), fileNbr, limit);
       return json(rows.map(normalizeSpoolLine));
     }
     case "ibmi.spool.hold": {
@@ -2911,6 +2905,15 @@ type ClCommandResult = {
   [key: string]: unknown;
 };
 
+/** liblist commands for the connection's library list; none when it sets neither a list nor a current library. */
+function qshLiblistCommands(conn: any): string[] {
+  const config = conn.getConfig?.() || {};
+  const libraryList = (Array.isArray(config.libraryList) ? config.libraryList : []).map((l: unknown) => String(l || "").trim()).filter(Boolean);
+  const currentLibrary = String(config.currentLibrary || "").trim();
+  if (libraryList.length === 0 && !currentLibrary) return [];
+  return CompileTools.buildLiblistCommands(conn, { currentLibrary, libraryList: libraryList.filter(Tools.distinct) });
+}
+
 export async function runClCommand(conn: any, command: string, environment: string, cwd: string | undefined, timeoutMs: number): Promise<ClCommandResult> {
   if (environment === "pase") {
     return await withTimeout(
@@ -2920,8 +2923,13 @@ export async function runClCommand(conn: any, command: string, environment: stri
     ) as ClCommandResult;
   }
   if (environment === "qsh") {
+    // qsh runs in its own job, started from a job description (often
+    // QDFTSVR, LIBL(*SYSVAL)) that knows nothing of the connection's library
+    // list. Set it in the same qsh invocation so the command (a compile and
+    // its /COPY lookups) resolves *LIBL the way the connection says.
+    const liblist = qshLiblistCommands(conn);
     return await withTimeout(
-      conn.sendQsh({ command, directory: cwd }),
+      conn.sendQsh({ command: liblist.length ? `${liblist.join(" && ")} && ${command}` : command, directory: cwd }),
       timeoutMs,
       `CL command timed out after ${timeoutMs}ms`
     ) as ClCommandResult;
@@ -4479,6 +4487,45 @@ export function normalizeSpoolLine(row: Record<string, unknown>) {
     lineNumber: Number.isFinite(Number(position)) && position !== null && position !== "" ? Number(position) : null,
     text: String(row.SPOOLED_DATA ?? "")
   };
+}
+
+/** The routine (table function) does not exist on this system: SQL0204 / SQL0440. */
+export function isMissingRoutineError(err: any) {
+  const state = String(err?.sqlstate ?? "");
+  if (state === "42704" || state === "42884") return true;
+  return /\bSQL0?(204|440)\b|SQLSTATE[^A-Z0-9]*(42704|42884)\b|\((42704|42884)\)\s*$/i.test(String(err?.message ?? err ?? ""));
+}
+
+/** Which spooled file data function each connection has; learned on first use. */
+const spoolDataFunction = new WeakMap<object, "qsys2" | "systools">();
+
+/**
+ * Read the lines of a spooled file. QSYS2.DISPLAY_SPOOLED_FILE_DATA needs a
+ * recent Db2 PTF group; older systems only have SYSTOOLS.SPOOLED_FILE_DATA,
+ * which returns the same ORDINAL_POSITION and SPOOLED_DATA columns.
+ */
+export async function readSpooledFileData(conn: any, jobName: string, spooledFileName: string, spooledFileNumber: number, maxRows: number) {
+  const job = Tools.sqlString(jobName);
+  const file = Tools.sqlString(spooledFileName);
+  const number = Math.trunc(Number(spooledFileNumber));
+  const tail = `order by ordinal_position fetch first ${Math.trunc(maxRows)} rows only`;
+  const systools = () => conn.runSQL(
+    // SPOOLED_FILE_NUMBER is VARCHAR(6) in SYSTOOLS.
+    `select ordinal_position, spooled_data from table(systools.spooled_file_data(${job}, ${file}, ${Tools.sqlString(String(number))})) ${tail}`
+  );
+  if (spoolDataFunction.get(conn) === "systools") return systools();
+  try {
+    const rows = await conn.runSQL(
+      `select ordinal_position, spooled_data from table(qsys2.display_spooled_file_data(${job}, ${file}, ${number})) ${tail}`
+    );
+    spoolDataFunction.set(conn, "qsys2");
+    return rows;
+  } catch (err) {
+    if (!isMissingRoutineError(err)) throw err;
+    const rows = await systools();
+    spoolDataFunction.set(conn, "systools");
+    return rows;
+  }
 }
 
 export function clampNumber(value: unknown, fallback: number, min: number, max: number) {

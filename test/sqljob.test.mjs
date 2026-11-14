@@ -11,7 +11,8 @@ import {
   toSqlError,
   chainHasFingerprint,
   derToPem,
-  normalizeSqlTransport
+  normalizeSqlTransport,
+  runMapepireClCommand
 } from "../dist/ibmi/sqlJob.js";
 import { checkCertificate, certificateFingerprint, checkHostKey, CertificateMismatchError } from "../dist/ibmi/knownHosts.js";
 import { handleTool } from "../dist/mcp/tools.js";
@@ -373,4 +374,70 @@ test("auto mode does not let a slow job start eat the caller's time", async () =
   await new Promise(resolve => setTimeout(resolve, 80));
   assert.deepEqual(await sqlJob.runSql("select a from t"), [{ A: 1 }]);
   assert.equal(sqlJob.status().active, "mapepire");
+});
+
+// SQLJob.clcommand in @ibm/mapepire-js 1.1.0 sends the request at once and
+// returns a promise of { success, data: CLMessage[], error? }; it never rejects
+// for a failed command.
+function promiseClJob(response) {
+  return {
+    commands: [],
+    clcommand(command) {
+      this.commands.push(command);
+      return Promise.resolve(response);
+    }
+  };
+}
+
+test("CL on Mapepire 1.1.0: success with messages", async () => {
+  const job = promiseClJob({
+    success: true,
+    data: [{ id: "CPC2102", type: "COMPLETION", severity: 0, text: "Library list changed.", time: 0 }]
+  });
+  const result = await runMapepireClCommand(job, "DSPLIBL");
+  assert.deepEqual(job.commands, ["DSPLIBL"]);
+  assert.deepEqual(result, { success: true, messages: [{ id: "CPC2102", type: "COMPLETION", text: "Library list changed." }] });
+});
+
+test("CL on Mapepire 1.1.0: success false with messages is a result, not an error", async () => {
+  const job = promiseClJob({
+    success: false,
+    error: "CPF9801",
+    data: [
+      { id: "CPF9801", type: "DIAGNOSTIC", severity: 40, text: "Object NOSUCHOBJ in library QTEMP not found.", time: 0 },
+      { id: "CPF9801", type: "ESCAPE", severity: 40, text: "Object NOSUCHOBJ in library QTEMP not found.", time: 0 }
+    ]
+  });
+  const result = await runMapepireClCommand(job, "CHKOBJ OBJ(QTEMP/NOSUCHOBJ) OBJTYPE(*PGM)");
+  assert.equal(result.success, false);
+  assert.deepEqual(result.messages.map(m => [m.id, m.type]), [["CPF9801", "DIAGNOSTIC"], ["CPF9801", "ESCAPE"]]);
+});
+
+test("CL on Mapepire 1.1.0: success false with only an error gives one ESCAPE message", async () => {
+  const job = promiseClJob({ success: false, error: "Command not found", data: [] });
+  const result = await runMapepireClCommand(job, "NOSUCHCMD");
+  assert.deepEqual(result, { success: false, messages: [{ type: "ESCAPE", text: "Command not found" }] });
+});
+
+test("CL on Mapepire 1.0.x: the Query is executed and closed; job log column names are read", async () => {
+  let closed = false;
+  const job = {
+    clcommand() {
+      return {
+        async execute(rows) {
+          assert.ok(rows > 0);
+          return {
+            success: false,
+            has_results: true,
+            is_done: false,
+            data: [{ MESSAGE_ID: "CPF9801 ", MESSAGE_TYPE: "ESCAPE", MESSAGE_TEXT: "Object not found." }]
+          };
+        },
+        async close() { closed = true; }
+      };
+    }
+  };
+  const result = await runMapepireClCommand(job, "CHKOBJ OBJ(QTEMP/X) OBJTYPE(*PGM)");
+  assert.equal(closed, true);
+  assert.deepEqual(result, { success: false, messages: [{ id: "CPF9801", type: "ESCAPE", text: "Object not found." }] });
 });

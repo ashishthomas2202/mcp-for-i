@@ -121,7 +121,12 @@ export namespace CompileTools {
       .reverse();
   }
 
-  function buildLiblistCommands(connection: IBMiClient, config: ILELibrarySettings): string[] {
+  /**
+   * qsh `liblist` commands that set the job's library list: the user's default
+   * libraries, the current library, then the list. Run them in the same qsh
+   * invocation as the CL so the job that runs the command has that list.
+   */
+  export function buildLiblistCommands(connection: IBMiClient, config: ILELibrarySettings): string[] {
     const defaultLibNames = (connection.defaultUserLibraries || [])
       .filter(l => l && l !== "QSYS")
       .map(l => assertLibraryName(connection, l, "default library"));

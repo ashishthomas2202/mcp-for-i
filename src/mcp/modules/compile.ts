@@ -18,6 +18,7 @@ import {
   mapActionExecution,
   normalizeSpoolEntry,
   normalizeSpoolLine,
+  readSpooledFileData,
   requireQsysName,
   resolveAction
 } from "../tools.js";
@@ -266,11 +267,7 @@ export async function fetchCompileListing(
   if (!entry || !entry.jobName || !entry.spooledFileName) return { found: false };
 
   const number = entry.spooledFileNumber ?? 1;
-  const rows = await conn.runSQL(
-    `select ordinal_position, spooled_data from table(qsys2.display_spooled_file_data(` +
-    `${Tools.sqlString(entry.jobName)}, ${Tools.sqlString(entry.spooledFileName)}, ${Number(number)})) ` +
-    `order by ordinal_position fetch first ${maxLines + 1} rows only`
-  );
+  const rows = await readSpooledFileData(conn, entry.jobName, entry.spooledFileName, Number(number), maxLines + 1);
   const lines = (rows || []).map((row: Record<string, unknown>) => normalizeSpoolLine(row).text);
   return {
     found: true,

@@ -492,3 +492,67 @@ test("searchIFS with no matches returns an empty list without warnings", async (
   assert.deepEqual(resultSet.hits, []);
   assert.equal(resultSet.warnings, undefined);
 });
+
+test("spool.read falls back to SYSTOOLS.SPOOLED_FILE_DATA when the QSYS2 function is missing", async () => {
+  const { conn, calls } = fakeConn({
+    runSQL: sql => {
+      if (/qsys2\.display_spooled_file_data/i.test(sql)) {
+        const err = new Error("DISPLAY_SPOOLED_FILE_DATA in QSYS2 type *N not found. (42704)");
+        err.name = "SqlError";
+        err.sqlstate = "42704";
+        throw err;
+      }
+      if (/systools\.spooled_file_data/i.test(sql)) return [{ ORDINAL_POSITION: 1, SPOOLED_DATA: "LISTING" }];
+      return [];
+    }
+  });
+  const ctx = context(conn);
+  const args = { jobName: "123456/DEV/JOB", spooledFileName: "QSYSPRT", spooledFileNumber: 2 };
+  const lines = data(await handleTool(ctx, "ibmi.spool.read", args));
+  assert.equal(lines[0].text, "LISTING");
+  assert.match(calls.sql[1], /systools\.spooled_file_data\('123456\/DEV\/JOB', 'QSYSPRT', '2'\)/);
+
+  // The connection remembers the fallback: the next read goes straight to SYSTOOLS.
+  await handleTool(ctx, "ibmi.spool.read", args);
+  assert.equal(calls.sql.length, 3);
+  assert.match(calls.sql[2], /systools\.spooled_file_data/);
+});
+
+test("spool.read does not fall back on other SQL errors", async () => {
+  const { conn, calls } = fakeConn({
+    runSQL: () => {
+      const err = new Error("Not authorized to object. (42501)");
+      err.sqlstate = "42501";
+      throw err;
+    }
+  });
+  await assert.rejects(
+    handleTool(context(conn), "ibmi.spool.read", { jobName: "123456/DEV/JOB", spooledFileName: "QSYSPRT" }),
+    /42501/
+  );
+  assert.equal(calls.sql.length, 1);
+});
+
+test("cl.run in qsh sets the connection's library list in the same job before the command", async () => {
+  const { conn, calls } = fakeConn();
+  conn.getConfig = () => ({ readOnlyMode: false, currentLibrary: "DEVJOHN", libraryList: ["DEVJOHN", "PGMJOHN", "DTAJOHN", "RICHARD"] });
+  conn.defaultUserLibraries = ["QTEMP", "QGPL"];
+  await handleTool(context(conn), "ibmi.cl.run", {
+    command: "system \"CHKOBJ OBJ(QSYS/QCMD) OBJTYPE(*PGM)\"",
+    environment: "qsh",
+    approve: true
+  });
+  assert.equal(calls.qsh.length, 1);
+  const parts = calls.qsh[0].split(" && ");
+  assert.equal(parts[0], "liblist -d QTEMP QGPL");
+  assert.equal(parts[1], "liblist -c DEVJOHN");
+  // liblist -a puts each library in front, so the list goes in reversed.
+  assert.equal(parts[2], "liblist -a RICHARD DTAJOHN PGMJOHN DEVJOHN");
+  assert.equal(parts[3], "system \"CHKOBJ OBJ(QSYS/QCMD) OBJTYPE(*PGM)\"");
+});
+
+test("cl.run in qsh leaves the job alone when the connection sets no library list", async () => {
+  const { conn, calls } = fakeConn();
+  await handleTool(context(conn), "ibmi.cl.run", { command: "ls", environment: "qsh", approve: true });
+  assert.deepEqual(calls.qsh, ["ls"]);
+});

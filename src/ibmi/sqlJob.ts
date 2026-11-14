@@ -735,7 +735,43 @@ async function findRemoteFile(request: SqlJobOpenRequest, candidates: string[]) 
   }
 }
 
-function wrapMapepireJob(job: any, mode: "daemon" | "ssh", connected: () => boolean, technique: "tcp" | "cli" = "tcp"): SqlJobHandle {
+/**
+ * Runs a CL command on a Mapepire job. A CL request answers with the job log
+ * messages the command sent, and success false when it failed; it does not
+ * reject. @ibm/mapepire-js 1.0.x returns a Query from SQLJob.clcommand that
+ * has to be executed; 1.1.0 and later send the request at once and return a
+ * promise of the result. Both shapes are handled.
+ */
+export async function runMapepireClCommand(job: any, command: string): Promise<SqlJobClResult> {
+  const pending = job.clcommand(command);
+  let result: any;
+  if (pending && typeof pending.execute === "function") {
+    result = await pending.execute(FETCH_SIZE);
+    if (result?.has_results && !result.is_done && typeof pending.close === "function") {
+      await Promise.resolve(pending.close()).catch(() => undefined);
+    }
+  } else {
+    result = await pending;
+  }
+  return toClResult(result);
+}
+
+/** Maps a CL response to { success, messages }; reads 1.1.0 and 1.0.x field names. */
+export function toClResult(result: any): SqlJobClResult {
+  const rows: any[] = Array.isArray(result?.data) ? result.data : [];
+  const field = (value: unknown) => (value === undefined || value === null || value === "" ? undefined : String(value).trim());
+  const messages: SqlJobClMessage[] = rows.map(row => ({
+    id: field(row?.id ?? row?.MESSAGE_ID),
+    type: field(row?.type ?? row?.MESSAGE_TYPE),
+    text: String(row?.text ?? row?.MESSAGE_TEXT ?? row?.SUMMARY ?? "").trim()
+  }));
+  if (result?.success === false && messages.length === 0 && result.error) {
+    messages.push({ type: "ESCAPE", text: String(result.error) });
+  }
+  return { success: result?.success !== false, messages };
+}
+
+function wrapMapepireJob(job: any,mode: "daemon" | "ssh", connected: () => boolean, technique: "tcp" | "cli" = "tcp"): SqlJobHandle {
   // SQLJob.close() drops its response listeners, so requests still waiting on
   // the job would never settle. Track them and fail them on close.
   const pending = new Set<(err: Error) => void>();
@@ -758,23 +794,7 @@ function wrapMapepireJob(job: any, mode: "daemon" | "ssh", connected: () => bool
     return { rows, columns, updateCount: typeof updateCount === "number" ? updateCount : undefined };
   };
 
-  // A CL request answers with the job log messages the command sent, and
-  // success false when it failed; it does not reject.
-  const runClCommand = async (command: string): Promise<SqlJobClResult> => {
-    const query = job.clcommand(command);
-    const result = await query.execute(FETCH_SIZE);
-    if (result.has_results && !result.is_done) await Promise.resolve(query.close()).catch(() => undefined);
-    const rows: any[] = Array.isArray(result.data) ? result.data : [];
-    const messages: SqlJobClMessage[] = rows.map(row => ({
-      id: row.MESSAGE_ID ? String(row.MESSAGE_ID).trim() : undefined,
-      type: row.MESSAGE_TYPE ? String(row.MESSAGE_TYPE).trim() : undefined,
-      text: String(row.MESSAGE_TEXT ?? row.SUMMARY ?? "").trim()
-    }));
-    if (result.success === false && messages.length === 0 && result.error) {
-      messages.push({ type: "ESCAPE", text: String(result.error) });
-    }
-    return { success: result.success !== false, messages };
-  };
+  const runClCommand = (command: string): Promise<SqlJobClResult> => runMapepireClCommand(job, command);
 
   return {
     mode,
