@@ -365,3 +365,53 @@ Finds source lines whose `SRCDAT` falls between `from` and `to` (inclusive, `YYY
 - `ibmi.libl.runProfileCommand`: run a profile's `setLibraryListCommand` (the active profile by default, or `profileName`) and store the user library list and current library it produces, read back from `QSYS2.LIBRARY_LIST_INFO` in the same SQL job. `saveToProfile` also stores the result in the profile. Set the command with `ibmi.profiles.save` (`profile.setLibraryListCommand`). The command is checked against the CL command policy.
 
 All three update the stored connection settings the same way `ibmi.libl.set` does, need a writable connection, ask the user first under guarded policies, and run `CHGLIBL`/`CHGCURLIB` when `applyToJob` is true.
+
+
+### SQL query completeness
+
+ibmi.sql.query requires transport evidence that proves completion. It returns
+at most maxRows + 1 rows to the server, including when SQL already has a row
+limit. maxRows defaults to 1000 (maximum 20000); pageSize defaults to 200
+(maximum 5000). totalRows counts retained rows across all buffered pages, not
+all matching rows in the database. Every cursor page repeats totalRows and
+truncated. A true truncated flag means an extra row was observed and omitted;
+a false flag means the result was exhausted. SQL warnings, malformed completion
+metadata and later fetch failures return an MCP error without successful partial
+rows.
+
+A statement the database rejects (an unknown column or table, bad syntax)
+returns the database's own message and SQLSTATE on both transports, for
+example `[SQL0206] Column or global variable X not found. (42703)`. It does not
+end the persistent SQL job: QTEMP and session settings are kept. Only a cancel,
+a timeout or a transport or cleanup failure discards the job.
+
+QZDFMDB2 adds `FETCH FIRST maxRows + 1 ROWS ONLY` at the end of the statement,
+before a trailing isolation (`WITH UR|CS|RS|RR|NC`) or `FOR READ|FETCH ONLY`
+clause. The statement is never wrapped in a derived table, which Db2 for i
+rejects for `WITH` (common table expressions), `WITH NC` and `FOR READ ONLY`.
+A statement that ends in its own row limit, or in a clause the limit cannot
+follow (`OPTIMIZE FOR`, `KEEP ... LOCKS`, `SKIP LOCKED DATA` and similar), is
+sent as written: its whole result crosses the SSH channel, rows past
+maxRows + 1 are dropped, and the result is reported truncated. QZDFMDB2
+requires one final selected-row footer whose count exactly matches parsed rows,
+a real clean SSH exit and no SQL diagnostics in either output stream. A
+diagnostic that arrives with rows still printed (a data mapping error prints a
+wrong value) fails with the job's own message. Missing, ambiguous or mismatched
+footers fail without returning partial rows; a mismatch usually means a value
+contains a line break, which this text transport cannot carry. Cancellation
+closes that command's SSH channel and late success is rejected. Internal runSQL
+source SELECTs validate the same footer; no-row DDL/CL batches need no SELECT
+footer.
+Metadata includes completenessProof on both initial and cursor pages: transport,
+method, reportedRowCount, parsedRowCount, exitValidated and footerValidated.
+Mapepire uses continuation-protocol evidence; QZDFMDB2 uses selected-row-footer.
+False exit/footer flags for Mapepire mean those shell/text checks do not apply.
+
+The corrected continuation defect could return exactly 2000 rows: execute
+fetched the initial 1000 and fetchMore fetched another 1000, then the adapter
+stopped because continuation responses omit has_results. Continuation now
+follows the explicit is_done flag, including terminal empty fetches when needed.
+Cancellation keeps the SQL job queue occupied until cancellation and cleanup
+settle; a cancelled query, or one that failed for a reason other than the
+database rejecting the statement, discards its SQL job before the next
+statement. A resolved sqlclose failure also rejects the query.

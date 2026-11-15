@@ -24,6 +24,7 @@ type SessionEntry = {
 };
 
 type SqlCursorState = {
+  summary: { totalRows: number; truncated: boolean; truncationNote?: string; completenessProof?: import("../ibmi/sqlJob.js").SqlCompletenessProof };
   rows: any[];
   nextIndex: number;
   expiresAt: number;
@@ -242,11 +243,12 @@ export class McpContext {
     }
   }
 
-  createSqlCursor(rows: any[], pageSize: number) {
+  createSqlCursor(rows: any[], pageSize: number, summary: SqlCursorState["summary"] = { totalRows: rows.length, truncated: false }) {
     const cursor = crypto.randomUUID();
     const initial = rows.slice(pageSize);
     if (initial.length === 0) return { cursor: undefined };
     this.cursors.set(cursor, {
+      summary,
       rows: initial,
       nextIndex: 0,
       expiresAt: Date.now() + this.cursorTtlMs
@@ -270,11 +272,11 @@ export class McpContext {
 
     if (state.nextIndex >= state.rows.length) {
       this.cursors.delete(cursor);
-      return { rows: page, cursor: undefined };
+      return { rows: page, cursor: undefined, ...state.summary };
     }
 
     this.cursors.set(cursor, state);
-    return { rows: page, cursor };
+    return { rows: page, cursor, ...state.summary };
   }
 
   private async prepareStoredConnection(name: string) {

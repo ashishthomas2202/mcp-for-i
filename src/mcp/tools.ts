@@ -12,7 +12,7 @@ import { MemberSnapshot } from "../ibmi/IBMiContent.js";
 import { detectSourceLanguage, inspectSource } from "../ibmi/sourceInspect.js";
 import { Action } from "../ibmi/types.js";
 import { Tools } from "../ibmi/Tools.js";
-import { checkReadOnlySql, getSqlStatementType as parseSqlStatementType } from "../ibmi/sqlParse.js";
+import { checkReadOnlySql, splitSqlStatements, getSqlStatementType as parseSqlStatementType } from "../ibmi/sqlParse.js";
 import { ConnectionPolicy } from "../config/store.js";
 import { ConnectionService } from "../controlplane/connectionService.js";
 import { log } from "./logger.js";
@@ -2203,8 +2203,11 @@ export async function handleTool(ctx: McpContext, name: string, args: any): Prom
         return json({
           rows: next.rows,
           cursor: next.cursor,
+          totalRows: next.totalRows,
+          truncated: next.truncated,
+          ...(next.truncationNote ? { truncationNote: next.truncationNote } : {}),
           ...(includeMetadata
-            ? { metadata: { source: "cursor", pageSize, timeoutMs } }
+            ? { metadata: { source: "cursor", pageSize, timeoutMs, completenessProof: next.completenessProof } }
             : {})
         });
       }
@@ -2217,17 +2220,31 @@ export async function handleTool(ctx: McpContext, name: string, args: any): Prom
       // Ask for one row more than maxRows so truncation can be reported without
       // pulling the whole result set over the wire.
       const capped = applySqlRowCap(sql, maxRows + 1);
-      const rows = await runSqlWithTimeout(conn, capped.sql, timeoutMs, `SQL query timed out after ${timeoutMs}ms`);
+      const result = await runBoundedSqlWithTimeout(conn, capped.sql, maxRows + 1, timeoutMs);
+      if (!result.exhausted && !result.knownRemaining) {
+        throw new Error("SQL transport cannot prove result completeness");
+      }
+      const rows = result.rows;
       const limited = rows.slice(0, maxRows);
       const firstPage = limited.slice(0, pageSize);
-      const cursorInfo = ctx.createSqlCursor(limited, pageSize);
+      const truncated = rows.length > maxRows;
+      if (!truncated && !result.exhausted) {
+        throw new Error("SQL transport ended before result completeness was proven");
+      }
+      const truncationNote = truncated
+        ? "Result has more than " + maxRows + " rows; only the first " + maxRows + " are returned. Raise maxRows (up to 20000) or narrow the query."
+        : undefined;
+      const cursorInfo = ctx.createSqlCursor(limited, pageSize, {
+        totalRows: limited.length, truncated, ...(truncationNote ? { truncationNote } : {}),
+        completenessProof: result.completenessProof,
+      });
       const executionMs = Date.now() - startedAt;
 
       return json({
         rows: firstPage,
         cursor: cursorInfo.cursor,
         totalRows: limited.length,
-        truncated: rows.length > limited.length,
+        truncated,
         ...(rows.length > limited.length
           ? { truncationNote: `Result has more than ${maxRows} rows; only the first ${maxRows} are returned. Raise maxRows (up to 20000) or narrow the query.` }
           : {}),
@@ -2239,6 +2256,10 @@ export async function handleTool(ctx: McpContext, name: string, args: any): Prom
               pageSize,
               maxRows,
               rowCapAppliedInSql: capped.applied,
+              transport: result.transport,
+              completenessProof: result.completenessProof,
+              transportExhausted: result.exhausted,
+              effectiveFetchLimit: result.effectiveLimit,
               timeoutMs,
               executionMs
             }
@@ -3986,7 +4007,8 @@ const SQL_TRAILING_ROW_CLAUSE = new RegExp(
 // on the IBM i. Queries that already end with a row-limiting, locking or
 // isolation clause are left unchanged (the client-side slice still applies).
 function applySqlRowCap(sql: string, rowLimit: number): { sql: string; applied: boolean } {
-  const body = sql.replace(/[\s;]+$/, "");
+  const statement = splitSqlStatements(sql)[0];
+  const body = statement?.text ?? sql.replace(/[\s;]+$/, "");
   const normalized = body
     .replace(/\/\*[\s\S]*?\*\//g, " ")
     .split("\n")
@@ -4555,6 +4577,25 @@ export function clampNumber(value: unknown, fallback: number, min: number, max: 
  * signal asks the client to cancel the statement in its persistent SQL job, so
  * it does not keep running on the IBM i.
  */
+async function runBoundedSqlWithTimeout(conn: any, sql: string, rowLimit: number, timeoutMs: number) {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    if (typeof conn.querySQL !== "function") throw new Error("SQL transport cannot prove result completeness");
+    return await Promise.race([
+      conn.querySQL(sql, { rowLimit, signal: controller.signal }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error("SQL query timed out after " + timeoutMs + "ms"));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function runSqlWithTimeout(conn: any, sql: string, timeoutMs: number, timeoutMessage: string): Promise<any[]> {
   const controller = new AbortController();
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;

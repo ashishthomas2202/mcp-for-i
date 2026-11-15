@@ -157,8 +157,8 @@ test("source-date reads create and consume a QTEMP alias in one SQL job", async 
     runSQL: async sql => {
       statements.push(sql);
       return [
-        { SRCDAT: 260909, SRCSEQ: 1, SRCDTA: "first", SYSTEM_TABLE_MEMBER: "ORDER", SOURCE_TYPE: "RPGLE", ROW_LENGTH: 112 },
-        { SRCDAT: 260909, SRCSEQ: 2, SRCDTA: "second", SYSTEM_TABLE_MEMBER: "ORDER", SOURCE_TYPE: "RPGLE", ROW_LENGTH: 112 }
+        { SRCDAT: 260909, SRCSEQ: 1, SRCDTA: "first", NUMBER_ROWS: 2, SYSTEM_TABLE_MEMBER: "ORDER", SOURCE_TYPE: "RPGLE", ROW_LENGTH: 112 },
+        { SRCDAT: 260909, SRCSEQ: 2, SRCDTA: "second", NUMBER_ROWS: 2, SYSTEM_TABLE_MEMBER: "ORDER", SOURCE_TYPE: "RPGLE", ROW_LENGTH: 112 }
       ];
     }
   };

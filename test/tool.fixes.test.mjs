@@ -318,6 +318,7 @@ test("journal.receivers.retention defaults to a dry run", async () => {
 
 test("sql.query caps rows in SQL and reports truncation", async () => {
   const { conn, calls } = fakeConn({ runSQL: () => [{ A: 1 }, { A: 2 }, { A: 3 }] });
+  conn.querySQL = async (sql) => ({ rows: await conn.runSQL(sql), exhausted: true, knownRemaining: false, transport: "mapepire", effectiveLimit: 1001 });
   const ctx = { ...context(conn), createSqlCursor: () => ({ cursor: undefined }) };
   const response = data(await handleTool(ctx, "ibmi.sql.query", { sql: "select a from t order by a;", maxRows: 2 }));
   assert.equal(calls.sql[0], "select a from t order by a\nfetch first 3 rows only");
@@ -328,6 +329,7 @@ test("sql.query caps rows in SQL and reports truncation", async () => {
 
 test("sql.query leaves queries that already limit rows unchanged", async () => {
   const { conn, calls } = fakeConn({ runSQL: () => [{ A: 1 }] });
+  conn.querySQL = async (sql) => ({ rows: await conn.runSQL(sql), exhausted: true, knownRemaining: false, transport: "mapepire", effectiveLimit: 1001 });
   const ctx = { ...context(conn), createSqlCursor: () => ({ cursor: undefined }) };
   await handleTool(ctx, "ibmi.sql.query", { sql: "select a from t fetch first 5 rows only" });
   await handleTool(ctx, "ibmi.sql.query", { sql: "select a from t with ur" });

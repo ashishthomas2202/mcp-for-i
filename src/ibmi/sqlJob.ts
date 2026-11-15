@@ -1,3 +1,4 @@
+import { runBoundedMapepireQuery } from "./sqlQuery.js";
 import { EventEmitter } from "events";
 import net from "net";
 import tls from "tls";
@@ -104,6 +105,7 @@ export interface SqlJobHandle {
    * stops and the server-side cursor is closed.
    */
   run(sql: string, options: { parameters?: Array<string | number | null>; signal?: AbortSignal }): Promise<SqlJobStatementResult>;
+  runBounded?(sql: string, options: { rowLimit: number; signal?: AbortSignal }): Promise<BoundedSqlResult>;
   /**
    * Runs a CL command where its effect on the library list lasts (Mapepire's
    * CL request). Without it, CL runs as CALL QSYS2.QCMDEXC through run().
@@ -223,6 +225,24 @@ export function isQualifiedJobName(value: unknown): value is string {
 /** Rows plus the number of rows changed by INSERT/UPDATE/DELETE, when known. */
 export type SqlRows = Tools.DB2Row[] & { updateCount?: number };
 
+export interface SqlCompletenessProof {
+  transport: "mapepire" | "qzdfmdb2";
+  method: "continuation-protocol" | "selected-row-footer";
+  reportedRowCount: number;
+  parsedRowCount: number;
+  exitValidated: boolean;
+  footerValidated: boolean;
+}
+
+export interface BoundedSqlResult {
+  rows: Tools.DB2Row[];
+  exhausted: boolean;
+  knownRemaining: boolean;
+  effectiveLimit: number;
+  transport: "mapepire" | "qzdfmdb2";
+  completenessProof?: SqlCompletenessProof;
+}
+
 export class PersistentSqlJob {
   private handle?: SqlJobHandle;
   private opening?: Promise<SqlJobHandle | undefined>;
@@ -295,6 +315,31 @@ export class PersistentSqlJob {
       if (!handle.isAlive()) await this.discard(handle);
       throw err;
     }
+  }
+
+  /** A single read-only result, bounded independently of SQL rewriting. */
+  async query(sql: string, options: { rowLimit: number; signal?: AbortSignal }): Promise<BoundedSqlResult | undefined> {
+    if (!isReadOnlySql(sql) || splitSqlStatements(sql).length !== 1) {
+      throw new Error("Bounded SQL requires one read-only statement");
+    }
+    return this.exclusive(options.signal, async () => {
+      const handle = await this.acquire();
+      if (!handle) return undefined;
+      if (!handle.runBounded) throw new Error("SQL transport cannot prove result completeness");
+      await this.ensureLibraryList(handle);
+      try {
+        const work = handle.runBounded!(sql, options);
+        return await this.withQueryCancel(handle, work, options.signal);
+      } catch (error) {
+        // A statement the database rejected (a wrong name, bad syntax) leaves
+        // the job as it was: QTEMP and session settings are kept. Anything
+        // else (a cancel, a transport or cleanup failure) may leave a cursor
+        // or a running statement behind, so the job is discarded before the
+        // queue is released.
+        if (!(error instanceof Tools.SqlError) || options.signal?.aborted) await this.discard(handle);
+        throw error;
+      }
+    });
   }
 
   /**
@@ -501,6 +546,25 @@ export class PersistentSqlJob {
   }
 
   /** When `signal` aborts while `work` runs, the statement is cancelled on the IBM i. */
+  private async withQueryCancel<T>(handle: SqlJobHandle, work: Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (!signal) return work;
+    let cancelling: Promise<void> | undefined;
+    const onAbort = () => {
+      cancelling ??= this.cancelInFlight(handle, work);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    try {
+      const result = await work;
+      if (signal.aborted) throw new Error("SQL statement cancelled");
+      return result;
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      // A delayed CANCEL_SQL must never hit a subsequent queued statement.
+      if (cancelling) await cancelling;
+    }
+  }
+
   private async withCancel<T>(handle: SqlJobHandle, work: Promise<T>, signal?: AbortSignal): Promise<T> {
     if (!signal) return work;
     if (signal.aborted) {
@@ -771,7 +835,7 @@ export function toClResult(result: any): SqlJobClResult {
   return { success: result?.success !== false, messages };
 }
 
-function wrapMapepireJob(job: any,mode: "daemon" | "ssh", connected: () => boolean, technique: "tcp" | "cli" = "tcp"): SqlJobHandle {
+export function wrapMapepireJob(job: any,mode: "daemon" | "ssh", connected: () => boolean, technique: "tcp" | "cli" = "tcp"): SqlJobHandle {
   // SQLJob.close() drops its response listeners, so requests still waiting on
   // the job would never settle. Track them and fail them on close.
   const pending = new Set<(err: Error) => void>();
@@ -779,19 +843,35 @@ function wrapMapepireJob(job: any,mode: "daemon" | "ssh", connected: () => boole
 
   const runQuery = async (sql: string, options: { parameters?: Array<string | number | null>; signal?: AbortSignal }) => {
     const query = job.query(sql, options.parameters ? { parameters: options.parameters } : {});
-    let result = await query.execute(FETCH_SIZE);
-    const rows: Record<string, unknown>[] = Array.isArray(result.data) ? [...result.data] : [];
-    const columns = (result.metadata?.columns || []).map((c: any) => ({ name: c.name || c.label, type: c.type }));
-    while (result.has_results && !result.is_done) {
-      if (options.signal?.aborted) {
-        await Promise.resolve(query.close()).catch(() => undefined);
-        throw new Error("SQL statement cancelled");
+    try {
+      let result = await query.execute(FETCH_SIZE);
+      const hasResults = result.has_results === true;
+      const rows: Record<string, unknown>[] = [];
+      const columns = (result.metadata?.columns || []).map((c: any) => ({ name: c.name || c.label, type: c.type }));
+      if (hasResults) {
+        while (true) {
+          if (options.signal?.aborted) throw new Error("SQL statement cancelled");
+          if (typeof result.is_done !== "boolean" || !Array.isArray(result.data) ||
+              result.has_results === false || result.data.length > FETCH_SIZE) {
+            throw new Error("SQL transport cannot prove result completeness: invalid page metadata");
+          }
+          if (result.sql_state && !/^(00000|02000)$/.test(result.sql_state)) {
+            throw new Error("SQL transport reported a warning; result completeness is unknown");
+          }
+          rows.push(...result.data);
+          if (result.is_done) break;
+          if (result.data.length === 0) throw new Error("SQL transport returned an empty unfinished page");
+          result = await query.fetchMore(FETCH_SIZE);
+        }
       }
-      result = await query.fetchMore(FETCH_SIZE);
-      if (Array.isArray(result.data)) rows.push(...result.data);
+      const updateCount = hasResults ? undefined : result.update_count;
+      return { rows, columns, updateCount: typeof updateCount === "number" ? updateCount : undefined };
+    } finally {
+      const result = await query.close();
+      if (result !== undefined && result?.success !== true) {
+        throw new Error("SQL cursor cleanup failed");
+      }
     }
-    const updateCount = result.has_results ? undefined : result.update_count;
-    return { rows, columns, updateCount: typeof updateCount === "number" ? updateCount : undefined };
   };
 
   const runClCommand = (command: string): Promise<SqlJobClResult> => runMapepireClCommand(job, command);
@@ -814,6 +894,14 @@ function wrapMapepireJob(job: any,mode: "daemon" | "ssh", connected: () => boole
         runQuery(sql, options).then(resolve, reject).finally(() => pending.delete(reject));
       });
     },
+    runBounded(sql, options) {
+      if (closed) return Promise.reject(new Error("SQL job closed"));
+      return new Promise((resolve, reject) => {
+        pending.add(reject);
+        runBoundedMapepireQuery(job, sql, options).then(resolve, reject)
+          .finally(() => pending.delete(reject));
+      });
+    },
     runCl(command) {
       if (closed) return Promise.reject(new Error("SQL job closed"));
       return new Promise((resolve, reject) => {
@@ -822,6 +910,7 @@ function wrapMapepireJob(job: any,mode: "daemon" | "ssh", connected: () => boole
       });
     },
     async close() {
+      if (closed) return;
       closed = true;
       const error = new Error("SQL job closed");
       for (const reject of pending) reject(error);

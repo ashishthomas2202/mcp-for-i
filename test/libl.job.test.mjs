@@ -67,7 +67,7 @@ function fakeSsh(calls, respond = () => ({})) {
   return {
     async execCommand(command, options) {
       calls.push({ command, stdin: options?.stdin });
-      return { code: 0, signal: null, stdout: "", stderr: "", ...respond(command, options?.stdin) };
+      return { code: 0, signal: null, stdout: /\bselect\b/i.test(options?.stdin ?? "") ? db2Rows("N", []) : "", stderr: "", ...respond(command, options?.stdin) };
     },
     dispose() {}
   };
@@ -193,7 +193,7 @@ test("QZDFMDB2: when CHGLIBL fails, missing libraries are dropped and the warnin
   );
   await other.client.runSQL("select 1 from sysibm.sysdummy1").catch(() => undefined);
   assert.doesNotMatch(other.sshCalls.at(-1).stdin, /CHGLIBL/);
-  assert.match(other.client.sqlJob.status().libraryListWarning, /not applied: CHGLIBL LIBL\(DEVLIB\) failed: Not authorized/);
+  assert.match(other.client.sqlJob.status().libraryListWarning, /not applied: CHGLIBL LIBL\(DEVLIB\) failed: Not authorized to library DEVLIB\. \(38501\)/);
 });
 
 test("a job without CL requests still applies the list through QCMDEXC", async () => {

@@ -17,7 +17,7 @@ export namespace Tools {
 
   export interface DB2Row extends Record<string, string | number | null> {}
 
-  export function db2Parse(output: string, input?: string): DB2Row[] {
+  export function db2Parse(output: string, input?: string, options: { resultBody?: boolean } = {}): DB2Row[] {
     let gotHeaders = false;
     let figuredLengths = false;
     let iiErrorMessage = false;
@@ -42,8 +42,8 @@ export namespace Tools {
     data.forEach((line, index) => {
       const trimmed = line.trim();
       if (trimmed.length === 0 && iiErrorMessage) iiErrorMessage = false;
-      if (trimmed.length === 0) return;
-      if (/^\d+\s+RECORD\(S\)\s+SELECTED\.$/i.test(trimmed)) return;
+      if (trimmed.length === 0 && !(options.resultBody && figuredLengths && line.length > 0)) return;
+      if (!options.resultBody && /^\d+\s+RECORD\(S\)\s+SELECTED\.$/i.test(trimmed)) return;
 
       if (trimmed === `**** CLI ERROR *****`) {
         iiErrorMessage = true;

@@ -192,7 +192,7 @@ test("runSQL sends SQL on stdin, never in the shell command", async () => {
   client.client = {
     async execCommand(command, options) {
       calls.push({ command, options });
-      return { code: 0, signal: null, stdout: "", stderr: "" };
+      return { code: 0, signal: null, stdout: "N\n---\n\n  0 RECORD(S) SELECTED.", stderr: "" };
     }
   };
   const sql = "select '$(rm -rf ~)' as x from sysibm.sysdummy1\n__MCP_FOR_I_SQL__\nrm -rf /tmp/x\n`id`";

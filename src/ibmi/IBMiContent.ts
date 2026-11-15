@@ -675,6 +675,17 @@ export class IBMiContent {
     } else {
       metadata = this.memberMetadataFromRow(lib, file, rows[0]);
     }
+    const reportedCount = rows.length > 0 ? rows[0].NUMBER_ROWS : metadata.rowCount;
+    const expectedCount = Number(reportedCount);
+    if ((typeof reportedCount !== "number" && typeof reportedCount !== "string") ||
+        String(reportedCount).trim() === "" ||
+        !Number.isInteger(expectedCount) || expectedCount < 0) {
+      throw new Error("Source member SQL completeness cannot be proven: invalid record count");
+    }
+    if (rows.length !== expectedCount) {
+      throw new Error("Incomplete source member SQL read: expected " + expectedCount +
+        " records, received " + rows.length);
+    }
     const sourceDates = rows.map(row => String(row.SRCDAT).padStart(6, "0"));
     const content = rows.map(row => String(row.SRCDTA ?? "")).join("\n");
     const snapshot = this.makeMemberSnapshot(lib, file, mbr, content, metadata, "sql-member", []);
@@ -692,6 +703,17 @@ export class IBMiContent {
     if (!metadataAfter) throw new Error(`${mbr} in ${lib}/${file} was removed during read`);
     if (metadataBefore.lastChanged && metadataAfter.lastChanged && metadataBefore.lastChanged !== metadataAfter.lastChanged) {
       throw new Error(`Source changed during read: ${lib}/${file}(${mbr})`);
+    }
+    const streamText = String(content).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    // CPYTOSTMF writes one terminator per record, including blank records.
+    const records = streamText === "" ? 0 : streamText.endsWith("\n")
+      ? streamText.split("\n").length - 1 : streamText.split("\n").length;
+    if (!Number.isInteger(metadataAfter.rowCount) || metadataAfter.rowCount! < 0) {
+      throw new Error("Source member stream completeness cannot be proven: invalid record count");
+    }
+    if (records !== metadataAfter.rowCount) {
+      throw new Error("Incomplete source member stream read: expected " + metadataAfter.rowCount +
+        " records, received " + records);
     }
     return this.makeMemberSnapshot(
       lib,
@@ -714,6 +736,8 @@ export class IBMiContent {
     warnings: string[]
   ): MemberSnapshot {
     const { content, lines } = normalizeMemberContent(rawContent, transport);
+    // A single blank record has empty content but is still one source record.
+    if (lines.length === 0 && metadata.rowCount === 1) lines.push("");
     const sha256 = crypto.createHash("sha256").update(content, "utf8").digest("hex");
     const marker = metadata.lastChanged || "unknown";
     return {
@@ -740,7 +764,8 @@ export class IBMiContent {
       extension: String(row.SOURCE_TYPE || ""),
       text: String(row.PARTITION_TEXT || ""),
       lines: Number(row.NUMBER_ROWS || 0),
-      rowCount: Number(row.NUMBER_ROWS || 0),
+      rowCount: (typeof row.NUMBER_ROWS === "number" || typeof row.NUMBER_ROWS === "string") &&
+        String(row.NUMBER_ROWS).trim() !== "" ? Number(row.NUMBER_ROWS) : undefined,
       ...(row.LAST_SOURCE_UPDATE_TIMESTAMP ? { lastChanged: String(row.LAST_SOURCE_UPDATE_TIMESTAMP) } : {}),
       ...(rowLength > 0 ? { recordLength: Math.max(0, rowLength - 12) } : {})
     };

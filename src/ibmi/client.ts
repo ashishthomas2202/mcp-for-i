@@ -1,4 +1,5 @@
 import { NodeSSH } from "node-ssh";
+import { boundQzdfmdb2Sql, boundedQzdfmdb2Result, parseQzdfmdb2Result, qzdfmdb2HasResult } from "./qzdfmdb2.js";
 import fs from "fs/promises";
 import path from "path";
 import { Tools } from "./Tools.js";
@@ -11,6 +12,7 @@ import {
   SqlJobFactory,
   SqlJobOpenRequest,
   SqlRows,
+  BoundedSqlResult,
   isQualifiedJobName,
   normalizeMapepireMode
 } from "./sqlJob.js";
@@ -171,12 +173,30 @@ export class IBMiClient {
     const command = commands.join(" && ");
     const directory = options.directory || this.config.homeDirectory || ".";
 
-    const result = await this.client.execCommand(command, {
+    if (options.signal?.aborted) throw new Error("SQL statement cancelled");
+    let channel: any;
+    const cancel = () => { channel?.close(); channel?.destroy(); };
+    options.signal?.addEventListener("abort", cancel, { once: true });
+    let result;
+    try {
+      result = await this.client.execCommand(command, {
       cwd: directory,
       stdin: options.stdin,
       onStdout: options.onStdout,
-      onStderr: options.onStderr
+      onStderr: options.onStderr,
+      noTrim: options.requireCleanExit,
+      onChannel: (opened) => {
+        channel = opened;
+        if (options.signal?.aborted) cancel();
+      },
     });
+    } finally {
+      options.signal?.removeEventListener("abort", cancel);
+    }
+    if (options.signal?.aborted) throw new Error("SQL statement cancelled");
+    if (options.requireCleanExit && (result.code !== 0 || result.signal !== null)) {
+      throw new Error("QZDFMDB2 command exit was not clean");
+    }
 
     if (result.code === null) result.code = 0;
     if (result.signal === "SIGABRT") result.code = 127;
@@ -200,7 +220,18 @@ export class IBMiClient {
   async runSQL(statements: string, options: { signal?: AbortSignal } = {}): Promise<SqlRows> {
     const rows = await this.sqlJob.runSql(statements, options);
     if (rows) return rows;
-    return this.runSqlQzdfmdb2(statements);
+    return this.runSqlQzdfmdb2(statements, options);
+  }
+
+  async querySQL(sql: string, options: { rowLimit: number; signal?: AbortSignal }): Promise<BoundedSqlResult> {
+    const result = await this.sqlJob.query(sql, options);
+    if (result) return result;
+    const bounded = boundQzdfmdb2Sql(sql, options.rowLimit);
+    const resolved = await this.resolveFallbackLibraryList();
+    const statements = resolved?.command ? `@${resolved.command}\n${bounded}` : bounded;
+    const output = await this.executeQzdfmdb2Batch(statements, options);
+    if (options.signal?.aborted) throw new Error("SQL statement cancelled");
+    return boundedQzdfmdb2Result(output, options.rowLimit);
   }
 
   /**
@@ -313,17 +344,23 @@ export class IBMiClient {
    * in the same job, by a leading CHGLIBL (libraries that do not exist are
    * left out so it cannot fail the batch).
    */
-  async runSqlQzdfmdb2(statements: string): Promise<Tools.DB2Row[]> {
+  async runSqlQzdfmdb2(statements: string, options: { signal?: AbortSignal } = {}): Promise<Tools.DB2Row[]> {
     if (!Tools.fixSQL(statements, true).trim()) return [];
     const resolved = await this.resolveFallbackLibraryList();
     const command = resolved?.command;
-    return this.runQzdfmdb2Batch(command ? `@${command}\n${statements}` : statements);
+    return this.runQzdfmdb2Batch(command ? `@${command}\n${statements}` : statements, options);
   }
 
   /** Runs SQL in a new QZDFMDB2 job as it is (no library list). */
-  private async runQzdfmdb2Batch(statements: string): Promise<Tools.DB2Row[]> {
+  private async runQzdfmdb2Batch(statements: string, options: { signal?: AbortSignal } = {}): Promise<Tools.DB2Row[]> {
+    const output = await this.executeQzdfmdb2Batch(statements, options);
+    if (options.signal?.aborted) throw new Error("SQL statement cancelled");
+    return parseQzdfmdb2Result(output, qzdfmdb2HasResult(statements)).rows;
+  }
+
+  private async executeQzdfmdb2Batch(statements: string, options: { signal?: AbortSignal } = {}): Promise<CommandResult> {
     const input = Tools.fixSQL(statements, true).trim();
-    if (!input) return [];
+    if (!input) throw new Error("Empty QZDFMDB2 batch");
     const ccsid = Number(this.config.sqlJobCcsid ?? 1208);
     if (!Number.isInteger(ccsid) || ccsid < 1 || ccsid > 65535) {
       throw new Error(`Invalid sqlJobCcsid: ${this.config.sqlJobCcsid}`);
@@ -338,18 +375,12 @@ export class IBMiClient {
     const output = await this.sendCommand({
       command: `${LOCALE} /QOpenSys/usr/bin/qsh -c ${Tools.shellQuote(script)}`,
       stdin: `${input}\n`,
-      env: { QIBM_PASE_CCSID: String(ccsid) }
+      env: { QIBM_PASE_CCSID: String(ccsid) },
+      signal: options.signal,
+      requireCleanExit: true,
     });
 
-    if (output.stdout && output.stdout.trim()) {
-      return Tools.db2Parse(output.stdout, input);
-    }
-
-    if (hasSqlError(output.stderr || "")) {
-      throw new Tools.SqlError(normalizeSqlError(output.stderr || ""));
-    }
-
-    return [];
+    return output;
   }
 
   private async loadDefaultLibraryList() {

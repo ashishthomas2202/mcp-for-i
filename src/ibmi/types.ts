@@ -17,6 +17,8 @@ export interface RemoteCommand {
 }
 
 export interface CommandData extends StandardIO {
+  signal?: AbortSignal;
+  requireCleanExit?: boolean;
   command: string;
   directory?: string;
   env?: Record<string, string>;

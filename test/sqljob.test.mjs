@@ -52,7 +52,7 @@ function fakeSsh(calls) {
   return {
     async execCommand(command, options) {
       calls.push({ command, stdin: options?.stdin });
-      return { code: 0, signal: null, stdout: "", stderr: "" };
+      return { code: 0, signal: null, stdout: /\bselect\b/i.test(options?.stdin ?? "") ? "N\n---\n\n  0 RECORD(S) SELECTED." : "", stderr: "" };
     },
     dispose() {}
   };
@@ -286,7 +286,7 @@ test("ibmi.sql.query passes an abort signal that fires on timeout", async () => 
   const conn = {
     currentConnectionName: "DEV",
     getConfig: () => ({}),
-    async runSQL(_sql, options) {
+    async querySQL(_sql, options) {
       seenSignal = options?.signal;
       return new Promise(() => {});
     }
@@ -296,7 +296,7 @@ test("ibmi.sql.query passes an abort signal that fires on timeout", async () => 
     handleTool(ctx, "ibmi.sql.query", { sql: "select * from big", timeoutMs: 1000 }),
     /timed out after 1000ms/
   );
-  assert.ok(seenSignal, "runSQL received a signal");
+  assert.ok(seenSignal, "querySQL received a signal");
   assert.equal(seenSignal.aborted, true);
 
   await assert.rejects(
