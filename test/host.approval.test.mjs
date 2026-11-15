@@ -98,6 +98,9 @@ const ROUTINE = [
   ["cl.run OVRDBF and DLTOVR", "ibmi.cl.run", { command: "OVRDBF FILE(X) TOFILE(DISK/X)" }],
   ["cl.run DLTOVR", "ibmi.cl.run", { command: "DLTOVR FILE(*ALL)" }],
   ["cl.run DSPLIBL", "ibmi.cl.run", { command: "DSPLIBL" }],
+  ["cl.run CHGJOB of its own job's inquiry replies", "ibmi.cl.run", { command: "CHGJOB INQMSGRPY(*DFT)" }],
+  ["cl.run CHGJOB JOB(*) of its own job log", "ibmi.cl.run", { command: "CHGJOB JOB(*) LOG(4 00 *SECLVL) LOGCLPGM(*YES)" }],
+  ["cl.run ADDBNDDIRE into a trusted library, naming an object elsewhere", "ibmi.cl.run", { command: "ADDBNDDIRE BNDDIR(DEVLIB/PCRBCAEM) OBJ((QTCP/QTMMSNDM *SRVPGM))" }],
   ["sql.write CREATE ALIAS in a trusted library over another one", "ibmi.sql.execute", { sql: "CREATE ALIAS DEVLIB.X FOR DISK.F(M)" }],
   ["sql.write DROP ALIAS", "ibmi.sql.execute", { sql: "DROP ALIAS DEVLIB.X" }],
   ["sql.write CREATE VIEW", "ibmi.sql.execute", { sql: "CREATE OR REPLACE VIEW DEVLIB.V AS SELECT * FROM DISK.F" }],
@@ -133,6 +136,13 @@ const CRITICAL = [
   ["cl.run SBMJOB of a delete", "ibmi.cl.run", { command: "SBMJOB CMD(DLTLIB LIB(DEVLIB))" }, "cl.run", /DLTLIB is in confirmClCommands/],
   ["cl.run CALL QCMDEXC of a delete", "ibmi.cl.run", { command: "CALL PGM(QSYS/QCMDEXC) PARM('DLTF FILE(DEVLIB/F)' 19)" }, "cl.run", /DLTF is in confirmClCommands/],
   ["cl.run CHGUSRPRF", "ibmi.cl.run", { command: "CHGUSRPRF USRPRF(X) STATUS(*DISABLED)" }, "cl.run", /CHGUSRPRF/],
+  ["cl.run CHGJOB of another job", "ibmi.cl.run", { command: "CHGJOB JOB(151618/DEV/BCAPEBAD) INQMSGRPY(*DFT)" }, "cl.run", /cannot be determined/],
+  ["cl.run CHGJOB of another job, positional", "ibmi.cl.run", { command: "CHGJOB 151618/DEV/BCAPEBAD LOG(4 00 *SECLVL)" }, "cl.run", /outside trustedLibraries/],
+  ["cl.run CHGJOB CCSID of its own job", "ibmi.cl.run", { command: "CHGJOB CCSID(37)" }, "cl.run", /cannot be determined/],
+  ["cl.run CHGJOB mixing an allowed and another setting", "ibmi.cl.run", { command: "CHGJOB INQMSGRPY(*DFT) DATFMT(*ISO)" }, "cl.run", /cannot be determined/],
+  ["cl.run CHGJOB moving its job to another queue", "ibmi.cl.run", { command: "CHGJOB JOBQ(QGPL/QBATCH)" }, "cl.run", /cannot be determined/],
+  ["cl.run ADDBNDDIRE into a library outside trustedLibraries", "ibmi.cl.run", { command: "ADDBNDDIRE BNDDIR(PRODLIB/DIR) OBJ((DEVLIB/SRV *SRVPGM))" }, "cl.run", /PRODLIB, outside/],
+  ["cl.run RMVBNDDIRE", "ibmi.cl.run", { command: "RMVBNDDIRE BNDDIR(DEVLIB/DIR) OBJ((QTCP/QTMMSNDM))" }, "cl.run", /RMVBNDDIRE is in confirmClCommands/],
   ["sql.write DELETE", "ibmi.sql.execute", { sql: "DELETE FROM DEVLIB.T WHERE A = 1" }, "sql.write", /DELETE statements/],
   ["sql.write DROP TABLE", "ibmi.sql.execute", { sql: "DROP TABLE DEVLIB.T" }, "sql.write", /DROP TABLE statements/],
   ["sql.write CALL", "ibmi.sql.execute", { sql: "CALL DEVLIB.PROC()" }, "sql.write", /CALL statements/],
@@ -285,6 +295,13 @@ test("classifier: CL targets resolve qualified names, *CURLIB and CRT defaults",
   assert.deepEqual(classifyClText(policy, "DSPFD FILE(DISK/F) OUTPUT(*OUTFILE) OUTFILE(PROD/X)").targets, { libraries: ["PROD"], unknown: false });
   assert.equal(classifyClText(policy, "CALL PGM(*LIBL/X)").targets.unknown, true);
   assert.equal(classifyClText(policy, "CALL DEVLIB/X").targets.libraries[0], "DEVLIB");
+  // Its own job's reply and log settings write no library; the entries of a binding directory are only named.
+  assert.deepEqual(classifyClText(policy, "CHGJOB INQMSGRPY(*DFT)").targets, { libraries: [], unknown: false });
+  assert.deepEqual(classifyClText(policy, "CHGJOB JOB(*) LOG(4 00 *SECLVL)").targets, { libraries: [], unknown: false });
+  assert.equal(classifyClText(policy, "CHGJOB").targets.unknown, true);
+  assert.equal(classifyClText(policy, "CHGJOB CCSID(37)").targets.unknown, true);
+  assert.equal(classifyClText(policy, "CHGJOB JOB(123456/U/J) INQMSGRPY(*DFT)").targets.unknown, true);
+  assert.deepEqual(classifyClText(policy, "ADDBNDDIRE BNDDIR(DEVLIB/D) OBJ((QTCP/QTMMSNDM *SRVPGM) (DISK/M *MODULE))").targets, { libraries: ["DEVLIB"], unknown: false });
 });
 
 test("classifier: SQL targets", () => {

@@ -272,6 +272,13 @@ const OBJECT_KEYWORDS = new Set([
 ]);
 /** Commands whose MODULE parameter is an input, not the object created. */
 const MODULE_INPUT_COMMANDS = new Set(["CRTPGM", "CRTSRVPGM", "UPDPGM", "UPDSRVPGM"]);
+/**
+ * CHGJOB settings the caller may change on its own job without being asked:
+ * how inquiry messages are answered and what the job log keeps. Nothing that
+ * changes what later statements in the shared SQL job return (CCSID, DATFMT,
+ * SRTSEQ ...), where the job runs (JOBQ, RUNPTY ...) or where output goes.
+ */
+const OWN_JOB_SETTINGS = new Set(["INQMSGRPY", "LOG", "LOGCLPGM"]);
 
 type ClDecision = { critical?: string; targets: LibraryTargets };
 
@@ -324,6 +331,16 @@ function classifyClCommand(policy: ConnectionPolicy, command: string, currentLib
     const result = classifySql(policy, literal, currentLibrary);
     return { critical: result.critical, targets: result.targets };
   }
+  if (name === "CHGJOB") {
+    // Its own job (no JOB, or JOB(*)) and only OWN_JOB_SETTINGS: no library is
+    // written. Another job, or any other setting, is classified as before.
+    const job = parsed.params.find(p => p.keyword === "JOB") ?? parsed.params.find(p => !p.keyword);
+    const settings = parsed.params.filter(p => p !== job);
+    const ownJob = !job || job.value.trim() === "*";
+    if (ownJob && settings.length > 0 && settings.every(p => !!p.keyword && OWN_JOB_SETTINGS.has(p.keyword))) {
+      return { targets };
+    }
+  }
 
   if (matchesAny(name, NO_TARGET_COMMANDS)) return { targets };
   const readOnly = matchesAny(name, READ_COMMANDS);
@@ -335,6 +352,8 @@ function classifyClCommand(policy: ConnectionPolicy, command: string, currentLib
     if (readOnly && !OUTPUT_KEYWORDS.has(keyword)) continue;
     if (keyword === "MODULE" && MODULE_INPUT_COMMANDS.has(name)) continue;
     if (keyword === "BNDDIR" && !name.includes("BNDDIR")) continue;
+    // ADDBNDDIRE writes the binding directory; the entries it adds only name objects.
+    if (keyword === "OBJ" && name === "ADDBNDDIRE") continue;
     if (LIBRARY_KEYWORDS.has(keyword)) {
       for (const value of listValues(p.value)) {
         found = true;
