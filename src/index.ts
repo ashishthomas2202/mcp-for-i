@@ -135,7 +135,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       approvedBy: callState.approvedBy,
       durationMs,
       correlationId,
-      resultSummary: summarizeResult(result)
+      resultSummary: {
+        ...summarizeResult(result),
+        // Jobs the server ended by itself during this call (a test job, a stuck connection job).
+        ...(callState.serverEndedJobs?.length ? { serverEndedJobs: callState.serverEndedJobs } : {})
+      }
     });
     return result;
   } catch (err: any) {

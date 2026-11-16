@@ -190,6 +190,8 @@ export interface SqlJobStatus {
   lastError?: string;
   libraryListWarning?: string;
   lastCancel?: string;
+  /** The statement running in the persistent job now: which job, and since when (ms). */
+  running?: { jobName?: string; since: number };
 }
 
 export interface PersistentSqlJobOptions {
@@ -251,6 +253,7 @@ export class PersistentSqlJob {
   private lastError?: string;
   private libraryListWarning?: string;
   private lastCancel?: string;
+  private runningNow?: { jobName?: string; since: number };
   /** The configured library list last applied, and to which job. */
   private appliedLibraryList?: { handle: SqlJobHandle; signature: string };
   private closed = false;
@@ -280,7 +283,8 @@ export class PersistentSqlJob {
       ...(this.unavailableReason ? { unavailableReason: this.unavailableReason } : {}),
       ...(this.lastError ? { lastError: this.lastError } : {}),
       ...(libraryListWarning ? { libraryListWarning } : {}),
-      ...(this.lastCancel ? { lastCancel: this.lastCancel } : {})
+      ...(this.lastCancel ? { lastCancel: this.lastCancel } : {}),
+      ...(this.runningNow ? { running: { ...this.runningNow } } : {})
     };
   }
 
@@ -507,7 +511,15 @@ export class PersistentSqlJob {
   private exclusive<T>(signal: AbortSignal | undefined, task: () => Promise<T>): Promise<T> {
     const run = async () => {
       if (signal?.aborted) throw new Error("SQL statement cancelled before it started");
-      return task();
+      // Which job is running a statement, and since when: a caller whose call timed out can tell
+      // whether it was its own statement that is stuck there, or one that was ahead of it.
+      const mine = { jobName: this.handle?.jobName, since: Date.now() };
+      this.runningNow = mine;
+      try {
+        return await task();
+      } finally {
+        if (this.runningNow === mine) this.runningNow = undefined;
+      }
     };
     const result = this.queue.then(run, run);
     this.queue = result.catch(() => undefined);

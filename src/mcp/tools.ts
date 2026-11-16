@@ -17,6 +17,7 @@ import { ConnectionPolicy } from "../config/store.js";
 import { ConnectionService } from "../controlplane/connectionService.js";
 import { log } from "./logger.js";
 import { baseOperation, classifyHostOperation } from "./hostApproval.js";
+import { clTimedOut, connectionJobName, isOwnJob, mark, mayEndJobs, rememberOwnJob, runningConnectionJob, runsProgram, submittedByThisCall, waitingJobsNotice } from "./modules/jobWatch.js";
 import {
   assertAgentConnectionChangeAllowed,
   assertSafeIfsDeletePath,
@@ -104,7 +105,12 @@ const SETTINGS_SCHEMA: JsonSchema = {
     tn5250Ccsid: { type: "number", description: "Single-byte EBCDIC code page for TN5250 screen text (default 37)." },
     tn5250LiveView: { type: "boolean", description: "Serve the live 5250 view on localhost (default true)." },
     tn5250LiveViewPort: { type: "number", description: "Preferred port for the live 5250 view (default 3981; another free port if taken, 0 for any)." },
-    tn5250AttnWaitMs: { type: "number", description: "How long Attn/SysReq wait for the host before unlocking the keyboard, in ms (default 2000)." }
+    tn5250AttnWaitMs: { type: "number", description: "How long Attn/SysReq wait for the host before unlocking the keyboard, in ms (default 2000)." },
+    testJobTimeoutSeconds: { type: "number", description: "How long a job run with ibmi.jobs.runTest may take before it is ended (default 120, 5-3600)." },
+    testJobOnInquiry: { type: "string", enum: ["end", "report"], description: "What ibmi.jobs.runTest does when its job asks a question: end it (default) or leave it and report." },
+    testJobOnTimeout: { type: "string", enum: ["end", "report"], description: "What ibmi.jobs.runTest does when its job runs out of time: end it (default) or leave it and report." },
+    watchWaitingJobs: { type: "boolean", description: "After a tool runs a program, report jobs of this user that wait on a message (default true)." },
+    stuckConnectionJob: { type: "string", enum: ["end", "report"], description: "When a call times out because the connection's own job waits on a question it asked: report it (default) or end that job." }
   }
 };
 
@@ -1412,7 +1418,16 @@ export type ToolCallState = {
   approvedBy?: "host" | "person";
   /** Host mode: the person already confirmed this call, so later checks in it don't ask again. */
   personConfirmed?: boolean;
+  /** Jobs the server ended by itself during this call (a test job, a stuck connection job), for the audit record. */
+  serverEndedJobs?: Array<{ jobName: string; why: string; messageId?: string }>;
 };
+
+/** Record that the server ended a job by itself in the tool call being handled, so the audit record shows it. */
+export function noteServerEndedJob(entry: { jobName: string; why: string; messageId?: string }) {
+  const state = toolCallStore.getStore();
+  if (!state) return;
+  (state.serverEndedJobs ??= []).push(entry);
+}
 
 /** Run a tool call with a state object the caller can read afterwards (for the audit). */
 export function handleToolCall(ctx: McpContext, name: string, args: any, state: ToolCallState = { toolName: name }) {
@@ -2302,7 +2317,18 @@ export async function handleTool(ctx: McpContext, name: string, args: any): Prom
           errorType: safe.type,
           code: safe.code
         });
-        return toolError(`SQL execute failed (${safe.type})`, safe);
+        // A statement that timed out may have left the connection's job waiting on a message (a CALL, a trigger,
+        // a function): that is looked at from a new job, and a stuck job is ended. Otherwise a failed CALL gets
+        // the ordinary look for waiting jobs.
+        const waiting = safe.type === "timeout"
+          ? await waitingJobsNotice(conn, getConnectionName(ctx, args), {
+            // Only when it was this statement that is still running in the connection's job.
+            connectionJob: runningConnectionJob(conn, startedAt),
+            mayEnd: mayEndJobs(ctx.getPolicy(args?.connectionName)),
+            withinSeconds: Math.ceil((Date.now() - startedAt) / 1000) + 10
+          })
+          : String(statementType).toUpperCase() === "CALL" ? await waitingJobsNotice(conn, getConnectionName(ctx, args)) : {};
+        return toolError(`SQL execute failed (${safe.type})`, { ...safe, ...waiting });
       }
     }
     case "ibmi.cl.run": {
@@ -2313,14 +2339,42 @@ export async function handleTool(ctx: McpContext, name: string, args: any): Prom
       const environment = String(args.environment || "ile");
       const cwd = args.cwd ? String(args.cwd) : undefined;
       const timeoutMs = clampNumber(args?.timeoutMs, 45000, 1000, 300000);
+      // An ILE command runs in the connection's own job: if it times out, that job may be waiting on a message.
+      // For an SBMJOB in the connection's own job: who we are and what time the system has, so the job it
+      // makes can be told from any other.
+      const submitMark = environment === "ile" && isSubmitJob(command) && connectionJobName(conn) ? await mark(conn).catch(() => undefined) : undefined;
+      const began = Date.now();
       const cmdResult = await runClCommand(conn, command, environment, cwd, timeoutMs);
+      const timedOut = clTimedOut(cmdResult);
 
       log("info", "audit.cl.run", { connectionName: args?.connectionName || ctx.activeName, environment });
+      const connectionName = getConnectionName(ctx, args);
+      // A job submitted from here is remembered, so it can be ended later without asking the person.
+      const submittedJob = cmdResult?.code === 0 && submitMark ? await submittedByThisCall(conn, submitMark) : undefined;
+      if (submittedJob) rememberOwnJob(connectionName, submittedJob);
+      // The look for waiting jobs costs queries, so it follows only what can leave one: a command that calls a
+      // program or submits a job, and any command that failed or timed out.
+      const ile = environment === "ile";
+      const look = timedOut || (ile && (cmdResult?.code !== 0 || runsProgram(command)));
+      const sinceSeconds = Math.ceil((Date.now() - began) / 1000) + 10;
+      const notice = !look
+        ? {}
+        : await waitingJobsNotice(
+          conn,
+          connectionName,
+          // The connection's job is looked at only when it was this command that is still running in it.
+          timedOut
+            ? { connectionJob: ile ? runningConnectionJob(conn, began) : undefined, mayEnd: mayEndJobs(ctx.getPolicy(args?.connectionName)), withinSeconds: sinceSeconds }
+            : undefined
+        );
       return json({
         ok: cmdResult?.code === 0,
         timeoutMs,
         environment,
-        ...cmdResult
+        ...cmdResult,
+        ...(submittedJob ? { submittedJob } : {}),
+        // A program run here can leave a job waiting on a message; that job cannot say so itself.
+        ...notice
       });
     }
     case "ibmi.diagnostics.parseEvfevent": {
@@ -2419,8 +2473,12 @@ export async function handleTool(ctx: McpContext, name: string, args: any): Prom
     }
     case "ibmi.jobs.end": {
       const conn = await ctx.ensureActive(args?.connectionName);
-      await enforceWritable(ctx, conn, "jobs.end", args);
       const jobName = requireJobName(args.jobName);
+      // A job this server submitted (ibmi.jobs.runTest, or an SBMJOB through ibmi.cl.run) is its own to
+      // stop: in host mode that is routine. Any other job asks the person, and prompt and agent mode
+      // treat every job as before.
+      const hostMode = ctx.getPolicy(args?.connectionName)?.approvalMode === "host";
+      await enforceWritable(ctx, conn, hostMode && isOwnJob(getConnectionName(ctx, args), jobName) ? "jobs.endOwn" : "jobs.end", args);
       const option = String(args?.option || "*CNTRLD").toUpperCase();
       if (option !== "*CNTRLD" && option !== "*IMMED") {
         throw new Error("option must be *CNTRLD or *IMMED");
@@ -2978,6 +3036,11 @@ export async function runClCommand(conn: any, command: string, environment: stri
   } catch (err: any) {
     return { code: 1, signal: null, stdout: "", stderr: err?.message || String(err), command };
   }
+}
+
+/** True when CL text is an SBMJOB (qualified or not). */
+export function isSubmitJob(command: string) {
+  return /^\s*(?:[A-Z#@$][A-Z0-9#@$_]{0,9}\/)?SBMJOB\b/i.test(String(command || ""));
 }
 
 type JournalQueryOptions = {

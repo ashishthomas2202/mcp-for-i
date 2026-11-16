@@ -169,6 +169,8 @@ The documentation catalog is also exposed through MCP resources: `ibmi-docs://ca
 - `ibmi.jobs.hold`
 - `ibmi.jobs.release`
 - `ibmi.jobs.end`
+- `ibmi.jobs.runTest`
+- `ibmi.jobs.waiting`
 - `ibmi.subsystems.list`
 - `ibmi.subsystems.status`
 - `ibmi.subsystems.start`
@@ -415,3 +417,64 @@ Cancellation keeps the SQL job queue occupied until cancellation and cleanup
 settle; a cancelled query, or one that failed for a reason other than the
 database rejecting the statement, discards its SQL job before the next
 statement. A resolved sqlclose failure also rejects the query.
+
+## Test jobs and jobs that wait on a message
+
+A program run to try it out can send an inquiry message that nobody is there to answer. Submitted with `INQMSGRPY(*RQD)` the job waits for ever and holds its job queue. Submitted with `INQMSGRPY(*DFT)`, a message that has no valid default reply can be asked again and again and fill `QSYSOPR`. A program called in the connection's own job (`ibmi.cl.run` with `CALL`, or SQL `CALL`) leaves that shared database server job stuck instead.
+
+### `ibmi.jobs.runTest`
+
+Runs one CL command as a batch job and watches it.
+
+- It submits `SBMJOB CMD(<command>) JOB(<name>) INQMSGRPY(*DFT) LOG(4 00 *SECLVL)`, with `JOBD`, `JOBQ`, `INLLIBL` and `CURLIB` when given. `command` is one CL command without comments or double quotes (`/* */` and `"` are refused: either could close `CMD(` early). The job name always ends in random characters; `jobName` gives its first six. The submit itself is given 30 seconds. Every run leaves a `QPJOBLOG` spooled file.
+- With `INQMSGRPY(*DFT)` the system gives a question its default reply and the program carries on until the next look, one to five seconds later. This tool never replies to a message itself.
+- Policy: the command is held to `denyCommands` and `allowCommands` as if it were run directly, and the `SBMJOB` as it will run goes through the same approval as `ibmi.cl.run`, so an `allowCommands` list must name `SBMJOB` as well as the command. The libraries of `jobQueue` and `jobDescription` are held to `denyLibraries` and `allowLibraries`. Read-only connections are refused.
+- Nothing is submitted when the job services it needs do not answer (`not-available`), or when a job of that name and user entered the system in the same second (`not-started`).
+- The job taken for the new one is the job of this user and name that entered the system at or after the submit and, when the connection has a long-lived SQL job, was submitted by that job. When none or more than one fits, no job is adopted and none is ended (`not-found`). A job that runs under another user (a job description with its own `USER`) is therefore not found and not watched.
+- It looks at the job every one to five seconds until it ends. A look that fails is retried; after three failures in a row, or when looks still do not work once the time is up, the job is ended and the outcome is `watch-lost`. A look that is only slow (no answer in 15 seconds) is waited out until the time limit.
+- If the job asked a question, answered or not, it is ended (`ENDJOB OPTION(*IMMED)`) and the result carries the message. A question is looked for in the job's log and on the two message queues it can land on, `QSYSOPR` and the job user's own; a queue the user may not read is not looked at. Status `MSGW` alone does not end a job early, because a program that waits for work on a message queue shows the same status.
+- If the job is still running, or still on its job queue, after `timeoutSeconds` (default 120, at most 3600), it is ended.
+- `onInquiry: "report"` and `onTimeout: "report"` leave the job as it is and report it. So does a policy that denies `ENDJOB`.
+`outcome` is one of:
+
+| Outcome | Meaning |
+|---|---|
+| `completed` | Ended normally, and no question from it was found on the operator's queue or the user's own. The note says so when the operator's queue could not be read. The only outcome with `ok: true`. |
+| `completed-after-inquiry` | Ended by itself, but it asked a question that got the default reply. Treat its result as unreliable. |
+| `failed` | Ended abnormally. |
+| `ended-on-inquiry` | Asked a question and was ended. |
+| `waiting-on-inquiry` | Asked a question and was left (report mode, a policy that forbids ending, or an end the system refused; the note says which). |
+| `ended-on-timeout` | Still running at the time limit and ended. |
+| `still-running` | Still running at the time limit and left, or an end was tried and failed; the note says which. |
+| `not-started` | The system refused the submit (a CPF or CPD message), a job of that name had just entered the system, or the job never left its job queue. In the last case it is taken off the queue unless `onTimeout` is `report`, the policy forbids ending, or the end fails; the note says which. |
+| `not-found` | Submitted, but no single job could be identified as the new one. Not watched. |
+| `not-available` | Nothing was submitted: jobs cannot be watched on this system or with this user. |
+| `submit-timed-out` | The submit did not answer or its answer was lost. If exactly one job submitted by the connection's job is found from a new job, it is ended. A job found by name alone is named and left. Otherwise it is not known whether one was submitted. |
+| `watch-lost` | The job could no longer be watched and was ended; if it could not be ended, the note says it may still be running. |
+| `unknown` | The system no longer knows the job. |
+
+The result also has `jobName`, `seconds`, `inquiry`, `ended` (`byWatcher`; `verified: true` only when the job was then seen on the output queue or gone, a job still shown as ending is not verified; completion status and end reason), the last job log messages seen while the job was active, and a `note` that says what to do next.
+
+Limits worth knowing: the watch runs inside the tool call, so `timeoutSeconds` should stay under the client's own time limit for a tool call; if the client gives up first, or the server process stops, the job is no longer watched. On a slow system a look, the end and its check can each take up to tens of seconds, so the call can return well after `timeoutSeconds`. Queries the tool stopped waiting for are not cancelled and can delay the next call on the connection. Every job the server ends by itself is recorded in the audit record of the tool call (`serverEndedJobs`).
+
+### `ibmi.jobs.waiting`
+
+Lists the jobs working for the connection's user that are in `MSGW`, with the message when it can be read, and says which of them were submitted from this server. It includes database server jobs that run under another user (`QZDASOINIT` under `QUSER`) on this user's behalf, and leaves out interactive sessions. On a system without the job services it answers `available: false`.
+
+A narrower look is added to the result of `ibmi.jobs.runTest`, of `ibmi.cl.run` in the ILE environment when the command calls a program or submits a job (`CALL`, `CALLPRC`, `SBMJOB`) or failed, of any `ibmi.cl.run` that timed out, and of a failed `ibmi.sql.execute` `CALL`. It reports only what the call could have caused: a job submitted from here, or a job with a question asked in the last ten minutes (since the call began, after a timeout). When there is one, the result gains `waitingJobs` and `waitingJobsNote`. Other commands cost no extra queries; a successful `CALL` costs two, an `SBMJOB` five. The tool stops waiting for the look after six seconds (after a timeout, see below, up to about a minute), and it never fails the tool. Set `watchWaitingJobs: false` on a connection to switch it off.
+
+### When the connection's own job is the one that is stuck
+
+`ibmi.cl.run` in the ILE environment and SQL statements run in the connection's long-lived job. A command there can ask a question too: a program it calls, a trigger, or a command's validity checking program (which `SBMJOB` also runs, in the submitting job, for the command it is given). The call then times out, and the job, a pooled database server job such as `QZDASOINIT`, keeps waiting on the message after the connection has let go of it.
+
+After a timeout in `ibmi.cl.run` (ILE), `ibmi.sql.execute` or the submit of `ibmi.jobs.runTest`, and only when the statement still running in the connection's job is the one this call started, that job is looked at from a new job. If it is in `MSGW`, still working for this user, and a question it asked since the call began has no reply yet, the result gains `stuckJob` (`jobName`, `message`, `ended`, and `reason` when it was not ended) and `stuckJobNote`.
+
+By default the job is reported and not ended (`stuckConnectionJob: "report"`): the person or an operator ends it or answers the message. With `stuckConnectionJob: "end"` it is ended (`ENDJOB OPTION(*IMMED)`) when the policy does not deny `ENDJOB`; it is checked once more immediately before the end, the end is waited for and reported, and the next call opens a new job. The person is not asked, in any approval mode. A job that is only slow, one that waits on a message queue without such a question (a program waiting for work looks the same), and one the system has handed to another user are left alone. The message stays listed on the operator's queue; it needs no answer once its job has ended.
+
+Limits: on a shared profile, "still working for this user" cannot tell two clients of the same user apart. A call that timed out while it was still waiting behind another call on the connection does not look at the connection's job at all. A call that timed out can return up to about a minute after its `timeoutMs`.
+
+A command's validity checker is resolved through the library list of the job that runs or submits the command. If a site keeps such programs in a library that is not on the connection's library list, compiles and submits fail this way: put that library on the connection's list.
+
+### Jobs submitted from here
+
+A job submitted from this server through `ibmi.jobs.runTest`, or through an `SBMJOB` with `ibmi.cl.run`, is remembered while the server runs, until `ibmi.disconnect` or `ibmi.session.terminate` for that connection (the most recent 200 per connection name; an idle timeout or a reconnect does not forget them). `ibmi.cl.run` returns it as `submittedJob` when it can be identified: on the persistent SQL job, in the ILE environment, from the system's own completion message of that call (its English text), for a job of this user that the connection's job submitted during the call. In host mode, ending a remembered job with `ibmi.jobs.end` is the operation `jobs.endOwn`; ending any other job stays `jobs.end`. In `prompt` and `agent` mode every job is `jobs.end`, as before.

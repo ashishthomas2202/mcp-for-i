@@ -116,6 +116,11 @@ export type Settings = {
   tn5250LiveView?: boolean;
   tn5250LiveViewPort?: number;
   tn5250AttnWaitMs?: number;
+  testJobTimeoutSeconds?: number;
+  testJobOnInquiry?: "end" | "report";
+  testJobOnTimeout?: "end" | "report";
+  watchWaitingJobs?: boolean;
+  stuckConnectionJob?: "end" | "report";
 };
 
 export type ConnectionProfile = {

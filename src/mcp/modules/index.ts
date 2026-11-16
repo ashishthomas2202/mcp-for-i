@@ -10,6 +10,7 @@ import { changedLinesModule } from "./changedLines.js";
 import { liblModule } from "./libl.js";
 import { systemModule } from "./system.js";
 import { tn5250Module } from "./tn5250.js";
+import { jobWatchModule } from "./jobWatch.js";
 
 /**
  * A group of tools that lives in its own file. getTools() appends every
@@ -29,7 +30,7 @@ export type ToolModule = {
 };
 
 // Feature modules register here, one import and one array entry each.
-export const toolModules: ToolModule[] = [objectsModule, membersModule, ifsOpsModule, bulkMembersModule, compareModule, inspectModule, compileModule, systemModule, changedLinesModule, liblModule, tn5250Module];
+export const toolModules: ToolModule[] = [objectsModule, membersModule, ifsOpsModule, bulkMembersModule, compareModule, inspectModule, compileModule, systemModule, changedLinesModule, liblModule, tn5250Module, jobWatchModule];
 
 export function findToolModule(name: string): ToolModule | undefined {
   return toolModules.find(module => module.tools.some(tool => tool.name === name));

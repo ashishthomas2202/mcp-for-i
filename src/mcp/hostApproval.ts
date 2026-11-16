@@ -66,6 +66,8 @@ export const OPERATION_BASE: Record<string, string> = {
   "objects.rename": "qsys.write",
   "qsys.deleteLibrary": "qsys.write",
   "jobs.end": "qsys.write",
+  // A job this server submitted itself. Not in DEFAULT_ALWAYS_CONFIRM: stopping your own test job is routine.
+  "jobs.endOwn": "qsys.write",
   "subsystems.end": "qsys.write",
   "spool.delete": "qsys.write",
   "spool.move": "qsys.write",

@@ -240,7 +240,8 @@ test("host mode: a client without prompts can't run critical operations but runs
   const { conn, calls } = fakeConn();
   const ctx = { store: {}, activeName: "DEV", sessionApprovals: new Set(), ensureActive: async () => conn, getPolicy: () => HOST };
   await handleTool(ctx, "ibmi.cl.run", { command: "CALL PGM(DEVLIB/X)" });
-  assert.equal(calls.sql.length, 1);
+  // The command ran once; the look for waiting jobs afterwards is extra SQL, not a second run.
+  assert.equal(calls.sql.filter(sql => /QCMDEXC/.test(sql)).length, 1);
   await assert.rejects(handleTool(ctx, "ibmi.cl.run", { command: "DLTPGM PGM(DEVLIB/X)" }), /is critical and needs the user's confirmation/);
 });
 

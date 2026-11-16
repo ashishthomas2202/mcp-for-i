@@ -37,6 +37,11 @@ Default settings (editable in the config file):
 - `tn5250LiveView`: boolean. Serve the live 5250 view on localhost while a session is open (default true).
 - `tn5250LiveViewPort`: number. Preferred port for the live 5250 view (default 3981; the next free port when taken, 0 for any).
 - `tn5250AttnWaitMs`: number. How long Attn/SysReq wait for the host before unlocking the keyboard, in milliseconds (default 2000, range 250-15000).
+- `testJobTimeoutSeconds`: number. How long a job run with `ibmi.jobs.runTest` may take, queue time included, before it is ended (default 120, range 5-3600). The tool's `timeoutSeconds` wins.
+- `testJobOnInquiry`: `"end"` (default) or `"report"`. What `ibmi.jobs.runTest` does when its job sends an inquiry message. The tool's `onInquiry` wins.
+- `testJobOnTimeout`: `"end"` (default) or `"report"`. What `ibmi.jobs.runTest` does when its job runs out of time. The tool's `onTimeout` wins.
+- `watchWaitingJobs`: boolean (default true). After a tool runs a program, report jobs working for this user that wait on a message.
+- `stuckConnectionJob`: `"report"` (default) or `"end"`. When a call times out because the connection's own job waits on a question it asked during the call: report it, or end that job. Ending it asks nobody; see [tools](tools.md).
 - `tn5250Ccsid`: number. Single-byte EBCDIC code page for TN5250 screen text (default 37; also 273, 277, 278, 280, 284, 285, 297, 500, 871, 1047, 1140-1149).
 
 `tempLibrary` remains accepted for configuration compatibility. Source member reads and source-date writes now use job-local `QTEMP` objects and do not require a persistent `ILEDITOR` library.
@@ -205,3 +210,9 @@ The audit log lives in `<configDir>/audit/` (or next to `MCP_FOR_I_AUDIT_LOG_PAT
 - `tool-audit.anchor.json`: signed checkpoint with the first record hash, the last sequence number and the last hash, updated on every append and purge.
 - `tool-audit.head`: last record hash (kept for older versions).
 - `tool-audit.lock`: held briefly while appending, purging or verifying, so several MCP processes write one chain.
+
+### Ending a job submitted from here
+
+In host mode `jobs.end` always asks the person. A job this server submitted itself is ended as `jobs.endOwn`, which is routine: stopping your own test job should not wait for someone. To be asked for those too, add `jobs.endOwn` to `alwaysConfirm`. In `prompt` and `agent` mode there is no `jobs.endOwn`: every job is `jobs.end`, so `requireApprovalFor` entries for `jobs.end` or `qsys.write` apply as before.
+
+The ends `ibmi.jobs.runTest` issues itself, and the end of a stuck connection job when `stuckConnectionJob` is `"end"`, are not separate tool calls and ask nobody, whatever `alwaysConfirm`, `confirmClCommands` or `requireApprovalFor` say about ending jobs. A test job's end is covered by the approval of the call that submitted it; ending a stuck connection job is something the connection opts into. Neither is issued when the policy denies `ENDJOB` (`denyCommands`, or an `allowCommands` list without it) or the profile is read-only: the job is then reported. Each is recorded in the audit record of its tool call.

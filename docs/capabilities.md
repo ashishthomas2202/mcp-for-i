@@ -170,6 +170,8 @@ Version context: `0.2.0`.
 - `ibmi.jobs.hold`
 - `ibmi.jobs.release`
 - `ibmi.jobs.end`
+- `ibmi.jobs.runTest`
+- `ibmi.jobs.waiting`
 - `ibmi.subsystems.list`
 - `ibmi.subsystems.status`
 - `ibmi.subsystems.start`
