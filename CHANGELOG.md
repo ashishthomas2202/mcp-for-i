@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- New `ibmi.jobs.find`: jobs in any state (active, on a job queue, ended with output), with how each ended.
+- New `ibmi.jobs.log`: the job log of any job with every column (type, second-level text, the programs, modules, procedures and statements a message went from and to), filters, and `after` to follow a running job. A job whose log was already printed is read from its `QPJOBLOG` spooled file and returned in the same shape.
+- New `ibmi.jobs.diagnose`: why a job failed or is stuck, in one call: verdict, the message that ended it, the messages that led to it, the program of the site's own nearest the cause with its statement and source line, and the call stack of a job that is still active.
+- New `ibmi.jobs.stack`: a job's call stack.
+- New `ibmi.joblog.parse`: the same reading for job log text that was saved or pasted.
+- New `ibmi.source.locateStatement`: from a program and a statement number to the source member and line, with how sure the line is.
+- New `ibmi.debug.ready`: whether the system can be debugged from this computer (Debug Service installed, level, running; certificate in date and issued for the host name; debug port reachable; stored password; debug data of a program), with what to do about each thing that is not.
+- New `ibmi.workbench.open`: a link to a local page (127.0.0.1, keyed) that shows jobs, job logs with their diagnosis and the readiness check to the person, whatever agent they use. The page can call only tools that read.
+- All of the above only read. See [tools](docs/tools.md) and [debugging](docs/debugging.md).
+
 ## 0.5.0
 
 - New `ibmi.jobs.runTest`: run a CL command as a watched batch job. The job is submitted with `INQMSGRPY(*DFT)`, looked at until it ends, and ended if it asked a question or is still running or queued when its time is up (default 120 s). A watch that is lost ends the job too. The result says how it ended, and what is not known. The job's command is held to the connection's policy as if it were run directly. See [tools](docs/tools.md) for the outcomes and the limits.

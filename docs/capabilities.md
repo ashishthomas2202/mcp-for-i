@@ -172,6 +172,13 @@ Version context: `0.2.0`.
 - `ibmi.jobs.end`
 - `ibmi.jobs.runTest`
 - `ibmi.jobs.waiting`
+- `ibmi.jobs.find`
+- `ibmi.jobs.log`
+- `ibmi.jobs.diagnose`
+- `ibmi.jobs.stack`
+- `ibmi.joblog.parse`
+- `ibmi.source.locateStatement`
+- `ibmi.workbench.open`
 - `ibmi.subsystems.list`
 - `ibmi.subsystems.status`
 - `ibmi.subsystems.start`
@@ -188,6 +195,7 @@ Version context: `0.2.0`.
 - `ibmi.debug.status`
 - `ibmi.debug.startService`
 - `ibmi.debug.stopService`
+- `ibmi.debug.ready`
 
 ### Audit and Compliance
 - `ibmi.audit.list`

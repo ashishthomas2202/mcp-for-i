@@ -833,7 +833,7 @@ export function getTools() {
     },
     {
       name: "ibmi.joblog.get",
-      description: "Read recent job log messages for the current job.",
+      description: "Read recent job log messages of the connection's own job (id, text, severity, time). For another job, or for message types, second-level text and the programs and statements involved, use ibmi.jobs.log; to find out why a job failed, ibmi.jobs.diagnose.",
       inputSchema: { type: "object", properties: { connectionName: { type: "string" }, limit: { type: "number" } } }
     },
     {

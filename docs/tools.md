@@ -144,6 +144,7 @@ The documentation catalog is also exposed through MCP resources: `ibmi-docs://ca
 - `ibmi.debug.status`
 - `ibmi.debug.startService`
 - `ibmi.debug.stopService`
+- `ibmi.debug.ready`
 
 ## SQL / CL
 - `ibmi.sql.query`
@@ -171,6 +172,13 @@ The documentation catalog is also exposed through MCP resources: `ibmi-docs://ca
 - `ibmi.jobs.end`
 - `ibmi.jobs.runTest`
 - `ibmi.jobs.waiting`
+- `ibmi.jobs.find`
+- `ibmi.jobs.log`
+- `ibmi.jobs.diagnose`
+- `ibmi.jobs.stack`
+- `ibmi.joblog.parse`
+- `ibmi.source.locateStatement`
+- `ibmi.workbench.open`
 - `ibmi.subsystems.list`
 - `ibmi.subsystems.status`
 - `ibmi.subsystems.start`
@@ -184,6 +192,77 @@ The documentation catalog is also exposed through MCP resources: `ibmi-docs://ca
 - `ibmi.dataqueue.receive`
 - `ibmi.dataarea.read`
 - `ibmi.dataarea.write`
+
+## Jobs, job logs and why a job failed
+
+All of these only read.
+
+### `ibmi.jobs.find`
+
+Jobs in any state, newest first: active, on a job queue, or ended with output still on the system (`ibmi.jobs.list` shows active jobs only). Left to itself it lists the connection user's jobs. `userName`, `name` (may end in `*`), `state` (`*ALL`, `*ACTIVE`, `*JOBQ`, `*OUTQ`), `sinceHours`, `limit`. Each job has `state`, and where the system knows them `completion` (`NORMAL` / `ABNORMAL`), `endReason`, `jobQueue`, `submittedBy`; an active job also has `activeStatus` (`MSGW` = waiting on a message) and `function`. `userName: "*ALL"` needs a `name`.
+
+### `ibmi.jobs.log`
+
+The job log of any job (`jobName` as `number/user/name`; left out, the connection's own job). Every message has `position`, `id`, `type`, `severity`, `time`, `text`, `help` (second-level text, formatting codes turned into line breaks), and `from` / `to` with `library`, `program`, `module`, `procedure` and `statement`.
+
+- Filters: `types`, `minSeverity`, `messageId` (`CPF*`), `contains`; `order` (`oldest` / `newest`), `limit` (default 200, up to 5,000), `includeHelp: false` for a smaller answer.
+- To follow a running job, pass the `lastPosition` of one answer as `after` in the next.
+- `source` says where the messages came from. `live`: the job's message queue (`QSYS2.JOBLOG_INFO`). `spooled`: the job has ended and its log was printed, so its newest `QPJOBLOG` spooled file was read and parsed into the same shape (`spooledFile` names it; up to 60,000 lines).
+- Reading another user's job log needs what the system asks for it: `*JOBCTL`, or being that user.
+
+### `ibmi.jobs.diagnose`
+
+One call that reads the end of a job's log (its last 3,000 messages) and answers "why did it fail":
+
+- `verdict`: `failed`, `waiting` (a question nobody has answered), `warnings` (escape or severe messages, but the job did not fail), or `clean`. `summary` says it in a sentence.
+- `ended`: the end code from the log (CPF1164) with its meaning; `job`: what the system knows about the job (state, completion, end reason, times).
+- `failure`: the message that ended the work: the last escape message, or the question that was answered with a cancel. `waitingOn` for a job that waits. `rootCause`: the first serious message of the run that led there, when it is another one.
+- `chain`: the messages that led to the failure, oldest first, without their second-level text.
+- `suspect`: the program nearest the cause that is not in a library of the system's own, with module, procedure and statement, and whether it `received` the message (it was running the failing statement) or `sent` it.
+- `location`: where that statement is in the source (see `ibmi.source.locateStatement`); `locate: false` skips it.
+- `stack`: for a job that is still active, its call stack (the site's own programs when there are any).
+
+The rules are simple and stated in `notes` when they could mislead: an escape message in a job that ended normally was handled; without a CPF1164 the log does not say how the job ended.
+
+### `ibmi.jobs.stack`
+
+The call stack of a job, newest call first (`QSYS2.STACK_INFO`): `library`, `program`, `module`, `procedure`, `statement`, and `own: true` for code that is not the system's. `ownOnly`, `allThreads`, `limit`.
+
+### `ibmi.joblog.parse`
+
+The same reading for job log text that was saved or pasted (`text`): the messages, and the diagnosis fields of `ibmi.jobs.diagnose` (`verdict`, `failure`, `chain`, `suspect`, ...). Needs no connection. Columns are taken from the page's own heading line, so a blank library or severity does not shift what follows; the order of day and month is taken from the dates themselves (`dateOrder` says which was used; dates that could be either are read month first when written with `/`). English job logs only. `limit: 0` returns the diagnosis alone.
+
+### `ibmi.source.locateStatement`
+
+From `library`, `program` and `statement` (and `module` when the program has several) to the source member or stream file the module was compiled from, and the line.
+
+- `confidence: "exact"`: CL, whose statement numbers are the source sequence numbers.
+- `confidence: "probable"`: the statement matches exactly one source sequence number (statement 32300 = sequence 323.00). That is the failing line when the module was compiled with `OPTION(*SRCSTMT)`. Without it the number counts lines of the compile listing, and the real line is at or before it.
+- `confidence: "unknown"`: the source is known but not the line; `notes` say why (no such sequence number, a machine instruction number, several modules) and what to read instead.
+- `sourceChangedSinceCompile` is true when the member was changed after the program was compiled.
+
+To read the member's sequence numbers it creates an alias in `QTEMP` of the connection's job, as the other source readers do.
+
+### `ibmi.workbench.open`
+
+Returns a link (`url`) to a page on this computer that shows jobs, a job's log with its diagnosis, and the debug readiness check, for the person to look at themselves. `jobName` opens it on a job, `view: "debug"` on the readiness check. The page can also read a pasted job log.
+
+- It listens on `127.0.0.1` only (port 3982, or another free one) and every request needs the key that is part of the link.
+- It can call only these tools: `ibmi.jobs.find`, `ibmi.jobs.log`, `ibmi.jobs.diagnose`, `ibmi.jobs.stack`, `ibmi.joblog.parse`, `ibmi.source.locateStatement`, `ibmi.debug.ready`. The connection's policy applies to it as to the agent.
+- A host application that embeds the page can listen for a window message of type `mcp-for-i.openSource` (`library`, `file`, `member`, `streamFile`, `line`) to open the source in its own editor; in a browser the button copies the location.
+
+### `ibmi.debug.ready`
+
+Checks whether programs on the system can be debugged from this computer through the IBM i Debug Service, and returns one entry per check (`ok` true, false, or null when it could not be told; `detail`; and for a failure `fix` and `who`: `you` or `administrator`):
+
+- `installed`: the service is there and at version 3 or later.
+- `running`, `debugServer`, `sepDaemon`: listeners on the debug port (`debugPort`, default 8005), the debug server port (3825) and the service entry point port (`debugSepPort`, default 8008).
+- `certificate`: the service's certificate can be read, is in date, and is issued for the host name the connection uses (a connection by IP address fails this).
+- `reachable`: one TLS handshake from this computer to the debug port, trusting only that certificate. Nothing is sent after the handshake. `checkNetwork: false` skips it.
+- `password`: the connection has a stored password (the Debug Service signs on with user and password; a key is not enough).
+- `program`, `sourceCurrent`: when `library` and `program` are given, whether its modules have debug data and whether their source changed since the compile.
+
+It does not check the user's authority to `STRDBG` or to the program. This version checks readiness only; it does not run debug sessions (see [debugging](debugging.md)).
 
 ### Diagnostics Notes
 - Diagnostics tools return normalized records suitable for downstream agents (`source`, normalized severity/status fields, and preserved raw fields).
