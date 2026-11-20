@@ -146,7 +146,16 @@ export function renderWorkbenchPage(version: string) {
   .m { display: grid; grid-template-columns: 8px 84px 76px 1fr; gap: 0 12px; align-items: baseline; padding: 7px 16px; border-top: 1px solid var(--line); cursor: pointer; }
   .m:first-child { border-top: 0; }
   .m:hover { background: var(--raised); }
-  .m.led { background: var(--bad-soft); }
+  .m.sev-bad { background: var(--bad-soft); }
+  .m.sev-warn { background: var(--warn-soft); }
+  .m.led { box-shadow: inset 3px 0 0 var(--bad); }
+  .m.led .id { color: var(--tx); font-weight: 600; }
+  .m.flash { animation: flash 1.4s ease-out; }
+  @keyframes flash { 0%, 35% { outline: 2px solid var(--accent); outline-offset: -2px; } 100% { outline: 2px solid transparent; outline-offset: -2px; } }
+  .trail li { cursor: pointer; border-radius: 8px; }
+  .trail li:hover { background: var(--raised); }
+  .step { display: inline-flex; gap: 4px; align-items: center; color: var(--tx-2); }
+  .step .btn { padding: 3px 9px; }
   .m .dot { align-self: center; width: 6px; height: 6px; }
   .m .tm, .m .id { font: 11px/1.6 var(--mono); color: var(--tx-3); }
   .m .id { color: var(--tx-2); }
@@ -237,7 +246,7 @@ export function renderWorkbenchPage(version: string) {
 (function () {
   var params = new URLSearchParams(location.search);
   var token = params.get("t") || "";
-  var state = { conn: params.get("c") || "", view: params.get("view") === "debug" ? "debug" : "jobs", job: params.get("job") || "", jobState: "*ALL", log: null, marks: {}, filter: "serious", search: "", follow: false, timer: null, open: {} };
+  var state = { conn: params.get("c") || "", view: params.get("view") === "debug" ? "debug" : "jobs", job: params.get("job") || "", jobState: "*ALL", log: null, marks: {}, filter: "all", search: "", follow: false, timer: null, open: {}, at: -1 };
   var $ = function (id) { return document.getElementById(id); };
 
   function h(tag, props) {
@@ -411,10 +420,10 @@ export function renderWorkbenchPage(version: string) {
     return box;
   }
 
-  function trail(chain, endPosition) {
+  function trail(chain, endPosition, clickable) {
     var list = h("ol", { class: "trail" });
     chain.forEach(function (m) {
-      list.appendChild(h("li", { class: m.position === endPosition ? "end" : "" },
+      list.appendChild(h("li", { class: m.position === endPosition ? "end" : "", title: clickable ? "Show this message in the log" : undefined, onclick: clickable ? function () { state.at = m.position; jumpTo(m.position); } : undefined },
         h("span", { class: "tm", text: clockOf(m.time) }),
         h("span", { class: "chip", text: m.id || typeWords(m.type) }),
         h("span", { class: "tx" }, m.text, h("span", { class: "pg", text: place(ownSide(m)) }))));
@@ -437,12 +446,13 @@ export function renderWorkbenchPage(version: string) {
     if (!holder || !state.log) return;
     clear(holder);
     var list = shown();
-    if (!list.length) holder.appendChild(h("div", { class: "quiet-note", text: state.filter === "serious" && !state.search ? "No serious messages. Show all to read the whole log." : "No messages match." }));
+    if (!list.length) holder.appendChild(h("div", { class: "quiet-note", text: state.filter === "serious" && !state.search ? "No problems in this log." : "No messages match." }));
     else {
       var log = h("div", { class: "log" });
       list.forEach(function (m) {
         var open = state.open[m.position];
-        log.appendChild(h("div", { class: "m" + (state.marks[m.position] ? " led" : "") + (open ? " open" : ""), onclick: function () { state.open[m.position] = !open; renderMessages(); } },
+        var sev = messageTone(m);
+        log.appendChild(h("div", { class: "m" + (sev === "bad" || sev === "warn" ? " sev-" + sev : "") + (state.marks[m.position] ? " led" : "") + (open ? " open" : ""), "data-pos": String(m.position), onclick: function () { state.open[m.position] = !open; renderMessages(); } },
           h("span", { class: "dot " + messageTone(m), title: typeWords(m.type) + (m.severity !== null && m.severity !== undefined ? ", severity " + m.severity : "") }),
           h("span", { class: "tm", text: clockOf(m.time) }),
           h("span", { class: "id", text: m.id || typeWords(m.type) }),
@@ -457,10 +467,31 @@ export function renderWorkbenchPage(version: string) {
     var count = $("count");
     if (count) count.textContent = list.length + " of " + state.log.messages.length + " messages" + (state.log.truncated ? " · the log is longer, this is its end" : "") + (state.log.source === "spooled" ? " · read from the printed job log" : "");
   }
+  function isProblem(m) { var t = messageTone(m); return t === "bad" || t === "warn" || state.marks[m.position]; }
+  function jumpTo(position) {
+    if (!state.log) return;
+    var visible = shown().some(function (m) { return m.position === position; });
+    if (!visible) { state.filter = "all"; state.search = ""; }
+    state.open[position] = true;
+    renderMessages();
+    var row = document.querySelector('.m[data-pos="' + position + '"]');
+    if (!row) return;
+    row.scrollIntoView({ block: "center", behavior: "smooth" });
+    row.className += " flash";
+  }
+  function stepProblem(direction) {
+    var list = shown().filter(isProblem);
+    if (!list.length) return;
+    var at = -1;
+    for (var i = 0; i < list.length; i++) if (list[i].position === state.at) at = i;
+    var next = at < 0 ? (direction > 0 ? 0 : list.length - 1) : (at + direction + list.length) % list.length;
+    state.at = list[next].position;
+    jumpTo(state.at);
+  }
   function logSection(parent) {
     parent.appendChild(h("div", { class: "eyebrow", text: "Job log" }));
     var seg = h("span", { class: "seg" });
-    [["serious", "Serious"], ["all", "All"]].forEach(function (c) {
+    [["all", "Everything"], ["serious", "Problems only"]].forEach(function (c) {
       seg.appendChild(h("button", { class: state.filter === c[0] ? "on" : "", text: c[1], onclick: function () { state.filter = c[0]; Array.prototype.forEach.call(seg.children, function (b) { b.className = ""; }); this.className = "on"; renderMessages(); } }));
     });
     var tools = h("div", { class: "tools" }, seg, h("input", { class: "field", placeholder: "Find in messages", value: state.search, oninput: function () { state.search = this.value; renderMessages(); } }));
@@ -468,6 +499,7 @@ export function renderWorkbenchPage(version: string) {
       var box = h("input", { type: "checkbox", onchange: function () { state.follow = this.checked; follow(); } });
       tools.appendChild(h("label", {}, box, "Follow new messages"));
     }
+    tools.appendChild(h("span", { class: "step" }, h("button", { class: "btn", title: "Previous problem", text: "↑", onclick: function () { stepProblem(-1); } }), h("button", { class: "btn", title: "Next problem", text: "↓", onclick: function () { stepProblem(1); } }), "problems"));
     parent.appendChild(tools);
     parent.appendChild(h("div", { id: "messages" }));
     parent.appendChild(h("div", { id: "count", class: "count" }));
@@ -488,7 +520,7 @@ export function renderWorkbenchPage(version: string) {
 
   // ---- one job ----
   function showJob(jobName) {
-    state.job = jobName; state.log = null; state.open = {}; state.marks = {}; state.follow = false; state.search = ""; state.filter = "serious"; follow();
+    state.job = jobName; state.log = null; state.open = {}; state.marks = {}; state.follow = false; state.search = ""; state.filter = "all"; state.at = -1; follow();
     markSelected();
     var col = column();
     var facts = h("div", { class: "facts" });
@@ -516,7 +548,7 @@ export function renderWorkbenchPage(version: string) {
       clear(diag).appendChild(finding(d));
       (d.chain || []).forEach(function (m) { state.marks[m.position] = true; });
       var end = (d.waitingOn || d.failure || {}).position;
-      if (d.chain && d.chain.length > 1) { after.appendChild(h("div", { class: "eyebrow", text: "What led to it" })); after.appendChild(trail(d.chain, end)); }
+      if (d.chain && d.chain.length > 1) { after.appendChild(h("div", { class: "eyebrow", text: "What led to it" })); after.appendChild(trail(d.chain, end, true)); }
       if (d.stack && d.stack.length) {
         after.appendChild(h("div", { class: "eyebrow", text: "Where it stands now" }));
         after.appendChild(trail(d.stack.map(function (e, i) { return { position: i, time: "", id: e.program, type: "", text: (e.procedure || e.module || "") + (e.statement ? "  statement " + e.statement : ""), from: { library: e.library, program: e.program } }; }), -1));
@@ -535,7 +567,7 @@ export function renderWorkbenchPage(version: string) {
 
   // ---- pasted text ----
   function readPasted(text) {
-    state.job = ""; state.follow = false; follow(); state.open = {}; state.marks = {}; state.search = ""; state.filter = "serious"; markSelected();
+    state.job = ""; state.follow = false; follow(); state.open = {}; state.marks = {}; state.search = ""; state.filter = "all"; state.at = -1; markSelected();
     var col = column();
     skeleton(col);
     call("ibmi.joblog.parse", { text: text, limit: 5000 }).then(function (d) {
@@ -547,7 +579,7 @@ export function renderWorkbenchPage(version: string) {
       col.appendChild(facts);
       col.appendChild(finding(d));
       (d.chain || []).forEach(function (m) { state.marks[m.position] = true; });
-      if (d.chain && d.chain.length > 1) { col.appendChild(h("div", { class: "eyebrow", text: "What led to it" })); col.appendChild(trail(d.chain, (d.waitingOn || d.failure || {}).position)); }
+      if (d.chain && d.chain.length > 1) { col.appendChild(h("div", { class: "eyebrow", text: "What led to it" })); col.appendChild(trail(d.chain, (d.waitingOn || d.failure || {}).position, true)); }
       state.log = { messages: d.messages || [], truncated: d.truncated, source: "pasted" };
       logSection(col);
       renderMessages();
