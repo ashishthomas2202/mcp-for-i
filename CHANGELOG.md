@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
 - New `ibmi.jobs.find`: jobs in any state (active, on a job queue, ended with output), with how each ended.
 - New `ibmi.jobs.log`: the job log of any job with every column (type, second-level text, the programs, modules, procedures and statements a message went from and to), filters, and `after` to follow a running job. A job whose log was already printed is read from its `QPJOBLOG` spooled file and returned in the same shape.
