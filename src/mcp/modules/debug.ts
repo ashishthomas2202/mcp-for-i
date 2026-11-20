@@ -52,12 +52,22 @@ export function probeTls(host: string, port: number, ca: string | undefined, tim
       resolve(probe);
     };
     // rejectUnauthorized stays off so the handshake completes and says *why* a certificate is not trusted.
-    const socket = tls.connect({ host, port, servername: host, ca: ca ? [ca] : undefined, rejectUnauthorized: false, timeout: timeoutMs }, () => {
+    // Trusted when a public authority this computer knows issued it, or when it is the very certificate
+    // the service keeps in its certs directory (a self-signed or privately issued one).
+    const socket = tls.connect({ host, port, servername: host, ca: ca ? [...tls.rootCertificates, ca] : undefined, rejectUnauthorized: false, timeout: timeoutMs }, () => {
       const peer = socket.getPeerCertificate();
+      let pinned = false;
+      try {
+        pinned = Boolean(ca && peer?.fingerprint256 && new crypto.X509Certificate(ca).fingerprint256 === peer.fingerprint256);
+      } catch {
+        pinned = false;
+      }
+      const hostError = pinned ? tls.checkServerIdentity(host, peer) : undefined;
+      const trusted = socket.authorized || (pinned && !hostError);
       finish({
         connected: true,
-        authorized: socket.authorized,
-        error: socket.authorized ? undefined : String(socket.authorizationError || "not trusted"),
+        authorized: trusted,
+        error: trusted ? undefined : String(socket.authorizationError || hostError?.message || "not trusted"),
         protocol: socket.getProtocol() || undefined,
         validTo: peer?.valid_to,
         subject: peer?.subject?.CN

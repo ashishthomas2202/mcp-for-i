@@ -82,3 +82,20 @@ Stopping in a job somebody else starts (a web request, another user's session). 
 - A statement number maps to a source line only when the module was compiled with `OPTION(*SRCSTMT)` (or is CL). Otherwise the tool says so rather than guess.
 - The diagnosis follows fixed rules (last escape, or the question answered with a cancel; the run of serious messages before it). It names what it found and leaves the judgement to the reader.
 - `ibmi.debug.ready` does not check authority to `STRDBG` or to the program.
+
+## Protocol trial, 2026-11-20 (IBM i 7.5, Debug Service 3.0.0)
+
+What was learned by talking to the service directly on port 8005:
+
+- It speaks standard DAP with `Content-Length` framing over TLS, with no adapter in between. `initialize` is answered at once. The service says it supports conditional breakpoints, hit counts, function breakpoints, set variable, set expression, modules, restart and terminate.
+- Its certificate can be one issued by a public authority (it was, on the system tried). Trusting only the file in the service's certs directory then fails, because that file is the leaf and not its issuer. Trust has to be: the computer's own roots, or that exact certificate.
+- `launch` and `attach` take the arguments IBM publishes for `launch.json`, plus `sessionId` (the service refuses a request without it: `EQARD1013E`). The password is accepted base64-encoded; the sign-on succeeded and counted no invalid attempt.
+- `initialized` arrives right after the request, and `configurationDone` is answered.
+- **Not solved:** neither `launch` (batch) nor `attach` (to a job held on a job queue) was ever answered, within 90 seconds. The service's log shows it got as far as "Debugging batch program ..." and "Attaching to job ...", the same lines it writes for working sessions from the VS Code extension. No job was submitted and no debug engine job (`QB5PHSRV`) was started for the user. Something the IBM client sends, or does on its second connection (port 8008), is missing from these requests.
+- Nothing was left behind: no job, no change to the system except the small trial program and its source member.
+
+To get past this, one of:
+
+1. A trace of one working session from the VS Code extension (Code for IBM i's debug tracing setting writes the DAP messages to its output), run by a developer against the same program. This shows the exact requests without reading IBM's code.
+2. Reading the extension's adapter to see what it sends. IBM's licence for the extension forbids reverse engineering, so this is the owner's decision.
+3. Asking IBM for the client contract of the Debug Service.
